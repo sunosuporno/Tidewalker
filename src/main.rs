@@ -17,8 +17,18 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    /// Run tests for the Move package at PATH and observe state changes.
+    /// Run tests for the Move package at PATH and observe/log state changes.
     Run {
+        /// Path to the Move package (directory containing Move.toml).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// Static analysis only: do not run tests, just analyze entry functions and intra-module calls.
+        #[arg(long = "static")]
+        static_only: bool,
+    },
+    /// Generate tests/tidewalker_generated_tests_setup.move with test_only helpers for shared objects and admin caps.
+    /// Alerts (to stderr) for any module/file where setup could not be generated.
+    GenerateSetup {
         /// Path to the Move package (directory containing Move.toml).
         #[arg(value_name = "PATH", default_value = ".")]
         path: PathBuf,
@@ -28,7 +38,14 @@ enum Commands {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { path } => run_tests_and_log(&path),
+        Commands::Run { path, static_only } => {
+            if static_only {
+                run_static_analysis(&path)
+            } else {
+                run_tests_and_log(&path)
+            }
+        }
+        Commands::GenerateSetup { path } => run_generate_setup(&path),
     }
 }
 
@@ -77,6 +94,789 @@ fn run_tests_and_log(package_path: &Path) -> Result<(), Box<dyn std::error::Erro
     }
 
     Ok(())
+}
+
+/// Run static analysis only: list entry functions and intra-module calls without running tests.
+fn run_static_analysis(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct MovePackage {
+        package: Package,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        name: String,
+    }
+
+    let path = package_path.canonicalize().unwrap_or_else(|_| package_path.to_path_buf());
+    let move_toml_path = path.join("Move.toml");
+    if !move_toml_path.is_file() {
+        return Err(format!("Not a Move package: no Move.toml at {}", path.display()).into());
+    }
+
+    let toml_str = fs::read_to_string(&move_toml_path)?;
+    let manifest: MovePackage = toml::from_str(&toml_str)?;
+    let pkg_name = manifest.package.name;
+
+    // Ensure build artifacts exist (but do not run tests).
+    let status = Command::new("sui")
+        .args(["move", "build", "-p", path.to_str().unwrap()])
+        .status()?;
+    if !status.success() {
+        return Err("sui move build failed".into());
+    }
+
+    let src_root = path.join("build").join(&pkg_name).join("sources");
+    if !src_root.is_dir() {
+        return Err(format!("No build sources found at {}", src_root.display()).into());
+    }
+
+    println!("Static analysis for package '{}' at {}", pkg_name, path.display());
+
+    let mut move_files: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(&src_root)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().map_or(false, |ext| ext == "move") {
+            move_files.push(p);
+        }
+    }
+    move_files.sort();
+
+    for file in move_files {
+        analyze_module_file(&file)?;
+    }
+
+    Ok(())
+}
+
+/// Generate tests/tidewalker_generated_tests_setup.move and print alerts for modules that couldn't be fully generated.
+fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct MovePackage {
+        package: Package,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        name: String,
+    }
+
+    let path = package_path.canonicalize().unwrap_or_else(|_| package_path.to_path_buf());
+    let move_toml_path = path.join("Move.toml");
+    if !move_toml_path.is_file() {
+        return Err(format!("Not a Move package: no Move.toml at {}", path.display()).into());
+    }
+
+    let toml_str = fs::read_to_string(&move_toml_path)?;
+    let manifest: MovePackage = toml::from_str(&toml_str)?;
+    let pkg_name = manifest.package.name;
+
+    let status = Command::new("sui")
+        .args(["move", "build", "-p", path.to_str().unwrap()])
+        .status()?;
+    if !status.success() {
+        return Err("sui move build failed".into());
+    }
+
+    let src_root = path.join("build").join(&pkg_name).join("sources");
+    if !src_root.is_dir() {
+        return Err(format!("No build sources at {}", src_root.display()).into());
+    }
+
+    let mut move_files: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(&src_root)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().map_or(false, |ext| ext == "move") {
+            move_files.push(p);
+        }
+    }
+    move_files.sort();
+
+    let mut all_shared: Vec<(String, String)> = Vec::new();
+    let mut all_caps: Vec<(String, String)> = Vec::new();
+    let mut alerts: Vec<(String, String)> = Vec::new();
+    let mut file_for_module: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    for file in &move_files {
+        let file_name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        match extract_setup_info(file) {
+            Ok(info) => {
+                file_for_module.insert(info.module_name.clone(), file_name.clone());
+                for (mod_name, type_name) in info.shared_types {
+                    all_shared.push((mod_name.clone(), type_name));
+                }
+                for (mod_name, type_name) in info.cap_types {
+                    all_caps.push((mod_name.clone(), type_name));
+                }
+                for (target, reason) in info.cannot_generate {
+                    alerts.push((target, reason));
+                }
+            }
+            Err(e) => {
+                alerts.push((file_name, format!("analysis failed: {}", e)));
+            }
+        }
+    }
+
+    // Generate test_only helpers in the defining module (protocol source), where struct
+    // instantiation is allowed. Group shared/caps by module and inject into sources/<file>.
+    let mut shared_by_module: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut caps_by_module: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for (mod_name, type_name) in &all_shared {
+        shared_by_module.entry(mod_name.clone()).or_default().push(type_name.clone());
+    }
+    for (mod_name, type_name) in &all_caps {
+        caps_by_module.entry(mod_name.clone()).or_default().push(type_name.clone());
+    }
+
+    let sources_dir = path.join("sources");
+    for (mod_name, file_name) in &file_for_module {
+        let shared = shared_by_module.get(mod_name).map(Vec::as_slice).unwrap_or(&[]);
+        let caps = caps_by_module.get(mod_name).map(Vec::as_slice).unwrap_or(&[]);
+        if shared.is_empty() && caps.is_empty() {
+            continue;
+        }
+        let source_path = sources_dir.join(file_name);
+        if !source_path.is_file() {
+            alerts.push((
+                file_name.clone(),
+                "Source file not found in package sources/ (only build output was analyzed).".to_string(),
+            ));
+            continue;
+        }
+        // Skip files that have #[test_only] code not generated by us (dev-written); we only update our own block.
+        let content = match fs::read_to_string(&source_path) {
+            Ok(c) => c,
+            Err(e) => {
+                alerts.push((file_name.clone(), format!("Could not read source file: {}", e)));
+                continue;
+            }
+        };
+        let lines: Vec<String> = content.lines().map(String::from).collect();
+        if file_has_test_only_outside_tidewalker_block(&lines) {
+            continue; // file has dev-written test_only → skip entirely, do not touch
+        }
+        match inject_test_only_helpers(&source_path, mod_name, shared, caps) {
+            Ok(()) => println!("Injected test_only helpers into {}", source_path.display()),
+            Err(e) => alerts.push((file_name.clone(), format!("Failed to inject helpers: {}", e))),
+        }
+    }
+
+    let tests_dir = path.join("tests");
+    if !tests_dir.is_dir() {
+        fs::create_dir_all(&tests_dir)?;
+    }
+    let out_path = tests_dir.join("tidewalker_generated_tests_setup.move");
+    let content = generate_setup_move_content(&pkg_name, &[], &[]);
+    fs::write(&out_path, content)?;
+    println!("Wrote {}", out_path.display());
+
+    if !alerts.is_empty() {
+        eprintln!("\n--- Tidewalker: setup generation alerts ---");
+        for (target, reason) in &alerts {
+            eprintln!("  ALERT [{}]: {}", target, reason);
+        }
+        eprintln!("--------------------------------------------");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ModuleSetupInfo {
+    module_name: String,
+    shared_types: Vec<(String, String)>,
+    cap_types: Vec<(String, String)>,
+    cannot_generate: Vec<(String, String)>,
+}
+
+fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let mut info = ModuleSetupInfo::default();
+
+    for line in &lines {
+        let t = line.trim();
+        if t.starts_with("module ") {
+            if let Some(rest) = t.strip_prefix("module ") {
+                let until = rest.split_whitespace().next().unwrap_or(rest);
+                info.module_name = until.trim_end_matches(';').to_string();
+            }
+            break;
+        }
+    }
+
+    let mut public_structs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        if t.starts_with("public struct ") {
+            let after = t.strip_prefix("public struct ").unwrap_or("");
+            let name = after
+                .split(|c: char| c.is_whitespace() || c == '<' || c == '(')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !name.is_empty() && (t.contains("key") || t.contains("store")) {
+                public_structs.insert(name.clone());
+            }
+        }
+        i += 1;
+    }
+
+    let init_body = find_init_body(&lines);
+    let (shared_vars, cap_vars) = if let Some(body) = init_body {
+        parse_init_body(body)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    for (_, type_name) in &shared_vars {
+        if public_structs.contains(type_name) {
+            info.shared_types.push((info.module_name.clone(), type_name.clone()));
+        } else if !type_name.is_empty() {
+            info.cannot_generate.push((
+                path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                format!(
+                    "shared object type '{}' is not a public struct (cannot generate create_and_share)",
+                    type_name
+                ),
+            ));
+        }
+    }
+    for (_, type_name) in &cap_vars {
+        if public_structs.contains(type_name) {
+            info.cap_types.push((info.module_name.clone(), type_name.clone()));
+        } else if !type_name.is_empty() {
+            info.cannot_generate.push((
+                path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                format!(
+                    "admin/cap type '{}' is not a public struct (cannot generate cap helper)",
+                    type_name
+                ),
+            ));
+        }
+    }
+
+    Ok(info)
+}
+
+fn find_init_body<'a>(lines: &'a [&'a str]) -> Option<Vec<&'a str>> {
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t.starts_with("fun init(") {
+            let mut depth = 0;
+            let mut start = i;
+            for (j, l) in lines.iter().enumerate().skip(i) {
+                for c in l.chars() {
+                    if c == '{' {
+                        depth += 1;
+                        if depth == 1 {
+                            start = j + 1;
+                        }
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(lines[start..=j].to_vec());
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_init_body(body: Vec<&str>) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut var_to_type: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in &body {
+        let t = line.trim();
+        if t.starts_with("let ") {
+            if let Some(rest) = t.strip_prefix("let ") {
+                let mut name = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if name.ends_with(',') {
+                    name.pop();
+                }
+                if let Some(eq) = rest.find('=') {
+                    let rhs = rest[eq + 1..].trim();
+                    let type_name = if rhs.contains(" {") {
+                        rhs.split_whitespace().next().unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !name.is_empty() && !type_name.is_empty() {
+                        var_to_type.insert(name, type_name);
+                    }
+                }
+            }
+        }
+    }
+    let mut shared = Vec::new();
+    let mut caps = Vec::new();
+    for line in &body {
+        let t = line.trim();
+        if t.contains("share_object(") {
+            if let Some(arg) = extract_first_arg(t, "share_object(") {
+                if let Some(ty) = var_to_type.get(&arg) {
+                    shared.push((arg.clone(), ty.clone()));
+                }
+            }
+        }
+        if t.contains("transfer(") && (t.contains("sender(") || t.contains("tx_context::sender")) {
+            if let Some(arg) = extract_first_arg(t, "transfer(") {
+                if let Some(ty) = var_to_type.get(&arg) {
+                    caps.push((arg.clone(), ty.clone()));
+                }
+            }
+        }
+    }
+    (shared, caps)
+}
+
+fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
+    let t = line.trim();
+    let after = t.find(prefix).map(|i| &t[i + prefix.len()..])?;
+    let arg = after
+        .trim_start()
+        .split(|c: char| c == ',' || c == ')')
+        .next()?
+        .trim()
+        .trim_end_matches(')');
+    if arg.is_empty() {
+        None
+    } else {
+        Some(arg.to_string())
+    }
+}
+
+/// Inner width of the ASCII box (space between the two slashes).
+const TIDEWALKER_BOX_WIDTH: usize = 59;
+
+fn tidewalker_box_lines() -> Vec<String> {
+    // Use "// " (comment + space) so "///" is not parsed as doc comment by Move.
+    let border = format!("// {}", "/".repeat(TIDEWALKER_BOX_WIDTH + 2));
+    let empty_line = format!("// {}{}{}", "/", " ".repeat(TIDEWALKER_BOX_WIDTH), "/");
+    let title = " Tidewalker generated test helpers ";
+    let pad = TIDEWALKER_BOX_WIDTH.saturating_sub(title.len()) / 2;
+    let pad_end = TIDEWALKER_BOX_WIDTH - pad - title.len();
+    let title_line = format!("// {}{}{}{}/", "/", " ".repeat(pad), title, " ".repeat(pad_end));
+    vec![
+        border.clone(),
+        empty_line.clone(),
+        title_line,
+        empty_line,
+        border,
+    ]
+}
+
+/// Generate Move source for #[test_only] create_and_share_* and create_*_for_testing (in defining module).
+fn generate_in_module_test_only_snippet(
+    _mod_name: &str,
+    shared: &[String],
+    caps: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    out.push("".to_string());
+    out.extend(tidewalker_box_lines());
+    for type_name in shared {
+        out.push("#[test_only]".to_string());
+        out.push(format!(
+            "/// Create and share {} for testing (replicating init).",
+            type_name
+        ));
+        out.push(format!(
+            "public fun create_and_share_{}_for_testing(ctx: &mut sui::tx_context::TxContext) {{",
+            type_name.to_lowercase()
+        ));
+        out.push(format!("    let obj = {} {{", type_name));
+        out.push("        id: sui::object::new(ctx),".to_string());
+        if type_name == "Counter" {
+            out.push("        value: 0,".to_string());
+        }
+        out.push("    };".to_string());
+        out.push("    transfer::public_share_object(obj);".to_string());
+        out.push("}".to_string());
+        out.push("".to_string());
+    }
+    for type_name in caps {
+        out.push("#[test_only]".to_string());
+        out.push(format!("/// Create {} for testing (caller receives it).", type_name));
+        out.push(format!(
+            "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
+            type_name.to_lowercase(),
+            type_name
+        ));
+        out.push(format!("    {} {{", type_name));
+        out.push("        id: sui::object::new(ctx),".to_string());
+        out.push("    }".to_string());
+        out.push("}".to_string());
+        out.push("".to_string());
+    }
+    out.extend(tidewalker_box_lines());
+    out
+}
+
+/// Detect existing Tidewalker block: (start, end) inclusive. Supports old and new box format.
+/// Prefers the block at the end of the file (last occurrence of the title).
+///
+/// Important: We only ever match our own block (Tidewalker box/sentinels). We never touch
+/// #[test_only] helpers that are not inside this block—hand-written or from other tools—they are left unchanged.
+fn find_tidewalker_block(lines: &[String]) -> Option<(usize, usize)> {
+    // Old format: "// ----- Tidewalker generated test helpers -----" ... "// ----- End Tidewalker -----"
+    let old_start = "// ----- Tidewalker generated test helpers -----";
+    let old_end = "// ----- End Tidewalker -----";
+    if let Some(s) = lines.iter().position(|l| l.trim() == old_start) {
+        if let Some(e) = lines[s..].iter().position(|l| l.trim() == old_end).map(|i| s + i) {
+            return Some((s, e));
+        }
+    }
+
+    // New format: find the *last* "Tidewalker generated test helpers" so we only remove the block at the end.
+    let is_border = |l: &str| {
+        let t = l.trim();
+        t.starts_with("//") && t.len() > 4 && t[2..].trim_start().starts_with('/')
+    };
+    let last_title_idx = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| l.contains("Tidewalker generated test helpers"))
+        .map(|(i, _)| i)?;
+    // First box: border is a few lines before this title. Go back at most 5 lines.
+    let first_box_start = (last_title_idx.saturating_sub(4))..=last_title_idx;
+    let first = first_box_start
+        .into_iter()
+        .find(|&i| is_border(lines[i].as_str()))?;
+    // Second box: after the helpers, find the next border (start of closing box), then end is that + 4.
+    let after_first_box = last_title_idx + 5;
+    let second_box_start = lines[after_first_box..]
+        .iter()
+        .position(|l| is_border(l.as_str()))
+        .map(|i| after_first_box + i)?;
+    let second_box_end = second_box_start + 4;
+    Some((first, second_box_end))
+}
+
+/// Returns true if we should skip this file: it has #[test_only] code that is not inside our
+/// Tidewalker block (i.e. dev-written). We only touch files that have no test_only, or only our block.
+fn file_has_test_only_outside_tidewalker_block(lines: &[String]) -> bool {
+    let block_range = find_tidewalker_block(lines);
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("#[test_only]") {
+            let inside_our_block = block_range.map(|(s, e)| (s..=e).contains(&i)).unwrap_or(false);
+            if !inside_our_block {
+                return true; // found test_only not generated by us → skip file
+            }
+        }
+    }
+    false
+}
+
+/// Inject or replace Tidewalker-generated test_only helpers at the end of the protocol source file.
+///
+/// Rule: We only remove/replace the block delimited by our Tidewalker box or sentinels. Any other
+/// #[test_only] code in the file (hand-written or from other tools) is never touched.
+fn inject_test_only_helpers(
+    source_path: &Path,
+    mod_name: &str,
+    shared: &[String],
+    caps: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(source_path)?;
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+
+    let snippet = generate_in_module_test_only_snippet(mod_name, shared, caps);
+
+    // Only remove our own block (identified by Tidewalker box/sentinels). Do not touch other test_only code.
+    if let Some((s, e)) = find_tidewalker_block(&lines) {
+        lines.drain(s..=e);
+        // Trim trailing blank line if any
+        while lines.last().map(|l| l.trim().is_empty()) == Some(true) {
+            lines.pop();
+        }
+    }
+
+    // Always place our block at the end of the file.
+    if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+        lines.push("".to_string());
+    }
+    lines.extend(snippet);
+    fs::write(source_path, lines.join("\n"))?;
+    Ok(())
+}
+
+fn generate_setup_move_content(
+    pkg_name: &str,
+    _shared: &[(String, String)],
+    _caps: &[(String, String)],
+) -> String {
+    let mut out = Vec::new();
+    out.push("// Generated by Tidewalker. Do not edit by hand.".to_string());
+    out.push("// Setup helpers are not generated here: in Move, structs can only be instantiated".to_string());
+    out.push("// in their defining module. Add #[test_only] create_and_share_* / create_*_for_testing".to_string());
+    out.push("// in the protocol source module (e.g. move_project.move) instead.".to_string());
+    out.push("#[test_only]".to_string());
+    out.push(format!("module {}::tidewalker_generated_tests_setup {{", pkg_name));
+    out.push("".to_string());
+    out.push("    use sui::test_scenario;".to_string());
+    out.push("    use sui::tx_context;".to_string());
+    out.push("".to_string());
+    out.push("}".to_string());
+    out.join("\n")
+}
+
+/// Very simple textual analysis: find entry functions and calls to other functions in same module.
+fn analyze_module_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let content = fs::read_to_string(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut module_name = String::new();
+    for line in &lines {
+        let t = line.trim();
+        if t.starts_with("module ") {
+            // e.g., module move_project::move_project;
+            if let Some(rest) = t.strip_prefix("module ") {
+                let until = rest.split_whitespace().next().unwrap_or(rest);
+                module_name = until.trim_end_matches(';').to_string();
+            }
+            break;
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct FnInfo {
+        name: String,
+        is_entry: bool,  // has `entry` keyword
+        is_public: bool, // declared `public` (with or without `entry`)
+        start: usize,
+        end: usize,
+    }
+
+    // First pass: find function definitions and approximate their span.
+    let mut fns: Vec<FnInfo> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        let (is_entry, is_public, is_fun) = if t.starts_with("public entry fun ") {
+            (true, true, true)
+        } else if t.starts_with("entry fun ") {
+            (true, false, true)
+        } else if t.starts_with("public fun ") {
+            (false, true, true)
+        } else if t.starts_with("fun ") {
+            (false, false, true)
+        } else {
+            (false, false, false)
+        };
+        if !is_fun {
+            i += 1;
+            continue;
+        }
+
+        // Extract function name: word after 'fun ' until '(' or '<'.
+        let after_fun = if let Some(pos) = t.find("fun ") {
+            &t[pos + 4..]
+        } else {
+            i += 1;
+            continue;
+        };
+        let name_part = after_fun
+            .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+            .next()
+            .unwrap_or("?");
+        let name = name_part.to_string();
+
+        // Approximate span using brace depth starting from this line.
+        let mut brace_depth = 0i32;
+        let start_line = i;
+        let mut end_line = i;
+        for (j, l) in lines.iter().enumerate().skip(i) {
+            let mut line_brace_delta = 0i32;
+            for c in l.chars() {
+                match c {
+                    '{' => line_brace_delta += 1,
+                    '}' => line_brace_delta -= 1,
+                    _ => {}
+                }
+            }
+            brace_depth += line_brace_delta;
+            if brace_depth <= 0 && j > i {
+                end_line = j;
+                break;
+            }
+            end_line = j;
+        }
+
+        fns.push(FnInfo { name, is_entry, is_public, start: start_line, end: end_line });
+        i = end_line + 1;
+    }
+
+    if fns.is_empty() {
+        return Ok(());
+    }
+
+    // Second pass: for each function, see which other functions in this module it calls,
+    // and which functions from other modules it calls (cross-module).
+    let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut cross_calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let all_names: Vec<String> = fns.iter().map(|f| f.name.clone()).collect();
+    let module_short = module_name
+        .split("::")
+        .last()
+        .unwrap_or(&module_name)
+        .to_string();
+
+    let local_name_set: BTreeSet<String> = all_names.iter().cloned().collect();
+
+    for f in &fns {
+        let mut intra = BTreeSet::new();
+        let mut cross = BTreeSet::new();
+        for other in &all_names {
+            if other == &f.name {
+                continue;
+            }
+            let needle_plain = format!("{}(", other);
+            let needle_mod = format!("{}::{}(", module_short, other);
+            let needle_self = format!("Self::{}(", other);
+            'outer: for line in &lines[f.start..=f.end.min(lines.len() - 1)] {
+                let t = line.trim();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if t.contains(&needle_plain) || t.contains(&needle_mod) || t.contains(&needle_self) {
+                    intra.insert(other.clone());
+                    break 'outer;
+                }
+            }
+        }
+        // Scan for cross-module calls in this function body.
+        for line in &lines[f.start..=f.end.min(lines.len() - 1)] {
+            let t = line.trim();
+            if t.starts_with("//") {
+                continue;
+            }
+            for target in find_cross_module_calls(t, &module_short, &local_name_set) {
+                cross.insert(target);
+            }
+        }
+        calls.insert(f.name.clone(), intra);
+        cross_calls.insert(f.name.clone(), cross);
+    }
+
+    // Print summary for this module.
+    println!("\nModule: {}", if module_name.is_empty() { "<unknown>" } else { &module_name });
+
+    // Explicit entry functions (those with `entry` keyword).
+    println!("  Entry functions (with `entry` keyword):");
+    let mut any_entry = false;
+    for f in &fns {
+        if f.is_entry {
+            any_entry = true;
+            let called = calls.get(&f.name);
+            let mut descr = format!("    {}", f.name);
+            if let Some(set) = called {
+                if !set.is_empty() {
+                    let list: Vec<_> = set.iter().cloned().collect();
+                    descr.push_str(&format!(" (calls: {})", list.join(", ")));
+                }
+            }
+            println!("{}", descr);
+            if let Some(xset) = cross_calls.get(&f.name) {
+                if !xset.is_empty() {
+                    let list: Vec<_> = xset.iter().cloned().collect();
+                    println!("      cross-module: {}", list.join(", "));
+                }
+            }
+        }
+    }
+    if !any_entry {
+        println!("    (none)");
+    }
+
+    // Public (non-entry) functions.
+    println!("  Public functions (no `entry` keyword):");
+    let mut any_public = false;
+    for f in &fns {
+        if f.is_public && !f.is_entry {
+            any_public = true;
+            let called = calls.get(&f.name);
+            let mut descr = format!("    {}", f.name);
+            if let Some(set) = called {
+                if !set.is_empty() {
+                    let list: Vec<_> = set.iter().cloned().collect();
+                    descr.push_str(&format!(" (calls: {})", list.join(", ")));
+                }
+            }
+            println!("{}", descr);
+            if let Some(xset) = cross_calls.get(&f.name) {
+                if !xset.is_empty() {
+                    let list: Vec<_> = xset.iter().cloned().collect();
+                    println!("      cross-module: {}", list.join(", "));
+                }
+            }
+        }
+    }
+    if !any_public {
+        println!("    (none)");
+    }
+
+    Ok(())
+}
+
+/// Naive detection of cross-module calls in a single line of Move source.
+/// Returns targets like `module::func` or `0x2::transfer::public_transfer`.
+fn find_cross_module_calls(
+    line: &str,
+    module_short: &str,
+    local_names: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // Strip comments.
+    let t = if let Some(idx) = line.find("//") {
+        &line[..idx]
+    } else {
+        line
+    };
+    for part in t.split(|c: char| c.is_whitespace() || c == ';' || c == ',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Only consider things that look like calls: something with '('.
+        if let Some(before_paren) = part.split('(').next() {
+            if !before_paren.contains("::") {
+                continue;
+            }
+            let candidate = before_paren.trim_end_matches(|c: char| c == '<' || c == '>');
+            // Skip same-module calls we already accounted for.
+            if candidate.starts_with(module_short)
+                || candidate.starts_with("Self::")
+                || local_names.contains(candidate)
+            {
+                continue;
+            }
+            // Basic sanity: ensure last segment looks like a function name.
+            if let Some(last_seg) = candidate.split("::").last() {
+                if last_seg.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+                    out.push(candidate.to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn log_trace_for_test(trace_path: &Path, test_name: &str) -> Result<(), Box<dyn std::error::Error>> {
