@@ -215,6 +215,24 @@ fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Err
                 for (target, reason) in info.cannot_generate {
                     alerts.push((target, reason));
                 }
+                for (type_name, fn_name) in info.non_init_shared {
+                    alerts.push((
+                        file_name.clone(),
+                        format!(
+                            "Type '{}' is created/shared in function '{}' (not init). Add a #[test_only] helper that calls {} with test parameters, or implement manually (will be tackled in test-generation phase).",
+                            type_name, fn_name, fn_name
+                        ),
+                    ));
+                }
+                for (type_name, fn_name) in info.non_init_caps {
+                    alerts.push((
+                        file_name.clone(),
+                        format!(
+                            "Cap type '{}' is created/transferred in function '{}' (not init). Add a #[test_only] helper that calls {} with test parameters, or implement manually (will be tackled in test-generation phase).",
+                            type_name, fn_name, fn_name
+                        ),
+                    ));
+                }
             }
             Err(e) => {
                 alerts.push((file_name, format!("analysis failed: {}", e)));
@@ -266,15 +284,6 @@ fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    let tests_dir = path.join("tests");
-    if !tests_dir.is_dir() {
-        fs::create_dir_all(&tests_dir)?;
-    }
-    let out_path = tests_dir.join("tidewalker_generated_tests_setup.move");
-    let content = generate_setup_move_content(&pkg_name, &[], &[]);
-    fs::write(&out_path, content)?;
-    println!("Wrote {}", out_path.display());
-
     if !alerts.is_empty() {
         eprintln!("\n--- Tidewalker: setup generation alerts ---");
         for (target, reason) in &alerts {
@@ -292,6 +301,12 @@ struct ModuleSetupInfo {
     shared_types: Vec<(String, String)>,
     cap_types: Vec<(String, String)>,
     cannot_generate: Vec<(String, String)>,
+    /// (type_name, function_name) for share_object in non-init functions
+    non_init_shared: Vec<(String, String)>,
+    /// (type_name, function_name) for transfer(..., sender) in non-init functions
+    non_init_caps: Vec<(String, String)>,
+    /// If init takes a one-time witness (e.g. REGISTRY), we don't generate for init-created types
+    init_one_time_witness: Option<String>,
 }
 
 fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error::Error>> {
@@ -328,41 +343,196 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
         i += 1;
     }
 
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    info.init_one_time_witness = get_init_one_time_witness(&lines);
+
     let init_body = find_init_body(&lines);
+    let init_complex_trigger = init_body
+        .as_ref()
+        .and_then(|body| first_disallowed_call_in_body(body));
     let (shared_vars, cap_vars) = if let Some(body) = init_body {
         parse_init_body(body)
     } else {
         (Vec::new(), Vec::new())
     };
 
-    for (_, type_name) in &shared_vars {
-        if public_structs.contains(type_name) {
-            info.shared_types.push((info.module_name.clone(), type_name.clone()));
-        } else if !type_name.is_empty() {
+    let skip_init_generation = info.init_one_time_witness.is_some() || init_complex_trigger.is_some();
+    if skip_init_generation {
+        if let Some(ref w) = info.init_one_time_witness {
             info.cannot_generate.push((
-                path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                file_name.clone(),
                 format!(
-                    "shared object type '{}' is not a public struct (cannot generate create_and_share)",
-                    type_name
+                    "Init uses one-time witness ({}); add a #[test_only] helper that receives the witness, or rely on test flow that simulates publish.",
+                    w
                 ),
             ));
         }
-    }
-    for (_, type_name) in &cap_vars {
-        if public_structs.contains(type_name) {
-            info.cap_types.push((info.module_name.clone(), type_name.clone()));
-        } else if !type_name.is_empty() {
+        if let Some(trigger) = init_complex_trigger {
             info.cannot_generate.push((
-                path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                file_name.clone(),
                 format!(
-                    "admin/cap type '{}' is not a public struct (cannot generate cap helper)",
-                    type_name
+                    "Init appears complex (found call `{}`); add a #[test_only] helper manually in the defining module or call existing test API.",
+                    trigger
                 ),
             ));
+        }
+    } else {
+        for (_, type_name) in &shared_vars {
+            if public_structs.contains(type_name) {
+                info.shared_types.push((info.module_name.clone(), type_name.clone()));
+            } else if !type_name.is_empty() {
+                info.cannot_generate.push((
+                    file_name.clone(),
+                    format!(
+                        "shared object type '{}' is not a public struct (cannot generate create_and_share). Add a #[test_only] helper manually in the defining module.",
+                        type_name
+                    ),
+                ));
+            }
+        }
+        for (_, type_name) in &cap_vars {
+            if public_structs.contains(type_name) {
+                info.cap_types.push((info.module_name.clone(), type_name.clone()));
+            } else if !type_name.is_empty() {
+                info.cannot_generate.push((
+                    file_name.clone(),
+                    format!(
+                        "admin/cap type '{}' is not a public struct (cannot generate cap helper). Add a #[test_only] helper manually in the defining module.",
+                        type_name
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Non-init: find share_object / transfer(..., sender) in all other functions (exclude our generated helpers)
+    for (fn_name, body) in find_all_function_bodies(&lines) {
+        if fn_name == "init" {
+            continue;
+        }
+        if fn_name.starts_with("create_and_share_") && fn_name.ends_with("_for_testing") {
+            continue;
+        }
+        if fn_name.starts_with("create_") && fn_name.ends_with("_for_testing") {
+            continue;
+        }
+        let (shared, caps) = parse_init_body(body);
+        for (_, type_name) in shared {
+            if !type_name.is_empty() {
+                info.non_init_shared.push((type_name, fn_name.clone()));
+            }
+        }
+        for (_, type_name) in caps {
+            if !type_name.is_empty() {
+                info.non_init_caps.push((type_name, fn_name.clone()));
+            }
         }
     }
 
     Ok(info)
+}
+
+/// Find all function definitions and return (function_name, body_lines). Includes init.
+fn find_all_function_bodies<'a>(lines: &'a [&'a str]) -> Vec<(String, Vec<&'a str>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim_start();
+        let (is_fun, name) = if t.starts_with("public entry fun ") {
+            let after = &t["public entry fun ".len()..];
+            let name = after
+                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (true, name)
+        } else if t.starts_with("entry fun ") {
+            let after = &t["entry fun ".len()..];
+            let name = after
+                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (true, name)
+        } else if t.starts_with("public fun ") {
+            let after = &t["public fun ".len()..];
+            let name = after
+                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (true, name)
+        } else if t.starts_with("public(package) fun ") {
+            let after = &t["public(package) fun ".len()..];
+            let name = after
+                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (true, name)
+        } else if t.starts_with("fun ") {
+            let after = &t["fun ".len()..];
+            let name = after
+                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_string();
+            (true, name)
+        } else {
+            (false, String::new())
+        };
+        if is_fun && !name.is_empty() {
+            let mut depth = 0;
+            let mut start = i;
+            let mut end_line = i;
+            for (j, l) in lines.iter().enumerate().skip(i) {
+                for c in l.chars() {
+                    if c == '{' {
+                        depth += 1;
+                        if depth == 1 {
+                            start = j + 1;
+                        }
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_line = j;
+                            out.push((name.clone(), lines[start..=j].to_vec()));
+                            break;
+                        }
+                    }
+                }
+                if depth == 0 {
+                    break;
+                }
+            }
+            i = end_line + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// If init's first parameter is a one-time witness (e.g. `_: REGISTRY`), return the type name.
+fn get_init_one_time_witness(lines: &[&str]) -> Option<String> {
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with("fun init(") {
+            let after_paren = t.strip_prefix("fun init(")?;
+            let first_param = after_paren.split(',').next()?.trim().trim_end_matches(')');
+            let first_param = first_param.trim();
+            if first_param.starts_with("_: ") {
+                return Some(first_param.strip_prefix("_: ").unwrap_or(first_param).trim().to_string());
+            }
+            if first_param.starts_with('_') && first_param.contains(':') {
+                if let Some(after_colon) = first_param.split(':').nth(1) {
+                    return Some(after_colon.trim().to_string());
+                }
+            }
+            break;
+        }
+    }
+    None
 }
 
 fn find_init_body<'a>(lines: &'a [&'a str]) -> Option<Vec<&'a str>> {
@@ -458,6 +628,112 @@ fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
     } else {
         Some(arg.to_string())
     }
+}
+
+fn first_disallowed_call_in_body(body: &[&str]) -> Option<String> {
+    // Allowlist is checked by suffix match so it works with prefixes like `sui::object::new`.
+    const ALLOWED_SUFFIXES: [&str; 10] = [
+        "object::new",
+        "transfer::share_object",
+        "transfer::public_share_object",
+        "transfer::transfer",
+        "transfer::public_transfer",
+        "tx_context::sender",
+        "std::string::utf8",
+        "option::none",
+        "option::some",
+        "vector::empty",
+    ];
+
+    for line in body {
+        // Strip line comments.
+        let t = line.split("//").next().unwrap_or("").trim_end();
+        if t.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = t.chars().collect();
+        for (idx, ch) in chars.iter().enumerate() {
+            if *ch != '(' || idx == 0 {
+                continue;
+            }
+
+            // Walk back from '(' to find the call "token" (optionally skipping generics).
+            let mut j: isize = (idx as isize) - 1;
+            while j >= 0 && chars[j as usize].is_whitespace() {
+                j -= 1;
+            }
+            if j < 0 {
+                continue;
+            }
+
+            // Skip a single generic parameter block like `<T, U>` immediately before '('.
+            if chars[j as usize] == '>' {
+                let mut depth: i32 = 0;
+                while j >= 0 {
+                    let c = chars[j as usize];
+                    if c == '>' {
+                        depth += 1;
+                    } else if c == '<' {
+                        depth -= 1;
+                        if depth == 0 {
+                            j -= 1;
+                            while j >= 0 && chars[j as usize].is_whitespace() {
+                                j -= 1;
+                            }
+                            break;
+                        }
+                    }
+                    j -= 1;
+                }
+                if j < 0 {
+                    continue;
+                }
+            }
+
+            // Collect token chars: [A-Za-z0-9_:_]
+            let end = j as usize;
+            let mut start = end;
+            while start > 0 {
+                let c = chars[start];
+                if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            if !(chars[start].is_ascii_alphanumeric() || chars[start] == '_' || chars[start] == ':') {
+                start += 1;
+            }
+            if start > end {
+                continue;
+            }
+            let token: String = chars[start..=end].iter().collect();
+            if token.is_empty() {
+                continue;
+            }
+            if !token.chars().any(|c| c.is_ascii_alphabetic() || c == '_') {
+                continue;
+            }
+
+            // Ignore method calls like `x.to_inner()` (token is preceded by '.').
+            if start > 0 && chars[start - 1] == '.' {
+                continue;
+            }
+
+            // Qualified call: `foo::bar(` (or deeper). Local call: `helper(`.
+            if token.contains("::") {
+                if ALLOWED_SUFFIXES.iter().any(|a| token.ends_with(a)) {
+                    continue;
+                }
+                return Some(token);
+            } else {
+                // Any local helper call makes init complex in the refined heuristic.
+                return Some(token);
+            }
+        }
+    }
+
+    None
 }
 
 /// Inner width of the ASCII box (space between the two slashes).
@@ -558,13 +834,19 @@ fn find_tidewalker_block(lines: &[String]) -> Option<(usize, usize)> {
     let first = first_box_start
         .into_iter()
         .find(|&i| is_border(lines[i].as_str()))?;
-    // Second box: after the helpers, find the next border (start of closing box), then end is that + 4.
-    let after_first_box = last_title_idx + 5;
+    // Second box: after the first box (5 lines) and the helpers, find the closing box.
+    let after_first_box = first + 5;
+    if after_first_box >= lines.len() {
+        return None;
+    }
     let second_box_start = lines[after_first_box..]
         .iter()
         .position(|l| is_border(l.as_str()))
         .map(|i| after_first_box + i)?;
     let second_box_end = second_box_start + 4;
+    if second_box_end >= lines.len() {
+        return None;
+    }
     Some((first, second_box_end))
 }
 
@@ -614,26 +896,6 @@ fn inject_test_only_helpers(
     lines.extend(snippet);
     fs::write(source_path, lines.join("\n"))?;
     Ok(())
-}
-
-fn generate_setup_move_content(
-    pkg_name: &str,
-    _shared: &[(String, String)],
-    _caps: &[(String, String)],
-) -> String {
-    let mut out = Vec::new();
-    out.push("// Generated by Tidewalker. Do not edit by hand.".to_string());
-    out.push("// Setup helpers are not generated here: in Move, structs can only be instantiated".to_string());
-    out.push("// in their defining module. Add #[test_only] create_and_share_* / create_*_for_testing".to_string());
-    out.push("// in the protocol source module (e.g. move_project.move) instead.".to_string());
-    out.push("#[test_only]".to_string());
-    out.push(format!("module {}::tidewalker_generated_tests_setup {{", pkg_name));
-    out.push("".to_string());
-    out.push("    use sui::test_scenario;".to_string());
-    out.push("    use sui::tx_context;".to_string());
-    out.push("".to_string());
-    out.push("}".to_string());
-    out.join("\n")
 }
 
 /// Very simple textual analysis: find entry functions and calls to other functions in same module.
