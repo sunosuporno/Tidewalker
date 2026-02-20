@@ -206,6 +206,10 @@ fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Err
 
     let mut all_shared: Vec<(String, String)> = Vec::new();
     let mut all_caps: Vec<(String, String)> = Vec::new();
+    let mut struct_fields_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<(String, String)>>,
+    > = std::collections::HashMap::new();
     let mut alerts: Vec<(String, String)> = Vec::new();
     let mut file_for_module: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
@@ -214,6 +218,7 @@ fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Err
         match extract_setup_info(file) {
             Ok(info) => {
                 file_for_module.insert(info.module_name.clone(), file_name.clone());
+                struct_fields_by_module.insert(info.module_name.clone(), info.struct_field_types.clone());
                 for (mod_name, type_name) in info.shared_types {
                     all_shared.push((mod_name.clone(), type_name));
                 }
@@ -286,7 +291,10 @@ fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Err
         if file_has_test_only_outside_tidewalker_block(&lines) {
             continue; // file has dev-written test_only → skip entirely, do not touch
         }
-        match inject_test_only_helpers(&source_path, mod_name, shared, caps) {
+        let empty_fields: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        let struct_fields = struct_fields_by_module.get(mod_name).unwrap_or(&empty_fields);
+        match inject_test_only_helpers(&source_path, mod_name, shared, caps, struct_fields) {
             Ok(()) => println!("Injected test_only helpers into {}", source_path.display()),
             Err(e) => alerts.push((file_name.clone(), format!("Failed to inject helpers: {}", e))),
         }
@@ -313,10 +321,51 @@ fn run_generate(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 struct FnDecl {
     module_name: String,
     fn_name: String,
-    params: Vec<String>, // type strings only
+    params: Vec<ParamDecl>,
+    return_ty: Option<String>,
+    is_public: bool,
     is_entry: bool,
+    is_test_only: bool,
     /// Tidewalker directive preconditions: functions that must be called first.
     requires: Vec<String>,
+    numeric_effects: Vec<NumericEffect>,
+    calls: Vec<CallSite>,
+}
+
+#[derive(Debug, Clone)]
+struct ParamDecl {
+    name: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone)]
+struct NumericEffect {
+    base_var: String,
+    field: String,
+    op: NumericOp,
+}
+
+#[derive(Debug, Clone)]
+struct AccessorSig {
+    fn_name: String,
+    param_ty: String,
+}
+
+#[derive(Debug, Clone)]
+enum NumericOp {
+    Add(String),
+    Sub(String),
+    Mul(String),
+    Div(String),
+    Mod(String),
+    Set(String),
+    Changed,
+}
+
+#[derive(Debug, Clone)]
+struct CallSite {
+    callee_fn: String,
+    arg_exprs: Vec<String>,
 }
 
 fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -382,8 +431,25 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     out.push("    const OTHER: address = @0xB;".to_string());
     out.push("".to_string());
 
+    let accessor_map = build_accessor_map(&decls);
+    let helper_catalog = build_helper_catalog(&decls);
+    let fn_lookup = build_fn_lookup(&decls);
+    let effects_map = build_chained_effect_map(&decls, 4);
     for d in decls {
-        if let Some(test_lines) = render_best_effort_test(&d) {
+        if d.is_test_only {
+            continue;
+        }
+        if !d.is_public && !d.is_entry {
+            continue;
+        }
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved_effects = effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.numeric_effects.clone());
+        if let Some(test_lines) =
+            render_best_effort_test(&d, &accessor_map, &helper_catalog, &fn_lookup, &resolved_effects)
+        {
             for l in test_lines {
                 out.push(format!("    {}", l));
             }
@@ -452,26 +518,30 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             i += 1;
             continue;
         }
-        let (is_public_or_entry, is_entry, name) = if t.starts_with("public entry fun ") {
+        let (is_fn_decl, is_public, is_entry, name) = if t.starts_with("public entry fun ") {
             let after = &t["public entry fun ".len()..];
             let name = after.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next().unwrap_or("").to_string();
-            (true, true, name)
+            (true, true, true, name)
         } else if t.starts_with("entry fun ") {
             let after = &t["entry fun ".len()..];
             let name = after.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next().unwrap_or("").to_string();
-            (true, true, name)
+            (true, false, true, name)
         } else if t.starts_with("public fun ") {
             let after = &t["public fun ".len()..];
             let name = after.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next().unwrap_or("").to_string();
-            (true, false, name)
+            (true, true, false, name)
         } else if t.starts_with("public(package) fun ") {
             let after = &t["public(package) fun ".len()..];
             let name = after.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next().unwrap_or("").to_string();
-            (true, false, name)
+            (true, true, false, name)
+        } else if t.starts_with("fun ") {
+            let after = &t["fun ".len()..];
+            let name = after.split(|c: char| c == '(' || c == '<' || c.is_whitespace()).next().unwrap_or("").to_string();
+            (true, false, false, name)
         } else {
-            (false, false, String::new())
+            (false, false, false, String::new())
         };
-        if !is_public_or_entry || name.is_empty() {
+        if !is_fn_decl || name.is_empty() {
             // Keep #[test_only] pending across blank lines and comments (docs often sit between
             // the attribute and the function). Clear only on non-comment, non-empty content.
             if pending_test_only_attr
@@ -487,13 +557,15 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             i += 1;
             continue;
         }
-        if name == "init" || pending_test_only_attr {
+        if name == "init" {
             pending_test_only_attr = false;
             pending_requires.clear();
             i += 1;
             continue;
         }
+        let is_test_only = pending_test_only_attr;
 
+        let fn_start = i;
         // Collect header across lines until we see ')'.
         let mut header = t.to_string();
         let mut j = i + 1;
@@ -502,25 +574,65 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             header.push_str(lines[j].trim());
             j += 1;
         }
-        i = j;
         pending_test_only_attr = false;
 
         let params_str = match header.split_once('(').and_then(|(_, rest)| rest.split_once(')')).map(|(p, _)| p) {
             Some(p) => p,
             None => continue,
         };
+        let return_ty = extract_return_type(&header);
         let params = split_params(params_str)
             .into_iter()
-            .filter_map(|p| p.split_once(':').map(|(_, ty)| ty.trim().to_string()))
+            .filter_map(|p| {
+                p.split_once(':').map(|(name, ty)| ParamDecl {
+                    name: name.trim().to_string(),
+                    ty: ty.trim().to_string(),
+                })
+            })
             .collect::<Vec<_>>();
+
+        let mut brace_depth = 0i32;
+        let mut body_start: Option<usize> = None;
+        let mut body_end: Option<usize> = None;
+        for (k, l) in lines.iter().enumerate().skip(fn_start) {
+            for c in l.chars() {
+                if c == '{' {
+                    brace_depth += 1;
+                    if brace_depth == 1 {
+                        body_start = Some(k + 1);
+                    }
+                } else if c == '}' {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        body_end = Some(k);
+                        break;
+                    }
+                }
+            }
+            if body_end.is_some() {
+                break;
+            }
+        }
+        let body_lines = match (body_start, body_end) {
+            (Some(s), Some(e)) if s <= e => lines[s..=e].iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let numeric_effects = extract_numeric_effects_from_body(&body_lines);
+        let calls = extract_same_module_calls_from_body(&body_lines, &module_name);
 
         out.push(FnDecl {
             module_name: module_name.clone(),
             fn_name: name,
             params,
+            return_ty,
+            is_public,
             is_entry,
+            is_test_only,
             requires: std::mem::take(&mut pending_requires),
+            numeric_effects,
+            calls,
         });
+        i = body_end.map(|e| e + 1).unwrap_or(j);
     }
     out
 }
@@ -550,26 +662,27 @@ fn split_params(s: &str) -> Vec<String> {
     out
 }
 
-fn render_best_effort_test(d: &FnDecl) -> Option<Vec<String>> {
-    // For now we only synthesize reliable calls for move_project-style APIs and for
-    // signatures consisting of primitives + TxContext.
+fn render_best_effort_test(
+    d: &FnDecl,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    numeric_effects: &[NumericEffect],
+) -> Option<Vec<String>> {
     let fq = format!("{}::{}", d.module_name, d.fn_name);
     let mut lines = Vec::new();
     lines.push("#[test]".to_string());
     lines.push(format!("fun test_call_{}_{}() {{", d.module_name.split("::").last().unwrap_or("m"), d.fn_name));
     lines.push("    let mut scenario = test_scenario::begin(SUPER_USER);".to_string());
 
-    // Helper: build argument list and required setup.
     let mut args: Vec<String> = Vec::new();
-    let mut needs_ctx = false;
-    let mut needs_counter = false;
-    let mut needs_admincap = false;
     let mut needs_coin = false;
+    let mut param_runtime: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut object_needs: Vec<ObjectNeed> = Vec::new();
 
-    for ty in &d.params {
-        let t = ty.trim();
+    for param in &d.params {
+        let t = param.ty.trim();
         if t.contains("TxContext") {
-            needs_ctx = true;
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if t == "address" {
             args.push("OTHER".to_string());
@@ -579,67 +692,115 @@ fn render_best_effort_test(d: &FnDecl) -> Option<Vec<String>> {
             args.push("false".to_string());
         } else if t.contains("Coin<") || t.contains("Coin <") {
             needs_coin = true;
-            // we will pass &mut coin
-            args.push("&mut coin".to_string());
-        } else if t.contains("AdminCap") {
-            needs_admincap = true;
-            args.push("&cap".to_string());
-        } else if t.contains("Counter") {
-            needs_counter = true;
             if t.starts_with("&mut") {
-                args.push("&mut counter".to_string());
+                args.push("&mut coin".to_string());
             } else {
-                args.push("&counter".to_string());
+                args.push("&coin".to_string());
             }
+        } else if t.starts_with('&') {
+            let obj = ObjectNeed::new(param);
+            if obj.is_mut {
+                args.push(format!("&mut {}", obj.var_name));
+            } else {
+                args.push(format!("&{}", obj.var_name));
+            }
+            param_runtime.insert(param.name.clone(), obj.var_name.clone());
+            object_needs.push(obj);
         } else {
-            // unsupported param type in this first pass
             return None;
         }
     }
 
-    // Setup tx: create needed objects.
-    if needs_ctx || needs_coin || needs_admincap {
-        lines.push("    {".to_string());
-        if needs_coin {
-            // Default to SUI for first pass.
-            lines.push("        let mut coin = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));".to_string());
-        }
-        if needs_admincap {
-            // Assume setup helper exists in same module as AdminCap.
-            lines.push(format!("        let cap = {}::create_admincap_for_testing(test_scenario::ctx(&mut scenario));", d.module_name).to_string());
-        }
-        if !args.is_empty() && !needs_counter {
-            lines.push(format!("        {}({});", fq, args.join(", ")));
-        }
-        // Consume resources so tests can return cleanly.
-        if needs_admincap {
-            lines.push("        transfer::public_transfer(cap, SUPER_USER);".to_string());
-        }
-        if needs_coin {
-            lines.push("        transfer::public_transfer(coin, SUPER_USER);".to_string());
-        }
-        lines.push("    };".to_string());
-    }
-
-    if needs_counter {
-        // Tx 1: create and share counter
-        lines.push("    {".to_string());
-        lines.push(format!("        {}::create_and_share_counter_for_testing(test_scenario::ctx(&mut scenario));", d.module_name));
-        lines.push("    };".to_string());
-        lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
-        // Tx 2: take shared counter and call
-        lines.push("    {".to_string());
-        lines.push(format!("        let mut counter = scenario.take_shared<{}::Counter>();", d.module_name));
-        // Tidewalker directive preconditions.
-        for req in &d.requires {
-            if req == "increment" {
-                lines.push(format!("        {}::increment(&mut counter);", d.module_name));
+    let mut shared_objects: Vec<ObjectNeed> = Vec::new();
+    let mut owned_objects: Vec<ObjectNeed> = Vec::new();
+    if !object_needs.is_empty() {
+        let module_helpers = helper_catalog.get(&d.module_name)?;
+        for obj in &object_needs {
+            if module_helpers.shared_types.contains(&obj.type_key) {
+                shared_objects.push(obj.clone());
+            } else if module_helpers.owned_types.contains(&obj.type_key) {
+                owned_objects.push(obj.clone());
+            } else {
+                return None;
             }
         }
-        lines.push(format!("        {}({});", fq, args.join(", ")));
-        lines.push("        test_scenario::return_shared(counter);".to_string());
-        lines.push("    };".to_string());
     }
+    let has_shared_objects = !shared_objects.is_empty();
+
+    if has_shared_objects {
+        lines.push("    {".to_string());
+        for obj in &shared_objects {
+            lines.push(format!(
+                "        {}::create_and_share_{}_for_testing(test_scenario::ctx(&mut scenario));",
+                d.module_name, obj.type_key
+            ));
+        }
+        lines.push("    };".to_string());
+        lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
+    }
+
+    let mut object_vars_by_type: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for obj in &object_needs {
+        object_vars_by_type
+            .entry(obj.type_key.clone())
+            .or_insert_with(|| obj.var_name.clone());
+    }
+
+    let (snapshot_before_lines, snapshot_after_lines) =
+        build_numeric_assertion_lines(d, numeric_effects, &param_runtime, accessor_map);
+
+    lines.push("    {".to_string());
+    if needs_coin {
+        lines.push("        let mut coin = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));".to_string());
+    }
+    for obj in &owned_objects {
+        let maybe_mut = if obj.is_mut { "mut " } else { "" };
+        lines.push(format!(
+            "        let {}{} = {}::create_{}_for_testing(test_scenario::ctx(&mut scenario));",
+            maybe_mut, obj.var_name, d.module_name, obj.type_key
+        ));
+    }
+    for obj in &shared_objects {
+        let maybe_mut = if obj.is_mut { "mut " } else { "" };
+        let obj_ty = qualify_type_for_module(&d.module_name, &obj.type_name);
+        lines.push(format!(
+            "        let {}{} = scenario.take_shared<{}>();",
+            maybe_mut, obj.var_name, obj_ty
+        ));
+    }
+
+    for req in &d.requires {
+        if let Some(module_fns) = fn_lookup.get(&d.module_name) {
+            if let Some(req_decl) = module_fns.get(req) {
+                if let Some(req_args) = synthesize_call_args_for_fn(req_decl, &object_vars_by_type, needs_coin) {
+                    lines.push(format!(
+                        "        {}::{}({});",
+                        d.module_name,
+                        req_decl.fn_name,
+                        req_args.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+    for l in snapshot_before_lines {
+        lines.push(format!("        {}", l));
+    }
+    lines.push(format!("        {}({});", fq, args.join(", ")));
+    for l in snapshot_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for obj in &shared_objects {
+        lines.push(format!("        test_scenario::return_shared({});", obj.var_name));
+    }
+    for obj in &owned_objects {
+        lines.push(format!("        transfer::public_transfer({}, SUPER_USER);", obj.var_name));
+    }
+    if needs_coin {
+        lines.push("        transfer::public_transfer(coin, SUPER_USER);".to_string());
+    }
+    lines.push("    };".to_string());
 
     // Ensure scenario is closed.
     lines.push("    test_scenario::end(scenario);".to_string());
@@ -647,11 +808,658 @@ fn render_best_effort_test(d: &FnDecl) -> Option<Vec<String>> {
     Some(lines)
 }
 
+#[derive(Debug, Clone)]
+struct ObjectNeed {
+    type_name: String,
+    type_key: String,
+    var_name: String,
+    is_mut: bool,
+}
+
+impl ObjectNeed {
+    fn new(param: &ParamDecl) -> Self {
+        let type_name = normalize_param_object_type(&param.ty);
+        let type_key = type_key_from_type_name(&type_name);
+        Self {
+            type_name,
+            type_key,
+            var_name: format!("obj_{}", sanitize_ident(&param.name)),
+            is_mut: param.ty.trim().starts_with("&mut"),
+        }
+    }
+}
+
+fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect> {
+    let mut effects = Vec::new();
+    for line in body_lines {
+        let no_comments = line.split("//").next().unwrap_or("").trim();
+        if no_comments.is_empty() || no_comments.starts_with("assert!") {
+            continue;
+        }
+        let stmt = no_comments.trim_end_matches(';').trim();
+        let (lhs, rhs) = match stmt.split_once('=') {
+            Some((l, r)) => (l.trim(), r.trim()),
+            None => continue,
+        };
+        if lhs.ends_with('!') || lhs.contains("==") {
+            continue;
+        }
+        let (base_var, field) = match parse_field_access(lhs) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let lhs_norm = remove_whitespace(lhs);
+        let rhs_norm = remove_whitespace(rhs);
+
+        let op = if let Some(rest) = rhs_norm.strip_prefix(&lhs_norm) {
+            let (op_char, raw_lit) = match rest.chars().next() {
+                Some(c @ ('+' | '-' | '*' | '/' | '%')) => (c, rest[1..].trim()),
+                _ => continue,
+            };
+            if let Some(lit) = parse_numeric_literal(raw_lit) {
+                match op_char {
+                    '+' => NumericOp::Add(lit),
+                    '-' => NumericOp::Sub(lit),
+                    '*' => NumericOp::Mul(lit),
+                    '/' => NumericOp::Div(lit),
+                    '%' => NumericOp::Mod(lit),
+                    _ => continue,
+                }
+            } else {
+                // We can still assert a state change happened even when exact delta is unknown.
+                NumericOp::Changed
+            }
+        } else if let Some(v) = parse_numeric_literal(&rhs_norm) {
+            NumericOp::Set(v)
+        } else {
+            continue;
+        };
+
+        effects.push(NumericEffect {
+            base_var,
+            field,
+            op,
+        });
+    }
+    effects
+}
+
+fn extract_return_type(header: &str) -> Option<String> {
+    let after_paren = header.split_once(')')?.1.trim();
+    let after_colon = after_paren.strip_prefix(':')?;
+    let before_brace = after_colon.split('{').next().unwrap_or(after_colon).trim();
+    if before_brace.is_empty() {
+        None
+    } else {
+        Some(before_brace.to_string())
+    }
+}
+
+fn extract_same_module_calls_from_body(body_lines: &[String], module_name: &str) -> Vec<CallSite> {
+    let module_short = module_name.split("::").last().unwrap_or(module_name);
+    let mut out = Vec::new();
+
+    for line in body_lines {
+        let text = line.split("//").next().unwrap_or("");
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] != '(' || i == 0 {
+                i += 1;
+                continue;
+            }
+            let mut j: isize = (i as isize) - 1;
+            while j >= 0 && chars[j as usize].is_whitespace() {
+                j -= 1;
+            }
+            if j < 0 {
+                i += 1;
+                continue;
+            }
+            let end = j as usize;
+            let mut start = end;
+            while start > 0 {
+                let c = chars[start];
+                if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            if !(chars[start].is_ascii_alphanumeric() || chars[start] == '_' || chars[start] == ':') {
+                start += 1;
+            }
+            if start > end {
+                i += 1;
+                continue;
+            }
+            if start > 0 && chars[start - 1] == '.' {
+                i += 1;
+                continue;
+            }
+            let token: String = chars[start..=end].iter().collect();
+            if token.is_empty() || token == "assert" {
+                i += 1;
+                continue;
+            }
+
+            let callee = if token.contains("::") {
+                if token.starts_with("Self::") {
+                    token.split("::").last().unwrap_or("").to_string()
+                } else if token.starts_with(&format!("{}::", module_short)) {
+                    token.split("::").last().unwrap_or("").to_string()
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                token
+            };
+            if callee.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            let mut depth = 1i32;
+            let mut k = i + 1;
+            while k < chars.len() {
+                if chars[k] == '(' {
+                    depth += 1;
+                } else if chars[k] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if k >= chars.len() {
+                i += 1;
+                continue;
+            }
+
+            let args_raw: String = chars[i + 1..k].iter().collect();
+            out.push(CallSite {
+                callee_fn: callee,
+                arg_exprs: split_args(&args_raw),
+            });
+            i = k + 1;
+        }
+    }
+
+    out
+}
+
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut angle = 0i32;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '<' => {
+                angle += 1;
+                cur.push(ch);
+            }
+            '>' => {
+                angle -= 1;
+                cur.push(ch);
+            }
+            '(' => {
+                paren += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                paren -= 1;
+                cur.push(ch);
+            }
+            '[' => {
+                bracket += 1;
+                cur.push(ch);
+            }
+            ']' => {
+                bracket -= 1;
+                cur.push(ch);
+            }
+            ',' if angle == 0 && paren == 0 && bracket == 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
+}
+
+fn parse_field_access(expr: &str) -> Option<(String, String)> {
+    let norm = remove_whitespace(expr);
+    if norm.contains('(') || norm.contains(')') || norm.matches('.').count() != 1 {
+        return None;
+    }
+    let (base, field) = norm.split_once('.')?;
+    if base.is_empty() || field.is_empty() {
+        return None;
+    }
+    if !is_ident(base) || !is_ident(field) {
+        return None;
+    }
+    Some((base.to_string(), field.to_string()))
+}
+
+fn remove_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+}
+
+fn parse_numeric_literal(raw: &str) -> Option<String> {
+    let mut lit = raw.trim();
+    while lit.starts_with('(') && lit.ends_with(')') && lit.len() >= 2 {
+        lit = &lit[1..lit.len() - 1];
+        lit = lit.trim();
+    }
+    if lit.is_empty() {
+        return None;
+    }
+    if lit.chars().all(|c| c.is_ascii_digit() || c == '_') && lit.chars().any(|c| c.is_ascii_digit()) {
+        return Some(lit.to_string());
+    }
+    None
+}
+
+fn is_ident(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+}
+
+fn is_numeric_type(ty: &str) -> bool {
+    matches!(
+        ty.trim(),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "u256"
+    )
+}
+
+fn normalize_param_object_type(ty: &str) -> String {
+    ty.replace("&mut", "")
+        .replace('&', "")
+        .trim()
+        .to_string()
+}
+
+fn type_key_from_type_name(type_name: &str) -> String {
+    let clean = type_name.trim();
+    let no_generics = clean.split('<').next().unwrap_or(clean).trim();
+    no_generics
+        .split("::")
+        .last()
+        .unwrap_or(no_generics)
+        .trim()
+        .to_lowercase()
+}
+
+fn qualify_type_for_module(module_name: &str, type_name: &str) -> String {
+    let clean = type_name.trim();
+    if clean.contains("::") {
+        clean.to_string()
+    } else {
+        format!("{}::{}", module_name, clean)
+    }
+}
+
+fn build_accessor_map(
+    decls: &[FnDecl],
+) -> std::collections::HashMap<String, Vec<AccessorSig>> {
+    let mut out: std::collections::HashMap<String, Vec<AccessorSig>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if d.is_test_only || !d.is_public {
+            continue;
+        }
+        if d.params.len() != 1 {
+            continue;
+        }
+        let ret = match &d.return_ty {
+            Some(r) if is_numeric_type(r) => r,
+            _ => continue,
+        };
+        let pty = d.params[0].ty.trim();
+        if !pty.starts_with('&') {
+            continue;
+        }
+        let _ = ret; // keep explicit intent: numeric accessor only
+        out.entry(d.module_name.clone())
+            .or_default()
+            .push(AccessorSig {
+                fn_name: d.fn_name.clone(),
+                param_ty: normalize_param_object_type(pty),
+            });
+    }
+    out
+}
+
+#[derive(Debug, Default)]
+struct ModuleHelperCatalog {
+    shared_types: std::collections::HashSet<String>,
+    owned_types: std::collections::HashSet<String>,
+}
+
+fn build_helper_catalog(
+    decls: &[FnDecl],
+) -> std::collections::HashMap<String, ModuleHelperCatalog> {
+    let mut out: std::collections::HashMap<String, ModuleHelperCatalog> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if !d.is_test_only {
+            continue;
+        }
+        if let Some(type_key) = d
+            .fn_name
+            .strip_prefix("create_and_share_")
+            .and_then(|x| x.strip_suffix("_for_testing"))
+        {
+            out.entry(d.module_name.clone())
+                .or_default()
+                .shared_types
+                .insert(type_key.to_string());
+            continue;
+        }
+        if let Some(type_key) = d
+            .fn_name
+            .strip_prefix("create_")
+            .and_then(|x| x.strip_suffix("_for_testing"))
+        {
+            out.entry(d.module_name.clone())
+                .or_default()
+                .owned_types
+                .insert(type_key.to_string());
+        }
+    }
+    out
+}
+
+fn build_fn_lookup(
+    decls: &[FnDecl],
+) -> std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        out.entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d.clone());
+    }
+    out
+}
+
+fn synthesize_call_args_for_fn(
+    d: &FnDecl,
+    object_vars_by_type: &std::collections::HashMap<String, String>,
+    has_coin: bool,
+) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for p in &d.params {
+        let t = p.ty.trim();
+        if t.starts_with('&') && !t.contains("TxContext") && !t.contains("Coin<") && !t.contains("Coin <") {
+            let ty = normalize_param_object_type(t);
+            let key = type_key_from_type_name(&ty);
+            let var = object_vars_by_type.get(&key)?;
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else {
+                args.push(format!("&{}", var));
+            }
+        } else if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if t.contains("Coin<") || t.contains("Coin <") {
+            if !has_coin {
+                return None;
+            }
+            if t.starts_with("&mut") {
+                args.push("&mut coin".to_string());
+            } else {
+                args.push("&coin".to_string());
+            }
+        } else if t == "u64" {
+            args.push("1".to_string());
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("OTHER".to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(args)
+}
+
+fn build_chained_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<NumericEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<String, std::collections::HashMap<String, &FnDecl>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+
+    let mut cache: std::collections::HashMap<String, Vec<NumericEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+fn collect_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<String, std::collections::HashMap<String, &FnDecl>>,
+    cache: &mut std::collections::HashMap<String, Vec<NumericEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<NumericEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.numeric_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.numeric_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                out.push(NumericEffect {
+                    base_var: arg.to_string(),
+                    field: eff.field,
+                    op: eff.op,
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!("{}::{}::{:?}", eff.base_var, eff.field, eff.op);
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
+}
+
+fn resolve_read_expr(
+    d: &FnDecl,
+    eff: &NumericEffect,
+    runtime_var: &str,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+) -> Option<String> {
+    let param = d.params.iter().find(|p| p.name == eff.base_var)?;
+    let param_obj_ty = normalize_param_object_type(&param.ty);
+    let module_accessors = accessor_map.get(&d.module_name)?;
+    let has_accessor = module_accessors.iter().any(|a| {
+        a.param_ty == param_obj_ty && a.fn_name == eff.field
+    });
+    if has_accessor {
+        Some(format!("{}::{}(&{})", d.module_name, eff.field, runtime_var))
+    } else {
+        None
+    }
+}
+
+fn build_numeric_assertion_lines(
+    d: &FnDecl,
+    numeric_effects: &[NumericEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+) -> (Vec<String>, Vec<String>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut idx = 0usize;
+
+    for eff in numeric_effects {
+        let runtime_var = match param_runtime.get(&eff.base_var) {
+            Some(v) => v,
+            None => continue,
+        };
+        let key = format!("{}.{}", runtime_var, eff.field);
+        if seen_targets.contains(&key) {
+            continue;
+        }
+        let read_expr = match resolve_read_expr(d, eff, runtime_var, accessor_map) {
+            Some(expr) => expr,
+            None => continue,
+        };
+        seen_targets.insert(key.clone());
+
+        let before_name = format!(
+            "before_{}_{}",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&eff.field)
+        );
+        let after_name = format!(
+            "after_{}_{}",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&eff.field)
+        );
+        before.push(format!("let {} = {};", before_name, read_expr));
+        after.push(format!("let {} = {};", after_name, read_expr));
+
+        match &eff.op {
+            NumericOp::Add(v) => after.push(format!(
+                "assert!({} == {} + {}, {});",
+                after_name,
+                before_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Sub(v) => after.push(format!(
+                "assert!({} == {} - {}, {});",
+                after_name,
+                before_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Mul(v) => after.push(format!(
+                "assert!({} == {} * {}, {});",
+                after_name,
+                before_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Div(v) => after.push(format!(
+                "assert!({} == {} / {}, {});",
+                after_name,
+                before_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Mod(v) => after.push(format!(
+                "assert!({} == {} % {}, {});",
+                after_name,
+                before_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Set(v) => after.push(format!(
+                "assert!({} == {}, {});",
+                after_name,
+                v,
+                900 + idx as u64
+            )),
+            NumericOp::Changed => after.push(format!(
+                "assert!({} != {}, {});",
+                after_name,
+                before_name,
+                900 + idx as u64
+            )),
+        }
+        idx += 1;
+    }
+
+    (before, after)
+}
+
 #[derive(Debug, Default)]
 struct ModuleSetupInfo {
     module_name: String,
     shared_types: Vec<(String, String)>,
     cap_types: Vec<(String, String)>,
+    struct_field_types: std::collections::HashMap<String, Vec<(String, String)>>,
     cannot_generate: Vec<(String, String)>,
     /// (type_name, function_name) for share_object in non-init functions
     non_init_shared: Vec<(String, String)>,
@@ -678,6 +1486,8 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
     }
 
     let mut public_structs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut struct_field_types: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
@@ -691,9 +1501,28 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
             if !name.is_empty() && (t.contains("key") || t.contains("store")) {
                 public_structs.insert(name.clone());
             }
+            let mut fields: Vec<(String, String)> = Vec::new();
+            while i < lines.len() && !lines[i].contains('{') {
+                i += 1;
+            }
+            i += 1;
+            while i < lines.len() {
+                let f = lines[i].trim();
+                if f.starts_with('}') {
+                    break;
+                }
+                if let Some((field_name, field_ty)) = parse_struct_field_line(f) {
+                    fields.push((field_name, field_ty));
+                }
+                i += 1;
+            }
+            if !name.is_empty() && !fields.is_empty() {
+                struct_field_types.insert(name, fields);
+            }
         }
         i += 1;
     }
+    info.struct_field_types = struct_field_types;
 
     let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
     info.init_one_time_witness = get_init_one_time_witness(&lines);
@@ -982,6 +1811,26 @@ fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
     }
 }
 
+fn parse_struct_field_line(line: &str) -> Option<(String, String)> {
+    let t = line
+        .split("//")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(',')
+        .trim();
+    if t.is_empty() || t.starts_with('#') {
+        return None;
+    }
+    let (name, ty) = t.split_once(':')?;
+    let name = name.trim();
+    let ty = ty.trim();
+    if name.is_empty() || ty.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), ty.to_string()))
+}
+
 fn first_disallowed_call_in_body(body: &[&str]) -> Option<String> {
     // Allowlist is checked by suffix match so it works with prefixes like `sui::object::new`.
     const ALLOWED_SUFFIXES: [&str; 10] = [
@@ -1113,6 +1962,7 @@ fn generate_in_module_test_only_snippet(
     _mod_name: &str,
     shared: &[String],
     caps: &[String],
+    struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     out.push("".to_string());
@@ -1128,9 +1978,13 @@ fn generate_in_module_test_only_snippet(
             type_name.to_lowercase()
         ));
         out.push(format!("    let obj = {} {{", type_name));
-        out.push("        id: sui::object::new(ctx),".to_string());
-        if type_name == "Counter" {
-            out.push("        value: 0,".to_string());
+        if let Some(fields) = struct_fields.get(type_name) {
+            for (field_name, field_ty) in fields {
+                let init = default_field_initializer(field_name, field_ty);
+                out.push(format!("        {}: {},", field_name, init));
+            }
+        } else {
+            out.push("        id: sui::object::new(ctx),".to_string());
         }
         out.push("    };".to_string());
         out.push("    transfer::public_share_object(obj);".to_string());
@@ -1146,7 +2000,14 @@ fn generate_in_module_test_only_snippet(
             type_name
         ));
         out.push(format!("    {} {{", type_name));
-        out.push("        id: sui::object::new(ctx),".to_string());
+        if let Some(fields) = struct_fields.get(type_name) {
+            for (field_name, field_ty) in fields {
+                let init = default_field_initializer(field_name, field_ty);
+                out.push(format!("        {}: {},", field_name, init));
+            }
+        } else {
+            out.push("        id: sui::object::new(ctx),".to_string());
+        }
         out.push("    }".to_string());
         out.push("}".to_string());
         out.push("".to_string());
@@ -1226,11 +2087,12 @@ fn inject_test_only_helpers(
     mod_name: &str,
     shared: &[String],
     caps: &[String],
+    struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source_path)?;
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
 
-    let snippet = generate_in_module_test_only_snippet(mod_name, shared, caps);
+    let snippet = generate_in_module_test_only_snippet(mod_name, shared, caps, struct_fields);
 
     // Only remove our own block (identified by Tidewalker box/sentinels). Do not touch other test_only code.
     if let Some((s, e)) = find_tidewalker_block(&lines) {
@@ -1248,6 +2110,26 @@ fn inject_test_only_helpers(
     lines.extend(snippet);
     fs::write(source_path, lines.join("\n"))?;
     Ok(())
+}
+
+fn default_field_initializer(field_name: &str, field_ty: &str) -> String {
+    if field_name == "id" || field_ty.contains("UID") {
+        return "sui::object::new(ctx)".to_string();
+    }
+    let t = field_ty.trim();
+    if matches!(t, "u8" | "u16" | "u32" | "u64" | "u128" | "u256") {
+        return "0".to_string();
+    }
+    if t == "bool" {
+        return "false".to_string();
+    }
+    if t == "address" {
+        return "@0x0".to_string();
+    }
+    if t.starts_with("vector<") {
+        return "vector[]".to_string();
+    }
+    "0".to_string()
 }
 
 /// Very simple textual analysis: find entry functions and calls to other functions in same module.
