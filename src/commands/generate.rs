@@ -22,6 +22,7 @@ struct FnDecl {
     /// Tidewalker directive preconditions: functions that must be called first.
     requires: Vec<String>,
     numeric_effects: Vec<NumericEffect>,
+    vector_effects: Vec<VectorEffect>,
     calls: Vec<CallSite>,
 }
 
@@ -39,6 +40,13 @@ struct NumericEffect {
 }
 
 #[derive(Debug, Clone)]
+struct VectorEffect {
+    base_var: String,
+    field: String,
+    op: VectorOp,
+}
+
+#[derive(Debug, Clone)]
 struct AccessorSig {
     fn_name: String,
     param_ty: String,
@@ -53,6 +61,12 @@ enum NumericOp {
     Mod(String),
     Set(String),
     Changed,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VectorOp {
+    PushBack,
+    PopBack,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +147,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let helper_catalog = build_helper_catalog(&decls);
     let fn_lookup = build_fn_lookup(&decls);
     let effects_map = build_chained_effect_map(&decls, 4);
+    let vector_effects_map = build_chained_vector_effect_map(&decls, 4);
     for d in decls {
         if d.is_test_only {
             continue;
@@ -145,12 +160,17 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.numeric_effects.clone());
+        let resolved_vector_effects = vector_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.vector_effects.clone());
         if let Some(test_lines) = render_best_effort_test(
             &d,
             &accessor_map,
             &helper_catalog,
             &fn_lookup,
             &resolved_effects,
+            &resolved_vector_effects,
         ) {
             for l in test_lines {
                 out.push(format!("    {}", l));
@@ -351,6 +371,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             _ => Vec::new(),
         };
         let numeric_effects = extract_numeric_effects_from_body(&body_lines);
+        let vector_effects = extract_vector_effects_from_body(&body_lines);
         let calls = extract_same_module_calls_from_body(&body_lines, &module_name);
 
         out.push(FnDecl {
@@ -363,6 +384,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             is_test_only,
             requires: std::mem::take(&mut pending_requires),
             numeric_effects,
+            vector_effects,
             calls,
         });
         i = body_end.map(|e| e + 1).unwrap_or(j);
@@ -407,6 +429,7 @@ fn render_best_effort_test(
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
+    vector_effects: &[VectorEffect],
 ) -> Option<Vec<String>> {
     let fq = format!("{}::{}", d.module_name, d.fn_name);
     let mut lines = Vec::new();
@@ -506,6 +529,8 @@ fn render_best_effort_test(
         &param_arg_values,
         accessor_map,
     );
+    let (vector_before_lines, vector_after_lines, vector_manual_comments) =
+        build_vector_assertion_lines(d, vector_effects, &param_runtime, accessor_map);
 
     lines.push("    {".to_string());
     if needs_coin {
@@ -546,8 +571,17 @@ fn render_best_effort_test(
     for l in snapshot_before_lines {
         lines.push(format!("        {}", l));
     }
+    for l in vector_before_lines {
+        lines.push(format!("        {}", l));
+    }
     lines.push(format!("        {}({});", fq, args.join(", ")));
     for l in snapshot_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in vector_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in vector_manual_comments {
         lines.push(format!("        {}", l));
     }
     for obj in &shared_objects {
@@ -658,6 +692,78 @@ fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect
         });
     }
     effects
+}
+
+fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> {
+    let mut out = Vec::new();
+    for line in body_lines {
+        let t = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = t.strip_suffix(".push_back") {
+            let _ = prefix;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "push_back(") {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::PushBack,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "pop_back(") {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::PopBack,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::push_back(") {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::PushBack,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::pop_back(") {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::PopBack,
+            });
+            continue;
+        }
+    }
+    out
+}
+
+fn parse_vector_method_target(line: &str, method_prefix: &str) -> Option<(String, String)> {
+    // Example: counter.history.push_back(x)
+    let idx = line.find(method_prefix)?;
+    let lhs = line[..idx].trim_end_matches('.').trim();
+    parse_field_access(lhs)
+}
+
+fn parse_vector_namespace_target(line: &str, call_prefix: &str) -> Option<(String, String)> {
+    // Example: vector::push_back(&mut counter.history, x)
+    let after = line.split_once(call_prefix)?.1.trim();
+    let first_arg = after
+        .split(|c: char| c == ',' || c == ')')
+        .next()?
+        .trim()
+        .trim_start_matches("&mut")
+        .trim_start_matches('&')
+        .trim();
+    parse_field_access(first_arg)
 }
 
 fn extract_return_type(header: &str) -> Option<String> {
@@ -1056,6 +1162,100 @@ fn build_chained_effect_map(
     cache
 }
 
+fn build_chained_vector_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<VectorEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<VectorEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_vector_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+fn collect_vector_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<VectorEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<VectorEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.vector_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.vector_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_vector_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                out.push(VectorEffect {
+                    base_var: arg.to_string(),
+                    field: eff.field,
+                    op: eff.op,
+                });
+            }
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, out.clone());
+    out
+}
+
 fn collect_effects_for_fn(
     d: &FnDecl,
     by_module_and_fn: &std::collections::HashMap<
@@ -1295,4 +1495,112 @@ fn build_exact_assert_line(
         )),
         NumericOp::Changed => None,
     }
+}
+
+fn resolve_vector_len_expr(
+    d: &FnDecl,
+    base_var: &str,
+    field: &str,
+    runtime_var: &str,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+) -> Option<String> {
+    let param = d.params.iter().find(|p| p.name == base_var)?;
+    let param_obj_ty = normalize_param_object_type(&param.ty);
+    let module_accessors = accessor_map.get(&d.module_name)?;
+    let preferred = format!("{}_len", field);
+    let alt = format!("len_{}", field);
+    let accessor = module_accessors
+        .iter()
+        .find(|a| a.param_ty == param_obj_ty && (a.fn_name == preferred || a.fn_name == alt))?;
+    Some(format!(
+        "{}::{}(&{})",
+        d.module_name, accessor.fn_name, runtime_var
+    ))
+}
+
+fn build_vector_assertion_lines(
+    d: &FnDecl,
+    vector_effects: &[VectorEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut comments = Vec::new();
+    if vector_effects.is_empty() {
+        return (before, after, comments);
+    }
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<&VectorEffect>> =
+        std::collections::BTreeMap::new();
+    for eff in vector_effects {
+        grouped
+            .entry(format!("{}.{}", eff.base_var, eff.field))
+            .or_default()
+            .push(eff);
+    }
+
+    let has_internal_calls = !d.calls.is_empty();
+    let mut manual_targets: Vec<String> = Vec::new();
+    let mut idx = 0u64;
+
+    for (target, effects) in grouped {
+        let first = effects[0];
+        let runtime_var = match param_runtime.get(&first.base_var) {
+            Some(v) => v,
+            None => {
+                manual_targets.push(target);
+                continue;
+            }
+        };
+        if has_internal_calls || effects.len() != 1 {
+            manual_targets.push(target);
+            continue;
+        }
+        let read_expr =
+            match resolve_vector_len_expr(d, &first.base_var, &first.field, runtime_var, accessor_map) {
+                Some(v) => v,
+                None => {
+                    manual_targets.push(target);
+                    continue;
+                }
+            };
+        let before_name = format!(
+            "before_{}_{}_len",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&first.field)
+        );
+        let after_name = format!(
+            "after_{}_{}_len",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&first.field)
+        );
+        before.push(format!("let {} = {};", before_name, read_expr));
+        after.push(format!("let {} = {};", after_name, read_expr));
+        match first.op {
+            VectorOp::PushBack => after.push(format!(
+                "assert!({} == {} + 1, {});",
+                after_name,
+                before_name,
+                960 + idx
+            )),
+            VectorOp::PopBack => after.push(format!(
+                "assert!({} + 1 == {}, {});",
+                after_name,
+                before_name,
+                960 + idx
+            )),
+        }
+        idx += 1;
+    }
+
+    if !manual_targets.is_empty() {
+        comments.push("// Tidewalker: vector state changed in this function.".to_string());
+        comments.push(format!(
+            "// Add custom assertions for: {}",
+            manual_targets.join(", ")
+        ));
+    }
+
+    (before, after, comments)
 }
