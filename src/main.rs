@@ -678,6 +678,7 @@ fn render_best_effort_test(
     let mut args: Vec<String> = Vec::new();
     let mut needs_coin = false;
     let mut param_runtime: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut param_arg_values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
 
     for param in &d.params {
@@ -685,11 +686,17 @@ fn render_best_effort_test(
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if t == "address" {
-            args.push("OTHER".to_string());
+            let v = "OTHER".to_string();
+            args.push(v.clone());
+            param_arg_values.insert(param.name.clone(), v);
         } else if t == "u64" {
-            args.push("1".to_string());
+            let v = "1".to_string();
+            args.push(v.clone());
+            param_arg_values.insert(param.name.clone(), v);
         } else if t == "bool" {
-            args.push("false".to_string());
+            let v = "false".to_string();
+            args.push(v.clone());
+            param_arg_values.insert(param.name.clone(), v);
         } else if t.contains("Coin<") || t.contains("Coin <") {
             needs_coin = true;
             if t.starts_with("&mut") {
@@ -747,8 +754,13 @@ fn render_best_effort_test(
             .or_insert_with(|| obj.var_name.clone());
     }
 
-    let (snapshot_before_lines, snapshot_after_lines) =
-        build_numeric_assertion_lines(d, numeric_effects, &param_runtime, accessor_map);
+    let (snapshot_before_lines, snapshot_after_lines) = build_numeric_assertion_lines(
+        d,
+        numeric_effects,
+        &param_runtime,
+        &param_arg_values,
+        accessor_map,
+    );
 
     lines.push("    {".to_string());
     if needs_coin {
@@ -865,12 +877,23 @@ fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect
                     '%' => NumericOp::Mod(lit),
                     _ => continue,
                 }
+            } else if is_ident(raw_lit) {
+                match op_char {
+                    '+' => NumericOp::Add(raw_lit.to_string()),
+                    '-' => NumericOp::Sub(raw_lit.to_string()),
+                    '*' => NumericOp::Mul(raw_lit.to_string()),
+                    '/' => NumericOp::Div(raw_lit.to_string()),
+                    '%' => NumericOp::Mod(raw_lit.to_string()),
+                    _ => continue,
+                }
             } else {
                 // We can still assert a state change happened even when exact delta is unknown.
                 NumericOp::Changed
             }
         } else if let Some(v) = parse_numeric_literal(&rhs_norm) {
             NumericOp::Set(v)
+        } else if is_ident(&rhs_norm) {
+            NumericOp::Set(rhs_norm)
         } else {
             continue;
         };
@@ -1364,11 +1387,19 @@ fn build_numeric_assertion_lines(
     d: &FnDecl,
     numeric_effects: &[NumericEffect],
     param_runtime: &std::collections::HashMap<String, String>,
+    param_arg_values: &std::collections::HashMap<String, String>,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
 ) -> (Vec<String>, Vec<String>) {
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut direct_effect_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for eff in &d.numeric_effects {
+        let key = format!("{}.{}", eff.base_var, eff.field);
+        *direct_effect_counts.entry(key).or_insert(0) += 1;
+    }
+    let has_internal_calls = !d.calls.is_empty();
     let mut idx = 0usize;
 
     for eff in numeric_effects {
@@ -1399,59 +1430,105 @@ fn build_numeric_assertion_lines(
         before.push(format!("let {} = {};", before_name, read_expr));
         after.push(format!("let {} = {};", after_name, read_expr));
 
-        match &eff.op {
-            NumericOp::Add(v) => after.push(format!(
-                "assert!({} == {} + {}, {});",
-                after_name,
-                before_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Sub(v) => after.push(format!(
-                "assert!({} == {} - {}, {});",
-                after_name,
-                before_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Mul(v) => after.push(format!(
-                "assert!({} == {} * {}, {});",
-                after_name,
-                before_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Div(v) => after.push(format!(
-                "assert!({} == {} / {}, {});",
-                after_name,
-                before_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Mod(v) => after.push(format!(
-                "assert!({} == {} % {}, {});",
-                after_name,
-                before_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Set(v) => after.push(format!(
-                "assert!({} == {}, {});",
-                after_name,
-                v,
-                900 + idx as u64
-            )),
-            NumericOp::Changed => after.push(format!(
+        let direct_key = format!("{}.{}", eff.base_var, eff.field);
+        let direct_count = direct_effect_counts.get(&direct_key).copied().unwrap_or(0);
+        let prefer_unqualified = has_internal_calls || direct_count > 1;
+
+        let exact_assert = if !prefer_unqualified {
+            build_exact_assert_line(
+                &eff.op,
+                &after_name,
+                &before_name,
+                param_arg_values,
+                900 + idx as u64,
+            )
+        } else {
+            None
+        };
+
+        if let Some(line) = exact_assert {
+            after.push(line);
+        } else {
+            after.push(format!(
                 "assert!({} != {}, {});",
                 after_name,
                 before_name,
                 900 + idx as u64
-            )),
+            ));
         }
         idx += 1;
     }
 
     (before, after)
+}
+
+fn resolve_numeric_operand(
+    token: &str,
+    param_arg_values: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if parse_numeric_literal(token).is_some() {
+        return Some(token.to_string());
+    }
+    if is_ident(token) {
+        let bound = param_arg_values.get(token)?;
+        if parse_numeric_literal(bound).is_some() {
+            return Some(bound.clone());
+        }
+    }
+    None
+}
+
+fn build_exact_assert_line(
+    op: &NumericOp,
+    after_name: &str,
+    before_name: &str,
+    param_arg_values: &std::collections::HashMap<String, String>,
+    code: u64,
+) -> Option<String> {
+    match op {
+        NumericOp::Add(v) => Some(format!(
+            "assert!({} == {} + {}, {});",
+            after_name,
+            before_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Sub(v) => Some(format!(
+            "assert!({} == {} - {}, {});",
+            after_name,
+            before_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Mul(v) => Some(format!(
+            "assert!({} == {} * {}, {});",
+            after_name,
+            before_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Div(v) => Some(format!(
+            "assert!({} == {} / {}, {});",
+            after_name,
+            before_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Mod(v) => Some(format!(
+            "assert!({} == {} % {}, {});",
+            after_name,
+            before_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Set(v) => Some(format!(
+            "assert!({} == {}, {});",
+            after_name,
+            resolve_numeric_operand(v, param_arg_values)?,
+            code
+        )),
+        NumericOp::Changed => None,
+    }
 }
 
 #[derive(Debug, Default)]
