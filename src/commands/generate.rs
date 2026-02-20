@@ -63,10 +63,46 @@ enum NumericOp {
     Changed,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum VectorOp {
     PushBack,
     PopBack,
+    Insert,
+    Remove,
+    SwapRemove,
+    Append {
+        src_base_var: String,
+        src_field: String,
+    },
+    ContentChanged,
+}
+
+#[derive(Debug, Default, Clone)]
+struct StateChangeSummary {
+    asserted: std::collections::BTreeSet<String>,
+    potential: std::collections::BTreeSet<String>,
+}
+
+impl StateChangeSummary {
+    fn add_asserted(&mut self, target: String) {
+        self.potential.remove(&target);
+        self.asserted.insert(target);
+    }
+
+    fn add_potential(&mut self, target: String) {
+        if !self.asserted.contains(&target) {
+            self.potential.insert(target);
+        }
+    }
+
+    fn merge(&mut self, other: StateChangeSummary) {
+        for t in other.asserted {
+            self.add_asserted(t);
+        }
+        for t in other.potential {
+            self.add_potential(t);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -522,15 +558,19 @@ fn render_best_effort_test(
             .or_insert_with(|| obj.var_name.clone());
     }
 
-    let (snapshot_before_lines, snapshot_after_lines) = build_numeric_assertion_lines(
+    let (snapshot_before_lines, snapshot_after_lines, numeric_summary) = build_numeric_assertion_lines(
         d,
         numeric_effects,
         &param_runtime,
         &param_arg_values,
         accessor_map,
     );
-    let (vector_before_lines, vector_after_lines, vector_manual_comments) =
+    let (vector_before_lines, vector_after_lines, vector_summary) =
         build_vector_assertion_lines(d, vector_effects, &param_runtime, accessor_map);
+    let mut state_summary = StateChangeSummary::default();
+    state_summary.merge(numeric_summary);
+    state_summary.merge(vector_summary);
+    let summary_lines = render_state_change_summary_lines(&state_summary);
 
     lines.push("    {".to_string());
     if needs_coin {
@@ -581,7 +621,7 @@ fn render_best_effort_test(
     for l in vector_after_lines {
         lines.push(format!("        {}", l));
     }
-    for l in vector_manual_comments {
+    for l in summary_lines {
         lines.push(format!("        {}", l));
     }
     for obj in &shared_objects {
@@ -630,12 +670,22 @@ impl ObjectNeed {
 
 fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect> {
     let mut effects = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in body_lines {
         let no_comments = line.split("//").next().unwrap_or("").trim();
         if no_comments.is_empty() || no_comments.starts_with("assert!") {
             continue;
         }
         let stmt = no_comments.trim_end_matches(';').trim();
+        if let Some((name, target)) = parse_alias_binding(stmt) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if stmt.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(stmt) {
+                aliases.remove(&name);
+            }
+        }
         let (lhs, rhs) = match stmt.split_once('=') {
             Some((l, r)) => (l.trim(), r.trim()),
             None => continue,
@@ -643,7 +693,9 @@ fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect
         if lhs.ends_with('!') || lhs.contains("==") {
             continue;
         }
-        let (base_var, field) = match parse_field_access(lhs) {
+        let (base_var, field) = match parse_field_access(lhs)
+            .and_then(|(base, field)| resolve_effect_target(&base, &field, &aliases))
+        {
             Some(parts) => parts,
             None => continue,
         };
@@ -696,6 +748,7 @@ fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<NumericEffect
 
 fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> {
     let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in body_lines {
         let t = line
             .split("//")
@@ -707,10 +760,19 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
         if t.is_empty() {
             continue;
         }
-        if let Some(prefix) = t.strip_suffix(".push_back") {
-            let _ = prefix;
+        if let Some((name, target)) = parse_alias_binding(t) {
+            aliases.insert(name, target);
+            continue;
         }
-        if let Some((base_var, field)) = parse_vector_method_target(t, "push_back(") {
+        if t.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(t) {
+                aliases.remove(&name);
+            }
+        }
+        if t.contains("==") {
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "push_back(", &aliases) {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -718,7 +780,7 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_method_target(t, "pop_back(") {
+        if let Some((base_var, field)) = parse_vector_method_target(t, "pop_back(", &aliases) {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -726,7 +788,69 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::push_back(") {
+        if let Some((base_var, field)) = parse_vector_method_target(t, "insert(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::Insert,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "remove(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::Remove,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "swap_remove(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::SwapRemove,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "append(", &aliases) {
+            let src = extract_method_args(t, "append(")
+                .and_then(|args| args.first().cloned())
+                .and_then(|arg| parse_vector_target_expr(&arg, &aliases));
+            if let Some((src_base_var, src_field)) = src {
+                out.push(VectorEffect {
+                    base_var,
+                    field,
+                    op: VectorOp::Append {
+                        src_base_var,
+                        src_field,
+                    },
+                });
+            } else {
+                out.push(VectorEffect {
+                    base_var,
+                    field,
+                    op: VectorOp::ContentChanged,
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "reverse(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::ContentChanged,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_method_target(t, "swap(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::ContentChanged,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::push_back(", &aliases) {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -734,36 +858,226 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::pop_back(") {
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::pop_back(", &aliases) {
             out.push(VectorEffect {
                 base_var,
                 field,
                 op: VectorOp::PopBack,
             });
             continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::insert(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::Insert,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::remove(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::Remove,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::swap_remove(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::SwapRemove,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::append(", &aliases) {
+            let src = extract_namespace_args(t, "vector::append(")
+                .and_then(|args| args.get(1).cloned())
+                .and_then(|arg| parse_vector_target_expr(&arg, &aliases));
+            if let Some((src_base_var, src_field)) = src {
+                out.push(VectorEffect {
+                    base_var,
+                    field,
+                    op: VectorOp::Append {
+                        src_base_var,
+                        src_field,
+                    },
+                });
+            } else {
+                out.push(VectorEffect {
+                    base_var,
+                    field,
+                    op: VectorOp::ContentChanged,
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::reverse(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::ContentChanged,
+            });
+            continue;
+        }
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::swap(", &aliases) {
+            out.push(VectorEffect {
+                base_var,
+                field,
+                op: VectorOp::ContentChanged,
+            });
+            continue;
+        }
+        if let Some((lhs, _)) = t.split_once('=') {
+            let lhs = lhs.trim();
+            if lhs.contains('[') && lhs.contains(']') {
+                let base = lhs.split('[').next().unwrap_or("").trim();
+                if let Some((base_var, field)) = parse_vector_target_expr(base, &aliases) {
+                    out.push(VectorEffect {
+                        base_var,
+                        field,
+                        op: VectorOp::ContentChanged,
+                    });
+                }
+            }
         }
     }
     out
 }
 
-fn parse_vector_method_target(line: &str, method_prefix: &str) -> Option<(String, String)> {
+fn parse_vector_method_target(
+    line: &str,
+    method_prefix: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
     // Example: counter.history.push_back(x)
     let idx = line.find(method_prefix)?;
     let lhs = line[..idx].trim_end_matches('.').trim();
-    parse_field_access(lhs)
+    parse_vector_target_expr(lhs, aliases)
 }
 
-fn parse_vector_namespace_target(line: &str, call_prefix: &str) -> Option<(String, String)> {
+fn parse_vector_namespace_target(
+    line: &str,
+    call_prefix: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
     // Example: vector::push_back(&mut counter.history, x)
-    let after = line.split_once(call_prefix)?.1.trim();
-    let first_arg = after
-        .split(|c: char| c == ',' || c == ')')
-        .next()?
+    let args = extract_namespace_args(line, call_prefix)?;
+    parse_vector_target_expr(args.first()?.as_str(), aliases)
+}
+
+fn parse_vector_target_expr(
+    arg: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let first_arg = arg
         .trim()
         .trim_start_matches("&mut")
         .trim_start_matches('&')
         .trim();
-    parse_field_access(first_arg)
+    if let Some((base, field)) = parse_field_access(first_arg) {
+        return resolve_effect_target(&base, &field, aliases);
+    }
+    if is_ident(first_arg) {
+        let resolved = resolve_alias_path(first_arg, aliases);
+        return parse_simple_base_field(&resolved);
+    }
+    None
+}
+
+fn parse_let_binding_name(stmt: &str) -> Option<String> {
+    let rest = stmt.strip_prefix("let ")?.trim();
+    let lhs = rest.split_once('=').map(|(l, _)| l).unwrap_or(rest).trim();
+    let lhs = lhs.strip_prefix("mut ").unwrap_or(lhs).trim();
+    let name = lhs.split(|c: char| c == ':' || c.is_whitespace()).next()?.trim();
+    if is_ident(name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_alias_binding(stmt: &str) -> Option<(String, String)> {
+    let name = parse_let_binding_name(stmt)?;
+    let rhs = stmt.split_once('=')?.1.trim().trim_end_matches(';').trim();
+    let rhs = rhs.trim().trim_matches('(').trim_matches(')').trim();
+    let target = rhs
+        .strip_prefix("&mut ")
+        .or_else(|| rhs.strip_prefix('&'))
+        .unwrap_or(rhs)
+        .trim()
+        .trim_matches('(')
+        .trim_matches(')')
+        .trim();
+    if is_ident(target) || parse_simple_base_field(target).is_some() {
+        Some((name, target.to_string()))
+    } else {
+        None
+    }
+}
+
+fn resolve_alias_path(
+    name: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut cur = name.to_string();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while is_ident(&cur) {
+        if !seen.insert(cur.clone()) {
+            break;
+        }
+        match aliases.get(&cur) {
+            Some(next) => cur = next.clone(),
+            None => break,
+        }
+    }
+    cur
+}
+
+fn parse_simple_base_field(path: &str) -> Option<(String, String)> {
+    let mut parts = path.split('.');
+    let base = parts.next()?.trim();
+    let field = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    if is_ident(base) && is_ident(field) {
+        Some((base.to_string(), field.to_string()))
+    } else {
+        None
+    }
+}
+
+fn resolve_effect_target(
+    base: &str,
+    field: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let resolved = resolve_alias_path(base, aliases);
+    if is_ident(&resolved) {
+        return Some((resolved, field.to_string()));
+    }
+    if let Some((resolved_base, resolved_field)) = parse_simple_base_field(&resolved) {
+        // If alias points to a field itself (e.g. alias -> counter.history), we only
+        // support direct tracking of that field target.
+        if field == resolved_field {
+            return Some((resolved_base, resolved_field));
+        }
+    }
+    None
+}
+
+fn extract_method_args(line: &str, method_prefix: &str) -> Option<Vec<String>> {
+    let idx = line.find(method_prefix)?;
+    let after = line[idx + method_prefix.len()..].trim();
+    let args_raw = after.strip_suffix(')')?;
+    Some(split_args(args_raw))
+}
+
+fn extract_namespace_args(line: &str, call_prefix: &str) -> Option<Vec<String>> {
+    let after = line.split_once(call_prefix)?.1.trim();
+    let args_raw = after.strip_suffix(')')?;
+    Some(split_args(args_raw))
 }
 
 fn extract_return_type(header: &str) -> Option<String> {
@@ -1355,9 +1669,10 @@ fn build_numeric_assertion_lines(
     param_runtime: &std::collections::HashMap<String, String>,
     param_arg_values: &std::collections::HashMap<String, String>,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
     let mut before = Vec::new();
     let mut after = Vec::new();
+    let mut summary = StateChangeSummary::default();
     let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut direct_effect_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -1369,9 +1684,13 @@ fn build_numeric_assertion_lines(
     let mut idx = 0usize;
 
     for eff in numeric_effects {
+        let target_label = format!("operator {}.{}", eff.base_var, eff.field);
         let runtime_var = match param_runtime.get(&eff.base_var) {
             Some(v) => v,
-            None => continue,
+            None => {
+                summary.add_potential(target_label);
+                continue;
+            }
         };
         let key = format!("{}.{}", runtime_var, eff.field);
         if seen_targets.contains(&key) {
@@ -1379,7 +1698,10 @@ fn build_numeric_assertion_lines(
         }
         let read_expr = match resolve_read_expr(d, eff, runtime_var, accessor_map) {
             Some(expr) => expr,
-            None => continue,
+            None => {
+                summary.add_potential(target_label);
+                continue;
+            }
         };
         seen_targets.insert(key.clone());
 
@@ -1414,6 +1736,7 @@ fn build_numeric_assertion_lines(
 
         if let Some(line) = exact_assert {
             after.push(line);
+            summary.add_asserted(target_label);
         } else {
             after.push(format!(
                 "assert!({} != {}, {});",
@@ -1421,11 +1744,12 @@ fn build_numeric_assertion_lines(
                 before_name,
                 900 + idx as u64
             ));
+            summary.add_asserted(target_label);
         }
         idx += 1;
     }
 
-    (before, after)
+    (before, after, summary)
 }
 
 fn resolve_numeric_operand(
@@ -1523,12 +1847,12 @@ fn build_vector_assertion_lines(
     vector_effects: &[VectorEffect],
     param_runtime: &std::collections::HashMap<String, String>,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
     let mut before = Vec::new();
     let mut after = Vec::new();
-    let mut comments = Vec::new();
+    let mut summary = StateChangeSummary::default();
     if vector_effects.is_empty() {
-        return (before, after, comments);
+        return (before, after, summary);
     }
 
     let mut grouped: std::collections::BTreeMap<String, Vec<&VectorEffect>> =
@@ -1541,7 +1865,8 @@ fn build_vector_assertion_lines(
     }
 
     let has_internal_calls = !d.calls.is_empty();
-    let mut manual_targets: Vec<String> = Vec::new();
+    let mut potential_targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut seen_len_snapshots: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut idx = 0u64;
 
     for (target, effects) in grouped {
@@ -1549,19 +1874,19 @@ fn build_vector_assertion_lines(
         let runtime_var = match param_runtime.get(&first.base_var) {
             Some(v) => v,
             None => {
-                manual_targets.push(target);
+                potential_targets.insert(target);
                 continue;
             }
         };
         if has_internal_calls || effects.len() != 1 {
-            manual_targets.push(target);
+            potential_targets.insert(target);
             continue;
         }
         let read_expr =
             match resolve_vector_len_expr(d, &first.base_var, &first.field, runtime_var, accessor_map) {
                 Some(v) => v,
                 None => {
-                    manual_targets.push(target);
+                    potential_targets.insert(target);
                     continue;
                 }
             };
@@ -1575,32 +1900,103 @@ fn build_vector_assertion_lines(
             sanitize_ident(runtime_var),
             sanitize_ident(&first.field)
         );
-        before.push(format!("let {} = {};", before_name, read_expr));
+        if seen_len_snapshots.insert(before_name.clone()) {
+            before.push(format!("let {} = {};", before_name, read_expr));
+        }
         after.push(format!("let {} = {};", after_name, read_expr));
-        match first.op {
-            VectorOp::PushBack => after.push(format!(
+        match &first.op {
+            VectorOp::PushBack | VectorOp::Insert => after.push(format!(
                 "assert!({} == {} + 1, {});",
                 after_name,
                 before_name,
                 960 + idx
             )),
-            VectorOp::PopBack => after.push(format!(
+            VectorOp::PopBack | VectorOp::Remove | VectorOp::SwapRemove => after.push(format!(
                 "assert!({} + 1 == {}, {});",
                 after_name,
                 before_name,
                 960 + idx
             )),
+            VectorOp::Append {
+                src_base_var,
+                src_field,
+            } => {
+                let src_runtime_var = match param_runtime.get(src_base_var) {
+                    Some(v) => v,
+                    None => {
+                        potential_targets.insert(target);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                let src_len_expr = match resolve_vector_len_expr(
+                    d,
+                    src_base_var,
+                    src_field,
+                    src_runtime_var,
+                    accessor_map,
+                ) {
+                    Some(v) => v,
+                    None => {
+                        potential_targets.insert(target);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                let src_before_name = format!(
+                    "before_{}_{}_len",
+                    sanitize_ident(src_runtime_var),
+                    sanitize_ident(src_field)
+                );
+                if seen_len_snapshots.insert(src_before_name.clone()) {
+                    before.push(format!("let {} = {};", src_before_name, src_len_expr));
+                }
+                after.push(format!(
+                    "assert!({} == {} + {}, {});",
+                    after_name,
+                    before_name,
+                    src_before_name,
+                    960 + idx
+                ));
+            }
+            VectorOp::ContentChanged => {
+                potential_targets.insert(target);
+                idx += 1;
+                continue;
+            }
         }
+        summary.add_asserted(format!("vector {}", target));
         idx += 1;
     }
 
-    if !manual_targets.is_empty() {
-        comments.push("// Tidewalker: vector state changed in this function.".to_string());
-        comments.push(format!(
-            "// Add custom assertions for: {}",
-            manual_targets.join(", ")
-        ));
+    for t in potential_targets {
+        summary.add_potential(format!("vector {}", t));
     }
 
-    (before, after, comments)
+    (before, after, summary)
+}
+
+fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String> {
+    let mut out = Vec::new();
+    if summary.asserted.is_empty() && summary.potential.is_empty() {
+        return out;
+    }
+    out.push("// Tidewalker state changes:".to_string());
+    if summary.asserted.is_empty() {
+        out.push("// asserted: (none)".to_string());
+    } else {
+        out.push(format!(
+            "// asserted: {}",
+            summary.asserted.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if summary.potential.is_empty() {
+        out.push("// potential_change: (none)".to_string());
+    } else {
+        out.push(format!(
+            "// potential_change: {}",
+            summary.potential.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out
 }
