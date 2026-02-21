@@ -16,6 +16,7 @@ struct FnDecl {
     fn_name: String,
     params: Vec<ParamDecl>,
     return_ty: Option<String>,
+    body_lines: Vec<String>,
     is_public: bool,
     is_entry: bool,
     is_test_only: bool,
@@ -23,6 +24,8 @@ struct FnDecl {
     requires: Vec<String>,
     numeric_effects: Vec<NumericEffect>,
     vector_effects: Vec<VectorEffect>,
+    option_effects: Vec<OptionEffect>,
+    string_effects: Vec<StringEffect>,
     calls: Vec<CallSite>,
 }
 
@@ -47,9 +50,30 @@ struct VectorEffect {
 }
 
 #[derive(Debug, Clone)]
+struct OptionEffect {
+    base_var: String,
+    field: String,
+    op: OptionOp,
+}
+
+#[derive(Debug, Clone)]
+struct StringEffect {
+    base_var: String,
+    field: String,
+}
+
+#[derive(Debug, Clone)]
 struct AccessorSig {
     fn_name: String,
     param_ty: String,
+}
+
+#[derive(Debug, Clone)]
+struct OptionAccessorSig {
+    fn_name: String,
+    param_ty: String,
+    field: String,
+    is_some_when_true: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +99,13 @@ enum VectorOp {
         src_field: String,
     },
     ContentChanged,
+}
+
+#[derive(Debug, Clone)]
+enum OptionOp {
+    SetSome,
+    SetNone,
+    Changed,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -180,10 +211,14 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     out.push("".to_string());
 
     let accessor_map = build_accessor_map(&decls);
+    let option_accessor_map = build_option_accessor_map(&decls);
     let helper_catalog = build_helper_catalog(&decls);
     let fn_lookup = build_fn_lookup(&decls);
     let effects_map = build_chained_effect_map(&decls, 4);
     let vector_effects_map = build_chained_vector_effect_map(&decls, 4);
+    let option_effects_map = build_chained_option_effect_map(&decls, 4);
+    let string_effects_map = build_chained_string_effect_map(&decls, 4);
+    let deep_overflow_map = build_deep_overflow_map(&decls, 4);
     for d in decls {
         if d.is_test_only {
             continue;
@@ -200,13 +235,29 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.vector_effects.clone());
+        let resolved_option_effects = option_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.option_effects.clone());
+        let resolved_string_effects = string_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.string_effects.clone());
+        let deep_overflow_paths = deep_overflow_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         if let Some(test_lines) = render_best_effort_test(
             &d,
             &accessor_map,
+            &option_accessor_map,
             &helper_catalog,
             &fn_lookup,
             &resolved_effects,
             &resolved_vector_effects,
+            &resolved_option_effects,
+            &resolved_string_effects,
+            &deep_overflow_paths,
         ) {
             for l in test_lines {
                 out.push(format!("    {}", l));
@@ -253,6 +304,8 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             break;
         }
     }
+    let option_fields_by_type = extract_option_fields_by_type(&lines);
+    let string_fields_by_type = extract_string_fields_by_type(&lines);
 
     let mut out = Vec::new();
     let mut pending_test_only_attr = false;
@@ -408,6 +461,10 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         };
         let numeric_effects = extract_numeric_effects_from_body(&body_lines);
         let vector_effects = extract_vector_effects_from_body(&body_lines);
+        let option_effects =
+            extract_option_effects_from_body(&body_lines, &params, &option_fields_by_type);
+        let string_effects =
+            extract_string_effects_from_body(&body_lines, &params, &string_fields_by_type);
         let calls = extract_same_module_calls_from_body(&body_lines, &module_name);
 
         out.push(FnDecl {
@@ -415,12 +472,15 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             fn_name: name,
             params,
             return_ty,
+            body_lines,
             is_public,
             is_entry,
             is_test_only,
             requires: std::mem::take(&mut pending_requires),
             numeric_effects,
             vector_effects,
+            option_effects,
+            string_effects,
             calls,
         });
         i = body_end.map(|e| e + 1).unwrap_or(j);
@@ -459,13 +519,153 @@ fn split_params(s: &str) -> Vec<String> {
     out
 }
 
+fn extract_option_fields_by_type(
+    lines: &[&str],
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        let rest = if let Some(r) = t.strip_prefix("public struct ") {
+            r
+        } else if let Some(r) = t.strip_prefix("struct ") {
+            r
+        } else {
+            i += 1;
+            continue;
+        };
+        let struct_name = rest
+            .split(|c: char| c == '{' || c == '<' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim();
+        if struct_name.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut brace_depth = 0i32;
+        let mut saw_open = false;
+        let mut j = i;
+        let mut fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while j < lines.len() {
+            let line = lines[j].trim();
+            if saw_open {
+                if let Some((field, ty_raw)) = line.split_once(':') {
+                    let field = field.trim().trim_end_matches(',').trim();
+                    let ty = ty_raw
+                        .split("//")
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches(',')
+                        .trim();
+                    if is_ident(field) && is_option_type(ty) {
+                        fields.insert(field.to_string());
+                    }
+                }
+            }
+            for ch in line.chars() {
+                if ch == '{' {
+                    brace_depth += 1;
+                    saw_open = true;
+                } else if ch == '}' {
+                    brace_depth -= 1;
+                }
+            }
+            if saw_open && brace_depth <= 0 {
+                break;
+            }
+            j += 1;
+        }
+        if !fields.is_empty() {
+            out.insert(type_key_from_type_name(struct_name), fields);
+        }
+        i = j.saturating_add(1);
+    }
+    out
+}
+
+fn extract_string_fields_by_type(
+    lines: &[&str],
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        let rest = if let Some(r) = t.strip_prefix("public struct ") {
+            r
+        } else if let Some(r) = t.strip_prefix("struct ") {
+            r
+        } else {
+            i += 1;
+            continue;
+        };
+        let struct_name = rest
+            .split(|c: char| c == '{' || c == '<' || c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim();
+        if struct_name.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut brace_depth = 0i32;
+        let mut saw_open = false;
+        let mut j = i;
+        let mut fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while j < lines.len() {
+            let line = lines[j].trim();
+            if saw_open {
+                if let Some((field, ty_raw)) = line.split_once(':') {
+                    let field = field.trim().trim_end_matches(',').trim();
+                    let ty = ty_raw
+                        .split("//")
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches(',')
+                        .trim();
+                    if is_ident(field) && is_string_type(ty) {
+                        fields.insert(field.to_string());
+                    }
+                }
+            }
+            for ch in line.chars() {
+                if ch == '{' {
+                    brace_depth += 1;
+                    saw_open = true;
+                } else if ch == '}' {
+                    brace_depth -= 1;
+                }
+            }
+            if saw_open && brace_depth <= 0 {
+                break;
+            }
+            j += 1;
+        }
+        if !fields.is_empty() {
+            out.insert(type_key_from_type_name(struct_name), fields);
+        }
+        i = j.saturating_add(1);
+    }
+    out
+}
+
 fn render_best_effort_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
     vector_effects: &[VectorEffect],
+    option_effects: &[OptionEffect],
+    string_effects: &[StringEffect],
+    deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
     let fq = format!("{}::{}", d.module_name, d.fn_name);
     let mut lines = Vec::new();
@@ -501,6 +701,11 @@ fn render_best_effort_test(
             let v = "false".to_string();
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            let v = "std::string::utf8(b\"tidewalker\")".to_string();
+            args.push(v);
         } else if t.contains("Coin<") || t.contains("Coin <") {
             needs_coin = true;
             if t.starts_with("&mut") {
@@ -558,18 +763,30 @@ fn render_best_effort_test(
             .or_insert_with(|| obj.var_name.clone());
     }
 
-    let (snapshot_before_lines, snapshot_after_lines, numeric_summary) = build_numeric_assertion_lines(
+    let (snapshot_before_lines, snapshot_after_lines, mut numeric_summary) = build_numeric_assertion_lines(
         d,
         numeric_effects,
         &param_runtime,
         &param_arg_values,
         accessor_map,
+        deep_overflow_paths,
     );
     let (vector_before_lines, vector_after_lines, vector_summary) =
-        build_vector_assertion_lines(d, vector_effects, &param_runtime, accessor_map);
+        build_vector_assertion_lines(d, vector_effects, &param_runtime, accessor_map, deep_overflow_paths);
+    let (option_before_lines, option_after_lines, option_summary) =
+        build_option_assertion_lines(d, option_effects, &param_runtime, option_accessor_map, deep_overflow_paths);
+    let string_summary = build_string_summary(string_effects, &param_runtime, deep_overflow_paths);
+    for eff in string_effects {
+        let operator_target = format!("operator {}.{}", eff.base_var, eff.field);
+        numeric_summary.asserted.remove(&operator_target);
+        numeric_summary.potential.remove(&operator_target);
+    }
     let mut state_summary = StateChangeSummary::default();
     state_summary.merge(numeric_summary);
     state_summary.merge(vector_summary);
+    state_summary.merge(option_summary);
+    state_summary.merge(string_summary);
+    state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
     let summary_lines = render_state_change_summary_lines(&state_summary);
 
     lines.push("    {".to_string());
@@ -614,11 +831,17 @@ fn render_best_effort_test(
     for l in vector_before_lines {
         lines.push(format!("        {}", l));
     }
+    for l in option_before_lines {
+        lines.push(format!("        {}", l));
+    }
     lines.push(format!("        {}({});", fq, args.join(", ")));
     for l in snapshot_after_lines {
         lines.push(format!("        {}", l));
     }
     for l in vector_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in option_after_lines {
         lines.push(format!("        {}", l));
     }
     for l in summary_lines {
@@ -940,6 +1163,219 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
                     });
                 }
             }
+        }
+    }
+    out
+}
+
+fn extract_option_effects_from_body(
+    body_lines: &[String],
+    params: &[ParamDecl],
+    option_fields_by_type: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Vec<OptionEffect> {
+    let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut param_option_fields: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for p in params {
+        let ty = normalize_param_object_type(&p.ty);
+        let key = type_key_from_type_name(&ty);
+        if let Some(fields) = option_fields_by_type.get(&key) {
+            param_option_fields.insert(p.name.clone(), fields.clone());
+        }
+    }
+
+    for line in body_lines {
+        let no_comments = line.split("//").next().unwrap_or("").trim();
+        if no_comments.is_empty() {
+            continue;
+        }
+        let stmt = no_comments.trim_end_matches(';').trim();
+        for borrow_target in extract_mut_borrow_targets(stmt) {
+            let resolved = if let Some((base, field)) = parse_field_access(&borrow_target)
+                .and_then(|(base, field)| resolve_effect_target(&base, &field, &aliases))
+            {
+                Some((base, field))
+            } else if is_ident(&borrow_target) {
+                parse_simple_base_field(&resolve_alias_path(&borrow_target, &aliases))
+            } else {
+                None
+            };
+            if let Some((base_var, field)) = resolved {
+                if let Some(fields) = param_option_fields.get(&base_var) {
+                    if fields.contains(&field) {
+                        let sig = format!("{}::{}::{:?}", base_var, field, OptionOp::Changed);
+                        if seen.insert(sig) {
+                            out.push(OptionEffect {
+                                base_var,
+                                field,
+                                op: OptionOp::Changed,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((name, target)) = parse_alias_binding(stmt) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if stmt.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(stmt) {
+                aliases.remove(&name);
+            }
+        }
+        let (lhs, rhs) = match stmt.split_once('=') {
+            Some((l, r)) if !l.contains("==") && !r.contains("==") => (l.trim(), r.trim()),
+            _ => continue,
+        };
+        if lhs.ends_with('!') || lhs.contains('[') || lhs.contains(']') {
+            continue;
+        }
+
+        let (base_var, field) = match parse_field_access(lhs)
+            .and_then(|(base, field)| resolve_effect_target(&base, &field, &aliases))
+        {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let fields = match param_option_fields.get(&base_var) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !fields.contains(&field) {
+            continue;
+        }
+
+        let op = parse_option_write_op(rhs);
+        let sig = format!("{}::{}::{:?}", base_var, field, op);
+        if seen.insert(sig) {
+            out.push(OptionEffect {
+                base_var,
+                field,
+                op,
+            });
+        }
+    }
+
+    out
+}
+
+fn parse_option_write_op(rhs: &str) -> OptionOp {
+    let norm = remove_whitespace(rhs);
+    if norm.contains("option::some(") {
+        OptionOp::SetSome
+    } else if norm.contains("option::none(") {
+        OptionOp::SetNone
+    } else {
+        OptionOp::Changed
+    }
+}
+
+fn extract_string_effects_from_body(
+    body_lines: &[String],
+    params: &[ParamDecl],
+    string_fields_by_type: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Vec<StringEffect> {
+    let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut param_string_fields: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for p in params {
+        let ty = normalize_param_object_type(&p.ty);
+        let key = type_key_from_type_name(&ty);
+        if let Some(fields) = string_fields_by_type.get(&key) {
+            param_string_fields.insert(p.name.clone(), fields.clone());
+        }
+    }
+
+    for line in body_lines {
+        let no_comments = line.split("//").next().unwrap_or("").trim();
+        if no_comments.is_empty() {
+            continue;
+        }
+        let stmt = no_comments.trim_end_matches(';').trim();
+        for borrow_target in extract_mut_borrow_targets(stmt) {
+            let resolved = if let Some((base, field)) = parse_field_access(&borrow_target)
+                .and_then(|(base, field)| resolve_effect_target(&base, &field, &aliases))
+            {
+                Some((base, field))
+            } else if is_ident(&borrow_target) {
+                parse_simple_base_field(&resolve_alias_path(&borrow_target, &aliases))
+            } else {
+                None
+            };
+            if let Some((base_var, field)) = resolved {
+                if let Some(fields) = param_string_fields.get(&base_var) {
+                    if fields.contains(&field) {
+                        let sig = format!("{}.{}", base_var, field);
+                        if seen.insert(sig) {
+                            out.push(StringEffect { base_var, field });
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((name, target)) = parse_alias_binding(stmt) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if stmt.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(stmt) {
+                aliases.remove(&name);
+            }
+        }
+        let (lhs, _rhs) = match stmt.split_once('=') {
+            Some((l, r)) if !l.contains("==") && !r.contains("==") => (l.trim(), r.trim()),
+            _ => continue,
+        };
+        if lhs.ends_with('!') || lhs.contains('[') || lhs.contains(']') {
+            continue;
+        }
+
+        let (base_var, field) = match parse_field_access(lhs)
+            .and_then(|(base, field)| resolve_effect_target(&base, &field, &aliases))
+        {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let fields = match param_string_fields.get(&base_var) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !fields.contains(&field) {
+            continue;
+        }
+        let sig = format!("{}.{}", base_var, field);
+        if seen.insert(sig) {
+            out.push(StringEffect { base_var, field });
+        }
+    }
+
+    out
+}
+
+fn extract_mut_borrow_targets(stmt: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in stmt.split("&mut").skip(1) {
+        let mut cand = part.trim();
+        while let Some(rest) = cand.strip_prefix('(') {
+            cand = rest.trim_start();
+        }
+        let end = cand
+            .find(|c: char| c == ',' || c == ')' || c == ';' || c == '=')
+            .unwrap_or(cand.len());
+        let token = cand[..end]
+            .trim()
+            .trim_matches('(')
+            .trim_matches(')')
+            .trim();
+        if !token.is_empty() {
+            out.push(token.to_string());
         }
     }
     out
@@ -1276,6 +1712,48 @@ fn is_ident(s: &str) -> bool {
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn is_string_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    norm == "String" || norm.ends_with("string::String")
+}
+
+fn is_option_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    norm.starts_with("Option<") || norm.contains("::option::Option<")
+}
+
+fn option_none_expr_for_type(ty: &str) -> String {
+    if let Some(inner) = extract_option_inner_type(ty) {
+        format!("std::option::none<{}>()", inner)
+    } else {
+        "std::option::none()".to_string()
+    }
+}
+
+fn extract_option_inner_type(ty: &str) -> Option<String> {
+    let start = ty.find('<')?;
+    let mut depth = 0i32;
+    let mut end_idx: Option<usize> = None;
+    for (i, ch) in ty.char_indices().skip(start) {
+        if ch == '<' {
+            depth += 1;
+        } else if ch == '>' {
+            depth -= 1;
+            if depth == 0 {
+                end_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let end = end_idx?;
+    let inner = ty[start + 1..end].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
 fn sanitize_ident(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -1343,6 +1821,80 @@ fn build_accessor_map(decls: &[FnDecl]) -> std::collections::HashMap<String, Vec
             });
     }
     out
+}
+
+fn build_option_accessor_map(
+    decls: &[FnDecl],
+) -> std::collections::HashMap<String, Vec<OptionAccessorSig>> {
+    let mut out: std::collections::HashMap<String, Vec<OptionAccessorSig>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if d.is_test_only || !d.is_public {
+            continue;
+        }
+        let sig = match parse_option_accessor_sig(d) {
+            Some(v) => v,
+            None => continue,
+        };
+        out.entry(d.module_name.clone()).or_default().push(sig);
+    }
+    out
+}
+
+fn parse_option_accessor_sig(d: &FnDecl) -> Option<OptionAccessorSig> {
+    if d.params.len() != 1 {
+        return None;
+    }
+    let ret = d.return_ty.as_ref()?.trim();
+    if ret != "bool" {
+        return None;
+    }
+    let param = d.params.first()?;
+    if !param.ty.trim().starts_with('&') {
+        return None;
+    }
+    let param_ty = normalize_param_object_type(&param.ty);
+    let param_name = param.name.as_str();
+
+    for line in &d.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let stmt = stmt.trim_end_matches(';').trim();
+        if let Some((field, is_some_when_true)) = parse_option_presence_from_expr(stmt, param_name) {
+            return Some(OptionAccessorSig {
+                fn_name: d.fn_name.clone(),
+                param_ty: param_ty.clone(),
+                field,
+                is_some_when_true,
+            });
+        }
+    }
+    None
+}
+
+fn parse_option_presence_from_expr(expr: &str, param_name: &str) -> Option<(String, bool)> {
+    let norm = remove_whitespace(expr);
+    for (needle, is_some_when_true) in [("option::is_some(", true), ("option::is_none(", false)] {
+        let idx = match norm.find(needle) {
+            Some(v) => v,
+            None => continue,
+        };
+        let after = &norm[idx + needle.len()..];
+        let arg = match after.split(')').next() {
+            Some(v) => v.trim_start_matches('&').trim(),
+            None => continue,
+        };
+        let (base, field) = match parse_field_access(arg) {
+            Some(v) => v,
+            None => continue,
+        };
+        if base == param_name {
+            return Some((field, is_some_when_true));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Default)]
@@ -1436,6 +1988,10 @@ fn synthesize_call_args_for_fn(
             args.push("false".to_string());
         } else if t == "address" {
             args.push("OTHER".to_string());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
         } else {
             return None;
         }
@@ -1508,6 +2064,327 @@ fn build_chained_vector_effect_map(
     cache
 }
 
+fn build_chained_option_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<OptionEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<OptionEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_option_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+fn build_chained_string_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<StringEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<StringEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_string_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+fn build_deep_overflow_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+
+    let mut cache: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_deep_overflow_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+fn collect_deep_overflow_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> std::collections::HashSet<String> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return collect_forwarded_mut_paths_at_cutoff(d, by_module_and_fn.get(&d.module_name));
+    }
+    visiting.insert(key.clone());
+
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let child_paths = collect_deep_overflow_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for path in child_paths {
+                if let Some(mapped) = map_child_overflow_path_to_caller(&path, callee, call) {
+                    out.insert(mapped);
+                } else {
+                    // If remapping fails (alias/expression), conservatively mark all mutable
+                    // parameters of the caller as potentially changed.
+                    for p in &d.params {
+                        if p.ty.trim().starts_with("&mut") {
+                            out.insert(p.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, out.clone());
+    out
+}
+
+fn collect_forwarded_mut_paths_at_cutoff(
+    d: &FnDecl,
+    module_map: Option<&std::collections::HashMap<String, &FnDecl>>,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(module_map) = module_map else {
+        return out;
+    };
+    let mut had_unresolved = false;
+    for call in &d.calls {
+        let callee = match module_map.get(&call.callee_fn) {
+            Some(c) => *c,
+            None => continue,
+        };
+        for (idx, param) in callee.params.iter().enumerate() {
+            if !param.ty.trim().starts_with("&mut") {
+                continue;
+            }
+            let arg = match call.arg_exprs.get(idx) {
+                Some(a) => a,
+                None => {
+                    had_unresolved = true;
+                    continue;
+                }
+            };
+            if let Some(path) = canonicalize_arg_path(arg) {
+                out.insert(path);
+            } else {
+                had_unresolved = true;
+            }
+        }
+    }
+
+    if had_unresolved {
+        for p in &d.params {
+            if p.ty.trim().starts_with("&mut") {
+                out.insert(p.name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn map_child_overflow_path_to_caller(
+    child_path: &str,
+    callee: &FnDecl,
+    call: &CallSite,
+) -> Option<String> {
+    let (head, tail) = split_path_head_tail(child_path)?;
+    let idx = callee.params.iter().position(|p| p.name == head)?;
+    let arg = call.arg_exprs.get(idx)?;
+    let arg_path = canonicalize_arg_path(arg)?;
+    Some(format!("{}{}", arg_path, tail))
+}
+
+fn split_path_head_tail(path: &str) -> Option<(&str, &str)> {
+    let first = path.split('.').next()?.trim();
+    if !is_ident(first) {
+        return None;
+    }
+    let tail = path.strip_prefix(first)?;
+    Some((first, tail))
+}
+
+fn canonicalize_arg_path(expr: &str) -> Option<String> {
+    let stripped = strip_ref_and_parens(expr.trim());
+    if let Some((base, field)) = parse_field_access(stripped) {
+        return Some(format!("{}.{}", base, field));
+    }
+    if is_ident(stripped) {
+        return Some(stripped.to_string());
+    }
+    None
+}
+
+fn strip_ref_and_parens(raw: &str) -> &str {
+    let mut s = raw.trim();
+    loop {
+        let mut changed = false;
+        if let Some(rest) = s.strip_prefix("&mut") {
+            s = rest.trim();
+            changed = true;
+        } else if let Some(rest) = s.strip_prefix('&') {
+            s = rest.trim();
+            changed = true;
+        }
+        if s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+            s = s[1..s.len() - 1].trim();
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    s
+}
+
+fn collect_option_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<OptionEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<OptionEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.option_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.option_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_option_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                out.push(OptionEffect {
+                    base_var: arg.to_string(),
+                    field: eff.field,
+                    op: eff.op,
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!("{}::{}::{:?}", eff.base_var, eff.field, eff.op);
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
+}
+
 fn collect_vector_effects_for_fn(
     d: &FnDecl,
     by_module_and_fn: &std::collections::HashMap<
@@ -1568,6 +2445,76 @@ fn collect_vector_effects_for_fn(
     visiting.remove(&key);
     cache.insert(key, out.clone());
     out
+}
+
+fn collect_string_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<StringEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<StringEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.string_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.string_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_string_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                out.push(StringEffect {
+                    base_var: arg.to_string(),
+                    field: eff.field,
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!("{}::{}", eff.base_var, eff.field);
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
 }
 
 fn collect_effects_for_fn(
@@ -1663,12 +2610,27 @@ fn resolve_read_expr(
     }
 }
 
+fn overflow_may_affect_target(
+    deep_overflow_paths: &std::collections::HashSet<String>,
+    base_var: &str,
+    field: &str,
+) -> bool {
+    let exact = format!("{}.{}", base_var, field);
+    for p in deep_overflow_paths {
+        if p == base_var || p == &exact {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_numeric_assertion_lines(
     d: &FnDecl,
     numeric_effects: &[NumericEffect],
     param_runtime: &std::collections::HashMap<String, String>,
     param_arg_values: &std::collections::HashMap<String, String>,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> (Vec<String>, Vec<String>, StateChangeSummary) {
     let mut before = Vec::new();
     let mut after = Vec::new();
@@ -1685,6 +2647,10 @@ fn build_numeric_assertion_lines(
 
     for eff in numeric_effects {
         let target_label = format!("operator {}.{}", eff.base_var, eff.field);
+        if overflow_may_affect_target(deep_overflow_paths, &eff.base_var, &eff.field) {
+            summary.add_potential(target_label);
+            continue;
+        }
         let runtime_var = match param_runtime.get(&eff.base_var) {
             Some(v) => v,
             None => {
@@ -1847,6 +2813,7 @@ fn build_vector_assertion_lines(
     vector_effects: &[VectorEffect],
     param_runtime: &std::collections::HashMap<String, String>,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> (Vec<String>, Vec<String>, StateChangeSummary) {
     let mut before = Vec::new();
     let mut after = Vec::new();
@@ -1871,6 +2838,10 @@ fn build_vector_assertion_lines(
 
     for (target, effects) in grouped {
         let first = effects[0];
+        if overflow_may_affect_target(deep_overflow_paths, &first.base_var, &first.field) {
+            potential_targets.insert(target);
+            continue;
+        }
         let runtime_var = match param_runtime.get(&first.base_var) {
             Some(v) => v,
             None => {
@@ -1974,6 +2945,169 @@ fn build_vector_assertion_lines(
     }
 
     (before, after, summary)
+}
+
+fn resolve_option_is_some_expr(
+    d: &FnDecl,
+    eff: &OptionEffect,
+    runtime_var: &str,
+    option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
+) -> Option<String> {
+    let param = d.params.iter().find(|p| p.name == eff.base_var)?;
+    let param_obj_ty = normalize_param_object_type(&param.ty);
+    let module_accessors = option_accessor_map.get(&d.module_name)?;
+    let accessor = module_accessors.iter().find(|a| {
+        a.param_ty == param_obj_ty && a.field == eff.field
+    })?;
+    if accessor.is_some_when_true {
+        Some(format!(
+            "{}::{}(&{})",
+            d.module_name, accessor.fn_name, runtime_var
+        ))
+    } else {
+        Some(format!(
+            "!({}::{}(&{}))",
+            d.module_name, accessor.fn_name, runtime_var
+        ))
+    }
+}
+
+fn build_option_assertion_lines(
+    d: &FnDecl,
+    option_effects: &[OptionEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut summary = StateChangeSummary::default();
+    if option_effects.is_empty() {
+        return (before, after, summary);
+    }
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<&OptionEffect>> =
+        std::collections::BTreeMap::new();
+    for eff in option_effects {
+        grouped
+            .entry(format!("{}.{}", eff.base_var, eff.field))
+            .or_default()
+            .push(eff);
+    }
+
+    let mut direct_effect_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for eff in &d.option_effects {
+        let key = format!("{}.{}", eff.base_var, eff.field);
+        *direct_effect_counts.entry(key).or_insert(0) += 1;
+    }
+
+    let has_internal_calls = !d.calls.is_empty();
+    let mut seen_before_snapshots: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut idx = 0u64;
+
+    for (target, effects) in grouped {
+        let first = effects[0];
+        if overflow_may_affect_target(deep_overflow_paths, &first.base_var, &first.field) {
+            summary.add_potential(format!("option {}", target));
+            continue;
+        }
+        let runtime_var = match param_runtime.get(&first.base_var) {
+            Some(v) => v,
+            None => {
+                summary.add_potential(format!("option {}", target));
+                continue;
+            }
+        };
+        let read_expr =
+            match resolve_option_is_some_expr(d, first, runtime_var, option_accessor_map) {
+                Some(v) => v,
+                None => {
+                    summary.add_potential(format!("option {}", target));
+                    continue;
+                }
+            };
+        let before_name = format!(
+            "before_{}_{}_is_some",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&first.field)
+        );
+        let after_name = format!(
+            "after_{}_{}_is_some",
+            sanitize_ident(runtime_var),
+            sanitize_ident(&first.field)
+        );
+
+        let direct_key = format!("{}.{}", first.base_var, first.field);
+        let direct_count = direct_effect_counts.get(&direct_key).copied().unwrap_or(0);
+        let prefer_generic = has_internal_calls || direct_count > 1 || effects.len() != 1;
+        let needs_before = prefer_generic || matches!(first.op, OptionOp::Changed);
+
+        if needs_before && seen_before_snapshots.insert(before_name.clone()) {
+            before.push(format!("let {} = {};", before_name, read_expr.clone()));
+        }
+        after.push(format!("let {} = {};", after_name, read_expr));
+
+        if prefer_generic {
+            after.push(format!(
+                "assert!({} != {}, {});",
+                after_name,
+                before_name,
+                980 + idx
+            ));
+            summary.add_asserted(format!("option {}", target));
+            idx += 1;
+            continue;
+        }
+
+        match first.op {
+            OptionOp::SetSome => after.push(format!("assert!({}, {});", after_name, 980 + idx)),
+            OptionOp::SetNone => {
+                after.push(format!("assert!(!{}, {});", after_name, 980 + idx))
+            }
+            OptionOp::Changed => after.push(format!(
+                "assert!({} != {}, {});",
+                after_name,
+                before_name,
+                980 + idx
+            )),
+        }
+        summary.add_asserted(format!("option {}", target));
+        idx += 1;
+    }
+
+    (before, after, summary)
+}
+
+fn build_string_summary(
+    string_effects: &[StringEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> StateChangeSummary {
+    let mut summary = StateChangeSummary::default();
+    for eff in string_effects {
+        if overflow_may_affect_target(deep_overflow_paths, &eff.base_var, &eff.field) {
+            summary.add_potential(format!("string {}.{}", eff.base_var, eff.field));
+            continue;
+        }
+        if param_runtime.contains_key(&eff.base_var) {
+            summary.add_potential(format!("string {}.{}", eff.base_var, eff.field));
+        }
+    }
+    summary
+}
+
+fn build_deep_chain_summary(
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> StateChangeSummary {
+    let mut summary = StateChangeSummary::default();
+    for path in deep_overflow_paths {
+        if path.contains('.') {
+            summary.add_potential(format!("state {}", path));
+        }
+    }
+    summary
 }
 
 fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String> {
