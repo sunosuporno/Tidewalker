@@ -241,3 +241,203 @@ pub(super) fn build_fn_lookup(
     }
     out
 }
+
+#[derive(Debug, Default, Clone)]
+pub(super) struct ModuleBootstrapCatalog {
+    pub(super) one_time_witness_init: bool,
+    pub(super) init_shared_types: std::collections::HashSet<String>,
+    pub(super) init_owned_types: std::collections::HashSet<String>,
+}
+
+pub(super) fn build_bootstrap_catalog(
+    module_sources: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, ModuleBootstrapCatalog> {
+    let mut out = std::collections::HashMap::new();
+    for (module_name, content) in module_sources {
+        let info = parse_module_bootstrap_info(content);
+        if info.one_time_witness_init
+            || !info.init_shared_types.is_empty()
+            || !info.init_owned_types.is_empty()
+        {
+            out.insert(module_name.clone(), info);
+        }
+    }
+    out
+}
+
+fn parse_module_bootstrap_info(content: &str) -> ModuleBootstrapCatalog {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = ModuleBootstrapCatalog::default();
+
+    let Some((header, body_lines)) = find_init_header_and_body(&lines) else {
+        return out;
+    };
+    out.one_time_witness_init = init_uses_one_time_witness(&header);
+
+    let mut var_to_type: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in &body_lines {
+        let t = line.split("//").next().unwrap_or("").trim();
+        if let Some((var, ty)) = parse_init_struct_binding(t) {
+            var_to_type.insert(var, ty);
+        }
+    }
+
+    for line in &body_lines {
+        let t = line.split("//").next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(var) = extract_first_arg_for_prefixes(
+            t,
+            &[
+                "transfer::share_object",
+                "transfer::public_share_object",
+                "share_object",
+                "public_share_object",
+            ],
+        ) {
+            if let Some(ty) = var_to_type.get(&var) {
+                out.init_shared_types.insert(type_key_from_type_name(ty));
+            }
+            continue;
+        }
+
+        if let Some((obj_var, recipient)) = parse_transfer_call(t) {
+            if recipient.contains("sender(")
+                || recipient.contains("tx_context::sender(")
+                || recipient.contains("ctx.sender(")
+            {
+                if let Some(ty) = var_to_type.get(&obj_var) {
+                    out.init_owned_types.insert(type_key_from_type_name(ty));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn find_init_header_and_body<'a>(lines: &[&'a str]) -> Option<(String, Vec<String>)> {
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t.starts_with("fun init(") {
+            let mut header = t.to_string();
+            let mut j = i + 1;
+            while j < lines.len() && !header.contains(')') {
+                header.push(' ');
+                header.push_str(lines[j].trim());
+                j += 1;
+            }
+
+            let mut brace_depth = 0i32;
+            let mut body_start: Option<usize> = None;
+            let mut body_end: Option<usize> = None;
+            for (k, l) in lines.iter().enumerate().skip(i) {
+                for c in l.chars() {
+                    if c == '{' {
+                        brace_depth += 1;
+                        if brace_depth == 1 {
+                            body_start = Some(k + 1);
+                        }
+                    } else if c == '}' {
+                        brace_depth -= 1;
+                        if brace_depth == 0 {
+                            body_end = Some(k);
+                            break;
+                        }
+                    }
+                }
+                if body_end.is_some() {
+                    break;
+                }
+            }
+
+            let body = match (body_start, body_end) {
+                (Some(s), Some(e)) if s <= e => lines[s..=e]
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            return Some((header, body));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn init_uses_one_time_witness(header: &str) -> bool {
+    let params = header
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(p, _)| p)
+        .unwrap_or("");
+    let parts = split_params(params);
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    let Some((name, ty)) = first.split_once(':') else {
+        return false;
+    };
+    let pname = name.trim();
+    let pty = ty.trim().replace(' ', "");
+    if pty.contains("TxContext") || pty.contains("tx_context::TxContext") {
+        return false;
+    }
+    pname.starts_with('_')
+}
+
+fn parse_init_struct_binding(stmt: &str) -> Option<(String, String)> {
+    if !stmt.starts_with("let ") || !stmt.contains('=') || !stmt.contains('{') {
+        return None;
+    }
+    let after_let = stmt.strip_prefix("let ")?;
+    let (lhs, rhs) = after_let.split_once('=')?;
+    let var = lhs.trim().trim_start_matches("mut ").trim();
+    if !is_ident(var) {
+        return None;
+    }
+    let ty = rhs
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('{')
+        .trim();
+    if ty.is_empty() {
+        return None;
+    }
+    Some((var.to_string(), ty.to_string()))
+}
+
+fn extract_first_arg_for_prefixes(stmt: &str, prefixes: &[&str]) -> Option<String> {
+    for prefix in prefixes {
+        if let Some(args) = extract_namespace_args_flexible(stmt, prefix) {
+            if let Some(first) = args.first() {
+                let raw = strip_ref_and_parens_text(first);
+                if is_ident(raw) {
+                    return Some(raw.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_transfer_call(stmt: &str) -> Option<(String, String)> {
+    let args = extract_namespace_args_flexible(stmt, "transfer::transfer")
+        .or_else(|| extract_namespace_args_flexible(stmt, "transfer::public_transfer"))
+        .or_else(|| extract_namespace_args_flexible(stmt, "transfer"))
+        .or_else(|| extract_namespace_args_flexible(stmt, "public_transfer"))?;
+    if args.len() < 2 {
+        return None;
+    }
+    let obj = strip_ref_and_parens_text(args[0].as_str()).to_string();
+    let recipient = strip_ref_and_parens_text(args[1].as_str()).to_string();
+    if !is_ident(&obj) {
+        return None;
+    }
+    Some((obj, recipient))
+}

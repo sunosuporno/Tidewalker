@@ -1,5 +1,14 @@
-use super::catalog::ModuleHelperCatalog;
+use super::catalog::{ModuleBootstrapCatalog, ModuleHelperCatalog};
 use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectProvisionSource {
+    SharedHelper,
+    SharedInit,
+    OwnedHelper,
+    OwnedInit,
+    OwnedFactory,
+}
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
 }
@@ -11,6 +20,27 @@ fn default_u64_arg_for_param(name: &str) -> String {
     } else {
         "1".to_string()
     }
+}
+
+fn should_transfer_call_return(ret_ty: &str, module_name: &str) -> bool {
+    let t = ret_ty.trim();
+    if t.is_empty() || t == "()" || t.starts_with('&') {
+        return false;
+    }
+    if is_numeric_type(t)
+        || t == "bool"
+        || t == "address"
+        || is_string_type(t)
+        || is_option_type(t)
+        || t.starts_with("vector<")
+    {
+        return false;
+    }
+    if is_coin_type(t) || is_treasury_cap_type(t) {
+        return true;
+    }
+    // Heuristic: local module return types are usually key objects in constructor/factory APIs.
+    !t.contains("::") || t.starts_with(&format!("{}::", module_name))
 }
 
 fn requires_chain_uses_coin_slot_later(
@@ -150,12 +180,71 @@ fn synthesize_requires_call_args(
     Some((args, prep))
 }
 
+fn synthesize_factory_args(factory: &FnDecl) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for p in &factory.params {
+        let t = p.ty.trim();
+        if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if t == "u64" {
+            args.push(default_u64_arg_for_param(&p.name));
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("OTHER".to_string());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(args)
+}
+
+fn pick_factory_call_for_type(
+    d: &FnDecl,
+    type_key: &str,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Option<(String, Vec<String>)> {
+    let mut best: Option<(usize, String, Vec<String>)> = None;
+    for f in module_fns.values() {
+        if f.is_test_only {
+            continue;
+        }
+        if !(f.is_public || f.is_entry) {
+            continue;
+        }
+        if f.fn_name == d.fn_name || f.fn_name == "init" {
+            continue;
+        }
+        let ret = match &f.return_ty {
+            Some(v) => v,
+            None => continue,
+        };
+        if type_key_from_type_name(ret) != type_key {
+            continue;
+        }
+        let Some(args) = synthesize_factory_args(f) else {
+            continue;
+        };
+        let score = f.params.len();
+        let candidate = (score, f.fn_name.clone(), args);
+        if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, name, args)| (name, args))
+}
+
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
     option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
     container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
+    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
     vector_effects: &[VectorEffect],
@@ -244,15 +333,35 @@ pub(super) fn render_best_effort_test(
 
     let mut shared_objects: Vec<ObjectNeed> = Vec::new();
     let mut owned_objects: Vec<ObjectNeed> = Vec::new();
+    let mut object_sources: std::collections::HashMap<String, ObjectProvisionSource> =
+        std::collections::HashMap::new();
+    let mut factory_calls: std::collections::HashMap<String, (String, Vec<String>)> =
+        std::collections::HashMap::new();
     if !object_needs.is_empty() {
         let empty_helpers = ModuleHelperCatalog::default();
         let module_helpers = helper_catalog.get(&d.module_name).unwrap_or(&empty_helpers);
+        let empty_bootstrap = ModuleBootstrapCatalog::default();
+        let module_bootstrap = bootstrap_catalog
+            .get(&d.module_name)
+            .unwrap_or(&empty_bootstrap);
         let module_fns = fn_lookup.get(&d.module_name);
         for obj in &object_needs {
             if module_helpers.shared_types.contains(&obj.type_key) {
                 shared_objects.push(obj.clone());
+                object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::SharedHelper);
             } else if module_helpers.owned_types.contains(&obj.type_key) {
                 owned_objects.push(obj.clone());
+                object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedHelper);
+            } else if module_bootstrap.one_time_witness_init
+                && module_bootstrap.init_shared_types.contains(&obj.type_key)
+            {
+                shared_objects.push(obj.clone());
+                object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::SharedInit);
+            } else if module_bootstrap.one_time_witness_init
+                && module_bootstrap.init_owned_types.contains(&obj.type_key)
+            {
+                owned_objects.push(obj.clone());
+                object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedInit);
             } else {
                 let shared_helper = format!("create_and_share_{}_for_testing", obj.type_key);
                 let owned_helper = format!("create_{}_for_testing", obj.type_key);
@@ -264,27 +373,75 @@ pub(super) fn render_best_effort_test(
                     .unwrap_or(false);
                 if has_shared_helper {
                     shared_objects.push(obj.clone());
+                    object_sources
+                        .insert(obj.var_name.clone(), ObjectProvisionSource::SharedHelper);
                 } else if has_owned_helper {
                     owned_objects.push(obj.clone());
+                    object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedHelper);
+                } else if let Some((factory_fn, factory_args)) =
+                    module_fns.and_then(|fns| pick_factory_call_for_type(d, &obj.type_key, fns))
+                {
+                    owned_objects.push(obj.clone());
+                    object_sources
+                        .insert(obj.var_name.clone(), ObjectProvisionSource::OwnedFactory);
+                    factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
                 } else {
                     return None;
                 }
             }
         }
     }
+    let needs_init_bootstrap = object_sources.values().any(|src| {
+        matches!(
+            src,
+            ObjectProvisionSource::SharedInit | ObjectProvisionSource::OwnedInit
+        )
+    });
+    let has_init_bootstrap_helper = fn_lookup
+        .get(&d.module_name)
+        .map(|fns| fns.contains_key("bootstrap_init_for_testing"))
+        .unwrap_or(false);
+    if needs_init_bootstrap && !has_init_bootstrap_helper {
+        return None;
+    }
+
     let has_shared_objects = !shared_objects.is_empty();
     let preexisting_shared_type_keys: std::collections::HashSet<String> =
         shared_objects.iter().map(|o| o.type_key.clone()).collect();
 
+    let mut needs_next_tx_before_use = false;
     if has_shared_objects {
-        lines.push("    {".to_string());
-        for obj in &shared_objects {
-            lines.push(format!(
-                "        {}::create_and_share_{}_for_testing(test_scenario::ctx(&mut scenario));",
-                d.module_name, obj.type_key
-            ));
+        let helper_shared = shared_objects
+            .iter()
+            .filter(|obj| {
+                matches!(
+                    object_sources.get(&obj.var_name),
+                    Some(ObjectProvisionSource::SharedHelper)
+                )
+            })
+            .collect::<Vec<_>>();
+        if !helper_shared.is_empty() {
+            lines.push("    {".to_string());
+            for obj in helper_shared {
+                lines.push(format!(
+                    "        {}::create_and_share_{}_for_testing(test_scenario::ctx(&mut scenario));",
+                    d.module_name, obj.type_key
+                ));
+            }
+            lines.push("    };".to_string());
+            needs_next_tx_before_use = true;
         }
+    }
+    if needs_init_bootstrap {
+        lines.push("    {".to_string());
+        lines.push(format!(
+            "        {}::bootstrap_init_for_testing(test_scenario::ctx(&mut scenario));",
+            d.module_name
+        ));
         lines.push("    };".to_string());
+        needs_next_tx_before_use = true;
+    }
+    if needs_next_tx_before_use {
         lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
     }
 
@@ -385,10 +542,39 @@ pub(super) fn render_best_effort_test(
     }
     for obj in &owned_objects {
         let maybe_mut = if obj.is_mut { "mut " } else { "" };
-        lines.push(format!(
-            "        let {}{} = {}::create_{}_for_testing(test_scenario::ctx(&mut scenario));",
-            maybe_mut, obj.var_name, d.module_name, obj.type_key
-        ));
+        match object_sources.get(&obj.var_name) {
+            Some(ObjectProvisionSource::OwnedHelper) => {
+                lines.push(format!(
+                    "        let {}{} = {}::create_{}_for_testing(test_scenario::ctx(&mut scenario));",
+                    maybe_mut, obj.var_name, d.module_name, obj.type_key
+                ));
+            }
+            Some(ObjectProvisionSource::OwnedInit) => {
+                lines.push(format!(
+                    "        let {}{} = test_scenario::take_from_sender<{}>(&scenario);",
+                    maybe_mut,
+                    obj.var_name,
+                    qualify_type_for_module(&d.module_name, &obj.type_name)
+                ));
+            }
+            Some(ObjectProvisionSource::OwnedFactory) => {
+                let (factory_fn, factory_args) = factory_calls.get(&obj.var_name)?;
+                lines.push(format!(
+                    "        let {}{} = {}::{}({});",
+                    maybe_mut,
+                    obj.var_name,
+                    d.module_name,
+                    factory_fn,
+                    factory_args.join(", ")
+                ));
+            }
+            _ => {
+                lines.push(format!(
+                    "        let {}{} = {}::create_{}_for_testing(test_scenario::ctx(&mut scenario));",
+                    maybe_mut, obj.var_name, d.module_name, obj.type_key
+                ));
+            }
+        }
     }
     for obj in &shared_objects {
         let maybe_mut = if obj.is_mut { "mut " } else { "" };
@@ -448,7 +634,17 @@ pub(super) fn render_best_effort_test(
     for l in container_before_lines {
         lines.push(format!("        {}", l));
     }
-    lines.push(format!("        {}({});", fq, args.join(", ")));
+    let call_expr = format!("{}({})", fq, args.join(", "));
+    if let Some(ret_ty) = d.return_ty.as_ref() {
+        if should_transfer_call_return(ret_ty, &d.module_name) {
+            lines.push(format!("        let tw_ret_obj = {};", call_expr));
+            lines.push("        transfer::public_transfer(tw_ret_obj, SUPER_USER);".to_string());
+        } else {
+            lines.push(format!("        {};", call_expr));
+        }
+    } else {
+        lines.push(format!("        {};", call_expr));
+    }
     for l in snapshot_after_lines {
         lines.push(format!("        {}", l));
     }

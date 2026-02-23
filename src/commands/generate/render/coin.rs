@@ -1,4 +1,12 @@
 use super::*;
+
+fn coin_target_label(base_var: &str) -> String {
+    if base_var == "coin" {
+        "coin".to_string()
+    } else {
+        format!("coin {}", base_var)
+    }
+}
 fn overflow_may_affect_coin_target(
     deep_overflow_paths: &std::collections::HashSet<String>,
     base_var: &str,
@@ -36,7 +44,7 @@ pub(super) fn build_coin_assertion_lines(
     let mut idx = 0u64;
 
     for (base_var, effects) in grouped {
-        let target_label = format!("coin {}", base_var);
+        let target_label = coin_target_label(&base_var);
         if overflow_may_affect_coin_target(deep_overflow_paths, &base_var) {
             summary.add_potential(target_label);
             continue;

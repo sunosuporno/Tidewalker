@@ -76,6 +76,8 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         String,
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     > = std::collections::HashMap::new();
+    let mut init_one_time_witness_by_module: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut alerts: Vec<(String, String)> = Vec::new();
     let mut file_for_module: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -95,6 +97,9 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
                     info.module_name.clone(),
                     info.init_field_values_by_type.clone(),
                 );
+                if let Some(w) = &info.init_one_time_witness {
+                    init_one_time_witness_by_module.insert(info.module_name.clone(), w.clone());
+                }
                 for (mod_name, type_name) in info.shared_types {
                     all_shared.push((mod_name.clone(), type_name));
                 }
@@ -158,9 +163,6 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
             .get(mod_name)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        if shared.is_empty() && caps.is_empty() {
-            continue;
-        }
         let source_path = sources_dir.join(file_name);
         if !source_path.is_file() {
             alerts.push((
@@ -182,6 +184,10 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         let init_field_values = init_field_values_by_module
             .get(mod_name)
             .unwrap_or(&empty_init_values);
+        let init_one_time_witness = init_one_time_witness_by_module.get(mod_name).cloned();
+        if shared.is_empty() && caps.is_empty() && init_one_time_witness.is_none() {
+            continue;
+        }
         match inject_test_only_helpers(
             &source_path,
             mod_name,
@@ -189,6 +195,7 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
             caps,
             struct_fields,
             init_field_values,
+            init_one_time_witness,
         ) {
             Ok(()) => println!("Injected test_only helpers into {}", source_path.display()),
             Err(e) => alerts.push((
@@ -295,15 +302,6 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
     let skip_init_generation =
         info.init_one_time_witness.is_some() || init_complex_trigger.is_some();
     if skip_init_generation {
-        if let Some(ref w) = info.init_one_time_witness {
-            info.cannot_generate.push((
-                file_name.clone(),
-                format!(
-                    "Init uses one-time witness ({}); add a #[test_only] helper that receives the witness, or rely on test flow that simulates publish.",
-                    w
-                ),
-            ));
-        }
         if let Some(trigger) = init_complex_trigger {
             info.cannot_generate.push((
                 file_name.clone(),
@@ -852,21 +850,39 @@ fn generate_in_module_test_only_snippet(
         String,
         std::collections::HashMap<String, String>,
     >,
+    init_one_time_witness: Option<String>,
+    has_existing_bootstrap: bool,
 ) -> Vec<String> {
-    let mut out = Vec::new();
-    out.push("".to_string());
-    out.extend(tidewalker_box_lines());
+    let mut body = Vec::new();
+    if let Some(witness_type) = init_one_time_witness {
+        if !has_existing_bootstrap {
+            let witness_type = witness_type.trim().to_string();
+            body.push("#[test_only]".to_string());
+            body.push("/// Bootstrap one-time-witness init state for generated tests.".to_string());
+            body.push(
+                "public fun bootstrap_init_for_testing(ctx: &mut sui::tx_context::TxContext) {"
+                    .to_string(),
+            );
+            body.push(format!(
+                "    let witness = sui::test_utils::create_one_time_witness<{}>();",
+                witness_type
+            ));
+            body.push("    init(witness, ctx);".to_string());
+            body.push("}".to_string());
+            body.push("".to_string());
+        }
+    }
     for type_name in shared {
-        out.push("#[test_only]".to_string());
-        out.push(format!(
+        body.push("#[test_only]".to_string());
+        body.push(format!(
             "/// Create and share {} for testing (replicating init).",
             type_name
         ));
-        out.push(format!(
+        body.push(format!(
             "public fun create_and_share_{}_for_testing(ctx: &mut sui::tx_context::TxContext) {{",
             type_name.to_lowercase()
         ));
-        out.push(format!("    let obj = {} {{", type_name));
+        body.push(format!("    let obj = {} {{", type_name));
         if let Some(fields) = struct_fields.get(type_name) {
             for (field_name, field_ty) in fields {
                 let init = init_field_values
@@ -874,28 +890,28 @@ fn generate_in_module_test_only_snippet(
                     .and_then(|vals| vals.get(field_name))
                     .cloned()
                     .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
-                out.push(format!("        {}: {},", field_name, init));
+                body.push(format!("        {}: {},", field_name, init));
             }
         } else {
-            out.push("        id: sui::object::new(ctx),".to_string());
+            body.push("        id: sui::object::new(ctx),".to_string());
         }
-        out.push("    };".to_string());
-        out.push("    transfer::public_share_object(obj);".to_string());
-        out.push("}".to_string());
-        out.push("".to_string());
+        body.push("    };".to_string());
+        body.push("    transfer::public_share_object(obj);".to_string());
+        body.push("}".to_string());
+        body.push("".to_string());
     }
     for type_name in caps {
-        out.push("#[test_only]".to_string());
-        out.push(format!(
+        body.push("#[test_only]".to_string());
+        body.push(format!(
             "/// Create {} for testing (caller receives it).",
             type_name
         ));
-        out.push(format!(
+        body.push(format!(
             "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
             type_name.to_lowercase(),
             type_name
         ));
-        out.push(format!("    {} {{", type_name));
+        body.push(format!("    {} {{", type_name));
         if let Some(fields) = struct_fields.get(type_name) {
             for (field_name, field_ty) in fields {
                 let init = init_field_values
@@ -903,15 +919,24 @@ fn generate_in_module_test_only_snippet(
                     .and_then(|vals| vals.get(field_name))
                     .cloned()
                     .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
-                out.push(format!("        {}: {},", field_name, init));
+                body.push(format!("        {}: {},", field_name, init));
             }
         } else {
-            out.push("        id: sui::object::new(ctx),".to_string());
+            body.push("        id: sui::object::new(ctx),".to_string());
         }
-        out.push("    }".to_string());
-        out.push("}".to_string());
-        out.push("".to_string());
+        body.push("    }".to_string());
+        body.push("}".to_string());
+        body.push("".to_string());
     }
+
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    out.push("".to_string());
+    out.extend(tidewalker_box_lines());
+    out.extend(body);
     out.extend(tidewalker_box_lines());
     out
 }
@@ -985,17 +1010,10 @@ fn inject_test_only_helpers(
         String,
         std::collections::HashMap<String, String>,
     >,
+    init_one_time_witness: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source_path)?;
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
-
-    let snippet = generate_in_module_test_only_snippet(
-        mod_name,
-        shared,
-        caps,
-        struct_fields,
-        init_field_values,
-    );
 
     // Only remove our own block (identified by Tidewalker box/sentinels). Do not touch other test_only code.
     if let Some((s, e)) = find_tidewalker_block(&lines) {
@@ -1005,6 +1023,18 @@ fn inject_test_only_helpers(
             lines.pop();
         }
     }
+    let has_existing_bootstrap = lines
+        .iter()
+        .any(|l| l.contains("fun bootstrap_init_for_testing("));
+    let snippet = generate_in_module_test_only_snippet(
+        mod_name,
+        shared,
+        caps,
+        struct_fields,
+        init_field_values,
+        init_one_time_witness,
+        has_existing_bootstrap,
+    );
 
     // Always place our block at the end of the file.
     if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {

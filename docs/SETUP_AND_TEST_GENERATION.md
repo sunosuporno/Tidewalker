@@ -21,7 +21,7 @@ This document captures the cases we need to handle across two phases—**test_on
 | Case | Detection | Generation | Notes |
 |------|-----------|------------|--------|
 | **Shared/cap in non-init functions** | Scan **all** functions (not just init) for `share_object(...)` and `transfer(..., sender(...))`; record (type, kind, function_name). | Do **not** replicate construction (too many deps). **Alert:** “Type X is created/shared in function F. Add a #[test_only] helper that calls F with test parameters, or implement manually.” | Optional later: thin wrapper that calls F for very simple signatures. |
-| **Init with one-time witness** | Detect `fun init(_: WITNESS_TYPE, ctx: &mut TxContext)` (first param is one-time witness). | Do **not** generate (we cannot fabricate witness). **Alert:** “Init uses one-time witness; add a #[test_only] helper that receives the witness, or rely on test flow that simulates publish.” | |
+| **Init with one-time witness** | Detect `fun init(_: WITNESS_TYPE, ctx: &mut TxContext)` (first param is one-time witness). | Generate `#[test_only] bootstrap_init_for_testing(ctx)` in the defining module. It creates witness via `sui::test_utils::create_one_time_witness<WITNESS_TYPE>()` and calls `init(witness, ctx)`. | No manual helper needed for simple OTW init bootstrap. |
 | **Better alerts** | Already detect. | When we can’t generate: “Init too complex to replicate (versioned/nested); add a #[test_only] helper manually or call existing test API.” | Clear messaging only. |
 
 ### 1.3 What we do not generate in setup phase (admit defeat)
@@ -42,10 +42,10 @@ This document captures the cases we need to handle across two phases—**test_on
 | Case | How test generation handles it |
 |------|-------------------------------|
 | **Shared/cap in non-init (1A)** | Generate **test code** that performs a transaction calling the existing function (e.g. `pool::create_pool(registry, tick_size, lot_size, …)`) with test arguments. No separate test_only helper needed; the generated test is the “helper” that invokes the API. |
-| **One-time witness init (2)** | Generate **test code** that simulates publishing the package so `init(WITNESS, ctx)` runs once, then takes the shared object(s) and cap(s) from the scenario and uses them in later transactions. The generated test flow (publish step + take objects) replaces the need for a test_only helper that receives the witness. |
-| **`new()` / factory functions** | Types that are created and returned (owned) by `public fun new(...)` or similar (e.g. `BalanceManager::new(ctx)`, `TradeParams::new(...)`) need no test_only helper. Test generation produces test code that calls `module::new(ctx)` (or the appropriate factory) when the test needs that object. |
+| **One-time witness init (2)** | Test generation bootstraps init state by calling generated `bootstrap_init_for_testing(ctx)` first, then uses `take_shared` / `take_from_sender` for init-produced objects in later transaction steps. |
+| **`new()` / factory functions** | Types created and returned (owned) by public factory functions (including `new(...)`) need no test_only helper. Test generation now detects such factories and emits direct `module::factory(...)` object provisioning when a required object type has no helper. |
 
-So: **1A, one-time witness, and `new()`** are addressed by **how we generate tests** (calling real functions, simulating publish), not by generating extra setup helpers in the protocol.
+So: **1A** and **`new()`** are addressed by **how we generate tests**; **one-time witness init** is handled by an auto-generated setup helper (`bootstrap_init_for_testing`) plus generated test calls.
 
 ---
 
@@ -55,7 +55,7 @@ So: **1A, one-time witness, and `new()`** are addressed by **how we generate tes
 |----------|------------------------|-------------------------|
 | Simple shared/cap in `init`, public struct | ✅ Generate helper in defining module | Use generated helper in tests |
 | Shared/cap in non-init function | ⚠️ Alert; no construction generated | ✅ Generate test that calls that function |
-| Init with one-time witness | ⚠️ Alert; no helper generated | ✅ Generate test that simulates publish and uses result |
+| Init with one-time witness | ✅ Auto-generate `bootstrap_init_for_testing` in defining module | ✅ Generate test that calls bootstrap helper, then takes init-produced objects |
 | **`new()` / owned-object factories** | Not needed (no helper) | ✅ Generate test that calls `module::new(ctx)` etc. when test needs the object |
 | Complex init | ❌ Admit defeat; alert | Dev writes helper; tests use it |
 | Private struct | ❌ Admit defeat (structure known but not field constraints); alert | Dev writes helper; tests use it |

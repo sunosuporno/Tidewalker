@@ -1,4 +1,4 @@
-use super::catalog::ModuleHelperCatalog;
+use super::catalog::{ModuleBootstrapCatalog, ModuleHelperCatalog};
 use super::*;
 mod coin;
 mod container;
@@ -55,6 +55,7 @@ pub(super) fn render_best_effort_test(
     option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
     container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
+    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
     vector_effects: &[VectorEffect],
@@ -72,6 +73,7 @@ pub(super) fn render_best_effort_test(
         option_accessor_map,
         container_accessor_map,
         helper_catalog,
+        bootstrap_catalog,
         fn_lookup,
         numeric_effects,
         vector_effects,

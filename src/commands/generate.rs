@@ -266,9 +266,23 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     move_files.sort();
 
     let mut decls: Vec<FnDecl> = Vec::new();
+    let mut module_sources: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for file in &move_files {
         let content = fs::read_to_string(file)?;
         decls.extend(extract_public_fns(&content));
+        if let Some(module_name) = content.lines().find_map(|line| {
+            let t = line.trim();
+            if t.starts_with("module ") {
+                let rest = t.strip_prefix("module ")?;
+                let until = rest.split_whitespace().next().unwrap_or(rest);
+                Some(until.trim_end_matches(';').to_string())
+            } else {
+                None
+            }
+        }) {
+            module_sources.insert(module_name, content);
+        }
     }
 
     let mut skipped: Vec<(String, String, String)> = Vec::new(); // (module, fn, reason)
@@ -288,11 +302,25 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     out.push("    const SUPER_USER: address = @0xA;".to_string());
     out.push("    const OTHER: address = @0xB;".to_string());
     out.push("".to_string());
+    out.push("    // Tidewalker generated assertion code map:".to_string());
+    out.push(
+        "    // `i` = 0-based assertion index for that category within a single generated test function."
+            .to_string(),
+    );
+    out.push("    // Example: first coin assert = 990, second coin assert = 991.".to_string());
+    out.push("    // - numeric checks: 900 + i".to_string());
+    out.push("    // - container checks: 940 + i".to_string());
+    out.push("    // - vector checks: 960 + i".to_string());
+    out.push("    // - option checks: 980 + i".to_string());
+    out.push("    // - coin checks: 990 + i".to_string());
+    out.push("    // - treasury supply checks: 995 + i".to_string());
+    out.push("".to_string());
 
     let accessor_map = catalog::build_accessor_map(&decls);
     let option_accessor_map = catalog::build_option_accessor_map(&decls);
     let container_accessor_map = catalog::build_container_accessor_map(&decls);
     let helper_catalog = catalog::build_helper_catalog(&decls);
+    let bootstrap_catalog = catalog::build_bootstrap_catalog(&module_sources);
     let fn_lookup = catalog::build_fn_lookup(&decls);
     let effects_map = chain::build_chained_effect_map(&decls, 4);
     let vector_effects_map = chain::build_chained_vector_effect_map(&decls, 4);
@@ -350,6 +378,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             &option_accessor_map,
             &container_accessor_map,
             &helper_catalog,
+            &bootstrap_catalog,
             &fn_lookup,
             &resolved_effects,
             &resolved_vector_effects,
@@ -369,6 +398,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
                 &d,
                 &accessor_map,
                 &helper_catalog,
+                &bootstrap_catalog,
                 &fn_lookup,
             );
             for test in guard_tests {
