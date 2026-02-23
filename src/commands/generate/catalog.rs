@@ -70,7 +70,8 @@ fn parse_option_accessor_sig(d: &FnDecl) -> Option<OptionAccessorSig> {
             continue;
         }
         let stmt = stmt.trim_end_matches(';').trim();
-        if let Some((field, is_some_when_true)) = parse_option_presence_from_expr(stmt, param_name) {
+        if let Some((field, is_some_when_true)) = parse_option_presence_from_expr(stmt, param_name)
+        {
             return Some(OptionAccessorSig {
                 fn_name: d.fn_name.clone(),
                 param_ty: param_ty.clone(),

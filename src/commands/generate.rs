@@ -300,10 +300,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.string_effects.clone());
-        let deep_overflow_paths = deep_overflow_map
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let deep_overflow_paths = deep_overflow_map.get(&key).cloned().unwrap_or_default();
         if let Some(test_lines) = render::render_best_effort_test(
             &d,
             &accessor_map,
@@ -721,7 +718,6 @@ fn extract_string_fields_by_type(
     out
 }
 
-
 #[derive(Debug, Clone)]
 struct ObjectNeed {
     type_name: String,
@@ -925,7 +921,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::push_back(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::push_back(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -933,7 +931,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::pop_back(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::pop_back(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -941,7 +941,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::insert(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::insert(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -949,7 +951,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::remove(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::remove(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -957,7 +961,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::swap_remove(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::swap_remove(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -965,7 +971,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::append(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::append(", &aliases)
+        {
             let src = extract_namespace_args(t, "vector::append(")
                 .and_then(|args| args.get(1).cloned())
                 .and_then(|arg| parse_vector_target_expr(&arg, &aliases));
@@ -987,7 +995,9 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             }
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::reverse(", &aliases) {
+        if let Some((base_var, field)) =
+            parse_vector_namespace_target(t, "vector::reverse(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -995,7 +1005,8 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
             });
             continue;
         }
-        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::swap(", &aliases) {
+        if let Some((base_var, field)) = parse_vector_namespace_target(t, "vector::swap(", &aliases)
+        {
             out.push(VectorEffect {
                 base_var,
                 field,
@@ -1023,7 +1034,8 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
 fn extract_coin_effects_from_body(body_lines: &[String], params: &[ParamDecl]) -> Vec<CoinEffect> {
     let mut out = Vec::new();
     let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut minted_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut minted_vars: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut coin_params: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in params {
         if is_coin_type(&normalize_param_object_type(&p.ty)) {
@@ -1170,10 +1182,12 @@ fn extract_treasury_cap_effects_from_body(
     let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut split_coin_amounts: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut treasury_cap_params: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut treasury_cap_params: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for p in params {
-        if p.ty.trim().starts_with("&mut") && is_treasury_cap_type(&normalize_param_object_type(&p.ty))
+        if p.ty.trim().starts_with("&mut")
+            && is_treasury_cap_type(&normalize_param_object_type(&p.ty))
         {
             treasury_cap_params.insert(p.name.clone());
         }
@@ -1313,7 +1327,12 @@ fn parse_coin_split_method(
     aliases: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
     let idx = line.find(".split(")?;
-    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let before = line[..idx]
+        .split('=')
+        .last()?
+        .trim()
+        .trim_end_matches('.')
+        .trim();
     let base_var = parse_coin_target_expr(before, aliases)?;
     let args = extract_method_args(line, "split(")?;
     let amount = normalize_coin_amount_expr(args.first()?.as_str())?;
@@ -1335,7 +1354,12 @@ fn parse_coin_join_method(
     aliases: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
     let idx = line.find(".join(")?;
-    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let before = line[..idx]
+        .split('=')
+        .last()?
+        .trim()
+        .trim_end_matches('.')
+        .trim();
     let base_var = parse_coin_target_expr(before, aliases)?;
     let args = extract_method_args(line, "join(")?;
     let src_base_var = parse_coin_target_expr(args.first()?.as_str(), aliases)?;
@@ -1366,7 +1390,12 @@ fn parse_coin_join_mint_method(
     aliases: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
     let idx = line.find(".join(")?;
-    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let before = line[..idx]
+        .split('=')
+        .last()?
+        .trim()
+        .trim_end_matches('.')
+        .trim();
     let base_var = parse_coin_target_expr(before, aliases)?;
     let args = extract_method_args(line, "join(")?;
     let mint_amount = parse_mint_amount_from_expr(args.first()?.as_str())?;
@@ -1526,8 +1555,10 @@ fn extract_option_effects_from_body(
     let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut param_option_fields: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    let mut param_option_fields: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for p in params {
         let ty = normalize_param_object_type(&p.ty);
         let key = type_key_from_type_name(&ty);
@@ -1632,8 +1663,10 @@ fn extract_string_effects_from_body(
     let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut param_string_fields: std::collections::HashMap<String, std::collections::HashSet<String>> =
-        std::collections::HashMap::new();
+    let mut param_string_fields: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for p in params {
         let ty = normalize_param_object_type(&p.ty);
         let key = type_key_from_type_name(&ty);
@@ -1774,7 +1807,10 @@ fn parse_let_binding_name(stmt: &str) -> Option<String> {
     let rest = stmt.strip_prefix("let ")?.trim();
     let lhs = rest.split_once('=').map(|(l, _)| l).unwrap_or(rest).trim();
     let lhs = lhs.strip_prefix("mut ").unwrap_or(lhs).trim();
-    let name = lhs.split(|c: char| c == ':' || c.is_whitespace()).next()?.trim();
+    let name = lhs
+        .split(|c: char| c == ':' || c.is_whitespace())
+        .next()?
+        .trim();
     if is_ident(name) {
         Some(name.to_string())
     } else {
@@ -1801,10 +1837,7 @@ fn parse_alias_binding(stmt: &str) -> Option<(String, String)> {
     }
 }
 
-fn resolve_alias_path(
-    name: &str,
-    aliases: &std::collections::HashMap<String, String>,
-) -> String {
+fn resolve_alias_path(name: &str, aliases: &std::collections::HashMap<String, String>) -> String {
     let mut cur = name.to_string();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     while is_ident(&cur) {

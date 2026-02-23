@@ -1,5 +1,5 @@
-use super::*;
 use super::catalog::ModuleHelperCatalog;
+use super::*;
 
 #[derive(Debug, Clone)]
 struct CoinNeed {
@@ -9,9 +9,14 @@ struct CoinNeed {
 }
 
 #[derive(Debug, Clone)]
-struct CapTransferCheck {
+struct OwnershipTransferCheck {
     recipient: String,
-    cap_type: String,
+    object_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct OwnershipShareCheck {
+    object_type: String,
 }
 
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
@@ -291,6 +296,8 @@ pub(super) fn render_best_effort_test(
         }
     }
     let has_shared_objects = !shared_objects.is_empty();
+    let preexisting_shared_type_keys: std::collections::HashSet<String> =
+        shared_objects.iter().map(|o| o.type_key.clone()).collect();
 
     if has_shared_objects {
         lines.push("    {".to_string());
@@ -358,8 +365,8 @@ pub(super) fn render_best_effort_test(
         option_accessor_map,
         deep_overflow_paths,
     );
-    let (cap_transfer_checks, cap_transfer_summary) =
-        build_cap_transfer_checks(d, &param_arg_values);
+    let (ownership_transfer_checks, ownership_share_checks, ownership_summary) =
+        build_ownership_checks(d, &param_arg_values, &preexisting_shared_type_keys);
     let cap_auth_summary = build_cap_auth_summary(d);
     let string_summary = build_string_summary(string_effects, &param_runtime, deep_overflow_paths);
     for eff in string_effects {
@@ -374,7 +381,7 @@ pub(super) fn render_best_effort_test(
     state_summary.merge(treasury_summary);
     state_summary.merge(build_coin_note_summary(coin_notes));
     state_summary.merge(cap_auth_summary);
-    state_summary.merge(cap_transfer_summary);
+    state_summary.merge(ownership_summary);
     state_summary.merge(option_summary);
     state_summary.merge(string_summary);
     state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
@@ -504,18 +511,31 @@ pub(super) fn render_best_effort_test(
         }
     }
     lines.push("    };".to_string());
-    for (idx, check) in cap_transfer_checks.iter().enumerate() {
+    for (idx, check) in ownership_transfer_checks.iter().enumerate() {
         lines.push(format!(
             "    test_scenario::next_tx(&mut scenario, {});",
             check.recipient
         ));
         lines.push("    {".to_string());
         lines.push(format!(
-            "        let moved_cap_{} = test_scenario::take_from_sender<{}>(&scenario);",
-            idx, check.cap_type
+            "        let moved_obj_{} = test_scenario::take_from_sender<{}>(&scenario);",
+            idx, check.object_type
         ));
         lines.push(format!(
-            "        test_scenario::return_to_sender(&scenario, moved_cap_{});",
+            "        test_scenario::return_to_sender(&scenario, moved_obj_{});",
+            idx
+        ));
+        lines.push("    };".to_string());
+    }
+    for (idx, check) in ownership_share_checks.iter().enumerate() {
+        lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
+        lines.push("    {".to_string());
+        lines.push(format!(
+            "        let shared_obj_{} = scenario.take_shared<{}>();",
+            idx, check.object_type
+        ));
+        lines.push(format!(
+            "        test_scenario::return_shared(shared_obj_{});",
             idx
         ));
         lines.push("    };".to_string());
@@ -551,21 +571,177 @@ fn build_cap_auth_summary(d: &FnDecl) -> StateChangeSummary {
     summary
 }
 
-fn build_cap_transfer_checks(
+fn is_scalar_like_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    if norm.is_empty() {
+        return true;
+    }
+    if is_numeric_type(&norm) || norm == "bool" || norm == "address" {
+        return true;
+    }
+    if norm.starts_with("vector<") {
+        return true;
+    }
+    if is_option_type(&norm) || is_string_type(&norm) {
+        return true;
+    }
+    if norm == "ID" || norm.ends_with("::ID") || norm == "UID" || norm.ends_with("::UID") {
+        return true;
+    }
+    false
+}
+
+fn is_trackable_object_type(ty: &str) -> bool {
+    let norm = normalize_param_object_type(ty);
+    if norm.contains("TxContext") || is_coin_type(&norm) {
+        return false;
+    }
+    !is_scalar_like_type(&norm)
+}
+
+fn parse_let_binding_type_annotation(stmt: &str) -> Option<String> {
+    let rest = stmt.strip_prefix("let ")?.trim();
+    let lhs = rest.split_once('=').map(|(l, _)| l).unwrap_or(rest).trim();
+    let lhs = lhs.strip_prefix("mut ").unwrap_or(lhs).trim();
+    let (_, ty) = lhs.split_once(':')?;
+    let out = normalize_param_object_type(ty);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn parse_struct_destructure_id_bindings(stmt: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let rest = match stmt.strip_prefix("let ") {
+        Some(v) => v.trim(),
+        None => return out,
+    };
+    let lhs = rest.split_once('=').map(|(l, _)| l).unwrap_or(rest).trim();
+    let (ty_raw, fields_raw) = match lhs.split_once('{') {
+        Some(v) => v,
+        None => return out,
+    };
+    let fields = match fields_raw.rsplit_once('}') {
+        Some((inner, _)) => inner,
+        None => return out,
+    };
+    let ty =
+        normalize_param_object_type(ty_raw.trim().strip_prefix("mut ").unwrap_or(ty_raw).trim());
+    if !is_trackable_object_type(&ty) {
+        return out;
+    }
+    for part in fields.split(',') {
+        let token = part.trim();
+        if token == "id" {
+            out.push(("id".to_string(), ty.clone()));
+            continue;
+        }
+        if let Some((left, right)) = token.split_once(':') {
+            if left.trim() != "id" {
+                continue;
+            }
+            let id_var = right.trim();
+            if is_ident(id_var) {
+                out.push((id_var.to_string(), ty.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn resolve_object_var_and_type(
+    obj_arg: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    param_object_types: &std::collections::HashMap<String, String>,
+    local_object_types: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let obj_token = strip_ref_and_parens_text(obj_arg);
+    if !is_ident(obj_token) {
+        return None;
+    }
+    let resolved = resolve_alias_path(obj_token, aliases);
+    if let Some(ty) = param_object_types.get(&resolved) {
+        return Some((resolved, ty.clone()));
+    }
+    if let Some(ty) = local_object_types.get(&resolved) {
+        return Some((resolved, ty.clone()));
+    }
+    if let Some(ty) = param_object_types.get(obj_token) {
+        return Some((obj_token.to_string(), ty.clone()));
+    }
+    if let Some(ty) = local_object_types.get(obj_token) {
+        return Some((obj_token.to_string(), ty.clone()));
+    }
+    None
+}
+
+fn resolve_deleted_object_type(
+    stmt: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    param_object_types: &std::collections::HashMap<String, String>,
+    local_object_types: &std::collections::HashMap<String, String>,
+    id_owner_types: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let prefix = stmt.split_once(".delete(")?.0.trim();
+    let token = strip_ref_and_parens_text(prefix);
+    if let Some(base) = token.strip_suffix(".id") {
+        let base = base.trim();
+        if !is_ident(base) {
+            return None;
+        }
+        let resolved = resolve_alias_path(base, aliases);
+        return param_object_types
+            .get(&resolved)
+            .or_else(|| local_object_types.get(&resolved))
+            .or_else(|| param_object_types.get(base))
+            .or_else(|| local_object_types.get(base))
+            .cloned();
+    }
+    if !is_ident(token) {
+        return None;
+    }
+    let resolved = resolve_alias_path(token, aliases);
+    id_owner_types
+        .get(&resolved)
+        .or_else(|| id_owner_types.get(token))
+        .cloned()
+}
+
+fn build_ownership_checks(
     d: &FnDecl,
     param_arg_values: &std::collections::HashMap<String, String>,
-) -> (Vec<CapTransferCheck>, StateChangeSummary) {
-    let mut checks = Vec::new();
+    preexisting_shared_type_keys: &std::collections::HashSet<String>,
+) -> (
+    Vec<OwnershipTransferCheck>,
+    Vec<OwnershipShareCheck>,
+    StateChangeSummary,
+) {
+    let mut transfer_checks = Vec::new();
+    let mut share_checks = Vec::new();
     let mut summary = StateChangeSummary::default();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
     let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut local_cap_types: std::collections::HashMap<String, String> =
+    let mut local_object_types: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut param_cap_types: std::collections::HashMap<String, String> =
+    let mut param_object_types: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut id_owner_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut minted_cap_vars: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut coin_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     for p in &d.params {
+        if is_coin_type(&p.ty) {
+            coin_vars.insert(p.name.clone());
+        }
         let ty = normalize_param_object_type(&p.ty);
-        if is_cap_type(&ty) {
-            param_cap_types.insert(p.name.clone(), ty);
+        if p.ty.trim().starts_with('&') {
+            continue;
+        }
+        if is_trackable_object_type(&ty) {
+            param_object_types.insert(p.name.clone(), ty);
         }
     }
 
@@ -581,74 +757,194 @@ fn build_cap_transfer_checks(
             continue;
         }
         if let Some((name, target)) = parse_alias_binding(stmt) {
+            let resolved_target = resolve_alias_path(&target, &aliases);
+            if coin_vars.contains(&target) || coin_vars.contains(&resolved_target) {
+                coin_vars.insert(name.clone());
+            }
             aliases.insert(name, target);
             continue;
         }
         if stmt.starts_with("let ") {
+            for (id_var, owner_ty) in parse_struct_destructure_id_bindings(stmt) {
+                id_owner_types.insert(id_var, owner_ty);
+            }
             if let Some(name) = parse_let_binding_name(stmt) {
                 aliases.remove(&name);
+                local_object_types.remove(&name);
+                minted_cap_vars.remove(&name);
+                coin_vars.remove(&name);
+                if let Some(ty) = parse_let_binding_type_annotation(stmt) {
+                    if is_trackable_object_type(&ty) {
+                        local_object_types.insert(name.clone(), ty);
+                    }
+                }
                 if let Some((_, rhs)) = stmt.split_once('=') {
                     let rhs = rhs.trim();
-                    if let Some(type_token) = rhs.split('{').next() {
-                        let ty = type_token.trim();
-                        if is_cap_type(ty) || ty.ends_with("Cap") {
-                            local_cap_types.insert(name, ty.to_string());
+                    let rhs_lower = rhs.to_ascii_lowercase();
+                    let coin_like_rhs = rhs_lower.contains("coin::")
+                        || rhs_lower.contains(".into_coin(")
+                        || rhs_lower.contains(".split(")
+                        || rhs_lower.contains(".join(");
+                    if coin_like_rhs {
+                        coin_vars.insert(name.clone());
+                    }
+                    if rhs.contains('{') && rhs.contains('}') {
+                        if let Some(type_token) = rhs.split('{').next() {
+                            let ty = normalize_param_object_type(type_token.trim());
+                            if is_trackable_object_type(&ty) {
+                                local_object_types.insert(name.clone(), ty.clone());
+                                if is_cap_type(&ty)
+                                    && (rhs.contains("object::new(")
+                                        || rhs.contains("sui::object::new("))
+                                {
+                                    minted_cap_vars.insert(name.clone(), ty);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        let args = extract_namespace_args(stmt, "transfer::public_transfer(")
+        if stmt.contains(".delete(") {
+            if let Some(obj_ty) = resolve_deleted_object_type(
+                stmt,
+                &aliases,
+                &param_object_types,
+                &local_object_types,
+                &id_owner_types,
+            ) {
+                let label_ty = if obj_ty.contains("::") {
+                    obj_ty
+                } else {
+                    qualify_type_for_module(&d.module_name, &obj_ty)
+                };
+                summary.add_potential(format!("object delete {}", label_ty));
+            } else {
+                summary.add_potential("object delete".to_string());
+            }
+        }
+
+        let transfer_args = extract_namespace_args(stmt, "transfer::public_transfer(")
             .or_else(|| extract_namespace_args(stmt, "transfer::transfer("));
-        let Some(args) = args else {
-            continue;
-        };
-        let obj_arg = match args.first() {
-            Some(v) => v.as_str(),
-            None => continue,
-        };
-        let recipient_arg = match args.get(1) {
-            Some(v) => v.as_str(),
-            None => continue,
-        };
-
-        let obj_token = strip_ref_and_parens_text(obj_arg);
-        if !is_ident(obj_token) {
-            continue;
+        if let Some(args) = transfer_args {
+            let obj_arg = match args.first() {
+                Some(v) => v.as_str(),
+                None => continue,
+            };
+            let recipient_arg = match args.get(1) {
+                Some(v) => v.as_str(),
+                None => continue,
+            };
+            let Some((resolved_obj, obj_ty)) = resolve_object_var_and_type(
+                obj_arg,
+                &aliases,
+                &param_object_types,
+                &local_object_types,
+            ) else {
+                let obj_token = strip_ref_and_parens_text(obj_arg);
+                if is_ident(obj_token) {
+                    let resolved_token = resolve_alias_path(obj_token, &aliases);
+                    if coin_vars.contains(obj_token) || coin_vars.contains(&resolved_token) {
+                        continue;
+                    }
+                }
+                summary.add_potential("ownership transfer object".to_string());
+                continue;
+            };
+            let label_ty = if obj_ty.contains("::") {
+                obj_ty.clone()
+            } else {
+                qualify_type_for_module(&d.module_name, &obj_ty)
+            };
+            let transfer_label = if is_cap_type(&obj_ty) {
+                format!("cap transfer {}", label_ty)
+            } else {
+                format!("ownership transfer {}", label_ty)
+            };
+            if has_non_linear_flow {
+                summary.add_potential(transfer_label);
+            } else if let Some(recipient) =
+                resolve_cap_transfer_recipient(recipient_arg, param_arg_values)
+            {
+                transfer_checks.push(OwnershipTransferCheck {
+                    recipient,
+                    object_type: label_ty.clone(),
+                });
+                summary.add_asserted(transfer_label);
+            } else {
+                summary.add_potential(transfer_label);
+            }
+            if is_cap_type(&obj_ty) && minted_cap_vars.contains_key(&resolved_obj) {
+                let mint_label = format!("cap mint {}", label_ty);
+                if has_non_linear_flow {
+                    summary.add_potential(mint_label);
+                } else {
+                    summary.add_asserted(mint_label);
+                }
+            }
         }
-        let resolved_obj = resolve_alias_path(obj_token, &aliases);
-        let cap_ty = if let Some(ty) = param_cap_types.get(&resolved_obj) {
-            ty.clone()
-        } else if let Some(ty) = local_cap_types.get(&resolved_obj) {
-            ty.clone()
-        } else if let Some(ty) = local_cap_types.get(obj_token) {
-            ty.clone()
-        } else {
-            continue;
-        };
-        if !is_cap_type(&cap_ty) {
-            continue;
-        }
 
-        let label_ty = if cap_ty.contains("::") {
-            cap_ty.clone()
-        } else {
-            qualify_type_for_module(&d.module_name, &cap_ty)
-        };
-        let target_label = format!("cap transfer {}", label_ty);
-        if let Some(recipient) = resolve_cap_transfer_recipient(recipient_arg, param_arg_values) {
-            checks.push(CapTransferCheck {
-                recipient,
-                cap_type: label_ty,
-            });
-            summary.add_asserted(target_label);
-        } else {
-            summary.add_potential(target_label);
+        let share_args = extract_namespace_args(stmt, "transfer::share_object(")
+            .or_else(|| extract_namespace_args(stmt, "transfer::public_share_object("));
+        if let Some(args) = share_args {
+            let obj_arg = match args.first() {
+                Some(v) => v.as_str(),
+                None => continue,
+            };
+            let Some((resolved_obj, obj_ty)) = resolve_object_var_and_type(
+                obj_arg,
+                &aliases,
+                &param_object_types,
+                &local_object_types,
+            ) else {
+                summary.add_potential("ownership share object".to_string());
+                continue;
+            };
+            let label_ty = if obj_ty.contains("::") {
+                obj_ty.clone()
+            } else {
+                qualify_type_for_module(&d.module_name, &obj_ty)
+            };
+            let share_label = if is_cap_type(&obj_ty) {
+                format!("cap share {}", label_ty)
+            } else {
+                format!("ownership share {}", label_ty)
+            };
+            if has_non_linear_flow {
+                summary.add_potential(share_label);
+            } else {
+                let type_key = type_key_from_type_name(&obj_ty);
+                if preexisting_shared_type_keys.contains(&type_key) {
+                    summary.add_potential(share_label);
+                } else {
+                    share_checks.push(OwnershipShareCheck {
+                        object_type: label_ty.clone(),
+                    });
+                    summary.add_asserted(share_label);
+                }
+            }
+            if is_cap_type(&obj_ty) && minted_cap_vars.contains_key(&resolved_obj) {
+                let mint_label = format!("cap mint {}", label_ty);
+                if has_non_linear_flow {
+                    summary.add_potential(mint_label);
+                } else {
+                    summary.add_asserted(mint_label);
+                }
+            }
         }
     }
 
-    (checks, summary)
+    for (_var, cap_ty) in minted_cap_vars {
+        let label_ty = if cap_ty.contains("::") {
+            cap_ty
+        } else {
+            qualify_type_for_module(&d.module_name, &cap_ty)
+        };
+        summary.add_potential(format!("cap mint {}", label_ty));
+    }
+
+    (transfer_checks, share_checks, summary)
 }
 
 fn resolve_cap_transfer_recipient(
@@ -764,8 +1060,14 @@ fn build_treasury_cap_assertion_lines(
             };
             let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
             let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
-            before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
-            after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+            before.push(format!(
+                "let {} = coin::total_supply(&{});",
+                before_name, runtime_var
+            ));
+            after.push(format!(
+                "let {} = coin::total_supply(&{});",
+                after_name, runtime_var
+            ));
             if let Some(expr) = assert_expr {
                 after.push(format!(
                     "assert!({} == {}, {});",
@@ -794,23 +1096,25 @@ fn build_treasury_cap_assertion_lines(
             for eff in &effects {
                 match &eff.op {
                     TreasuryCapOp::Mint(amount) => {
-                        let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
-                            Some(v) => v,
-                            None => {
-                                exact = false;
-                                break;
-                            }
-                        };
+                        let resolved_amount =
+                            match resolve_numeric_operand(amount, param_arg_values) {
+                                Some(v) => v,
+                                None => {
+                                    exact = false;
+                                    break;
+                                }
+                            };
                         expr = format!("({} + {})", expr, resolved_amount);
                     }
                     TreasuryCapOp::Burn(amount) => {
-                        let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
-                            Some(v) => v,
-                            None => {
-                                exact = false;
-                                break;
-                            }
-                        };
+                        let resolved_amount =
+                            match resolve_numeric_operand(amount, param_arg_values) {
+                                Some(v) => v,
+                                None => {
+                                    exact = false;
+                                    break;
+                                }
+                            };
                         expr = format!("({} - {})", expr, resolved_amount);
                     }
                     TreasuryCapOp::Changed => {
@@ -825,8 +1129,14 @@ fn build_treasury_cap_assertion_lines(
             if effects.len() == 1 && matches!(&effects[0].op, TreasuryCapOp::Changed) {
                 let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
                 let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
-                before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
-                after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+                before.push(format!(
+                    "let {} = coin::total_supply(&{});",
+                    before_name, runtime_var
+                ));
+                after.push(format!(
+                    "let {} = coin::total_supply(&{});",
+                    after_name, runtime_var
+                ));
                 after.push(format!(
                     "assert!({} != {}, {});",
                     after_name,
@@ -843,8 +1153,14 @@ fn build_treasury_cap_assertion_lines(
 
         let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
         let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
-        before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
-        after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+        before.push(format!(
+            "let {} = coin::total_supply(&{});",
+            before_name, runtime_var
+        ));
+        after.push(format!(
+            "let {} = coin::total_supply(&{});",
+            after_name, runtime_var
+        ));
         after.push(format!(
             "assert!({} == {}, {});",
             after_name,
@@ -1209,8 +1525,10 @@ fn build_vector_assertion_lines(
 
     let has_internal_calls = !d.calls.is_empty();
     let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
-    let mut potential_targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut seen_len_snapshots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut potential_targets: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut seen_len_snapshots: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut idx = 0u64;
 
     for (target, effects) in grouped {
@@ -1230,14 +1548,19 @@ fn build_vector_assertion_lines(
             potential_targets.insert(target);
             continue;
         }
-        let read_expr =
-            match resolve_vector_len_expr(d, &first.base_var, &first.field, runtime_var, accessor_map) {
-                Some(v) => v,
-                None => {
-                    potential_targets.insert(target);
-                    continue;
-                }
-            };
+        let read_expr = match resolve_vector_len_expr(
+            d,
+            &first.base_var,
+            &first.field,
+            runtime_var,
+            accessor_map,
+        ) {
+            Some(v) => v,
+            None => {
+                potential_targets.insert(target);
+                continue;
+            }
+        };
         let before_name_tpl = format!(
             "before_{}_{}_len",
             sanitize_ident(runtime_var),
@@ -1306,7 +1629,10 @@ fn build_vector_assertion_lines(
         if !exact {
             if effects.len() == 1 {
                 match &first.op {
-                    VectorOp::PushBack | VectorOp::Insert | VectorOp::PopBack | VectorOp::Remove
+                    VectorOp::PushBack
+                    | VectorOp::Insert
+                    | VectorOp::PopBack
+                    | VectorOp::Remove
                     | VectorOp::SwapRemove => {}
                     _ => {
                         potential_targets.insert(target);
@@ -1376,7 +1702,8 @@ fn build_coin_assertion_lines(
     for eff in coin_effects {
         grouped.entry(eff.base_var.clone()).or_default().push(eff);
     }
-    let modified_coin_targets: std::collections::HashSet<String> = grouped.keys().cloned().collect();
+    let modified_coin_targets: std::collections::HashSet<String> =
+        grouped.keys().cloned().collect();
 
     let has_internal_calls = !d.calls.is_empty();
     let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
@@ -1446,7 +1773,8 @@ fn build_coin_assertion_lines(
                             break;
                         }
                     };
-                    let src_before_name = format!("before_{}_coin_value", sanitize_ident(src_runtime));
+                    let src_before_name =
+                        format!("before_{}_coin_value", sanitize_ident(src_runtime));
                     required_src_snapshots.push((src_before_name.clone(), src_runtime.clone()));
                     expr = format!("({} + {})", expr, src_before_name);
                 }
@@ -1460,9 +1788,15 @@ fn build_coin_assertion_lines(
         if !exact {
             if effects.len() == 1 && matches!(&effects[0].op, CoinOp::Changed) {
                 if seen_before_snapshots.insert(before_name.clone()) {
-                    before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
+                    before.push(format!(
+                        "let {} = coin::value(&{});",
+                        before_name, runtime_var
+                    ));
                 }
-                after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
+                after.push(format!(
+                    "let {} = coin::value(&{});",
+                    after_name, runtime_var
+                ));
                 after.push(format!(
                     "assert!({} != {}, {});",
                     after_name,
@@ -1478,14 +1812,23 @@ fn build_coin_assertion_lines(
         }
 
         if seen_before_snapshots.insert(before_name.clone()) {
-            before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
+            before.push(format!(
+                "let {} = coin::value(&{});",
+                before_name, runtime_var
+            ));
         }
         for (src_before_name, src_runtime) in required_src_snapshots {
             if seen_before_snapshots.insert(src_before_name.clone()) {
-                before.push(format!("let {} = coin::value(&{});", src_before_name, src_runtime));
+                before.push(format!(
+                    "let {} = coin::value(&{});",
+                    src_before_name, src_runtime
+                ));
             }
         }
-        after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
+        after.push(format!(
+            "let {} = coin::value(&{});",
+            after_name, runtime_var
+        ));
         after.push(format!(
             "assert!({} == {}, {});",
             after_name,
@@ -1678,7 +2021,12 @@ fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String
     } else {
         out.push(format!(
             "// asserted: {}",
-            summary.asserted.iter().cloned().collect::<Vec<_>>().join(", ")
+            summary
+                .asserted
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if summary.potential.is_empty() {
@@ -1686,7 +2034,12 @@ fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String
     } else {
         out.push(format!(
             "// potential_change: {}",
-            summary.potential.iter().cloned().collect::<Vec<_>>().join(", ")
+            summary
+                .potential
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     out

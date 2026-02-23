@@ -9,7 +9,8 @@ struct ModuleSetupInfo {
     shared_types: Vec<(String, String)>,
     cap_types: Vec<(String, String)>,
     struct_field_types: std::collections::HashMap<String, Vec<(String, String)>>,
-    init_field_values_by_type: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    init_field_values_by_type:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     cannot_generate: Vec<(String, String)>,
     /// (type_name, function_name) for share_object in non-init functions
     non_init_shared: Vec<(String, String)>,
@@ -300,8 +301,7 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
     };
     for (var_name, type_name) in shared_vars.iter().chain(cap_vars.iter()) {
         if let Some(field_values) = init_struct_field_values_by_var.get(var_name) {
-            info
-                .init_field_values_by_type
+            info.init_field_values_by_type
                 .entry(type_name.clone())
                 .or_insert_with(|| field_values.clone());
         }
@@ -622,7 +622,8 @@ fn parse_struct_literal_fields_from_body(
             i += 1;
             continue;
         }
-        let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut fields: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         i += 1;
         while i < body.len() && depth > 0 {
             let line_clean = strip_line_comment(body[i]).trim().to_string();
@@ -862,7 +863,10 @@ fn generate_in_module_test_only_snippet(
     shared: &[String],
     caps: &[String],
     struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
-    init_field_values: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    init_field_values: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
 ) -> Vec<String> {
     let mut out = Vec::new();
     out.push("".to_string());
@@ -1009,7 +1013,10 @@ fn inject_test_only_helpers(
     shared: &[String],
     caps: &[String],
     struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
-    init_field_values: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    init_field_values: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source_path)?;
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
