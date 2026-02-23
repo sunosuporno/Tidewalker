@@ -20,6 +20,138 @@ struct ModuleSetupInfo {
     init_one_time_witness: Option<String>,
 }
 
+fn normalize_setup_type(ty: &str) -> String {
+    ty.replace("&mut", "").replace('&', "").trim().to_string()
+}
+
+fn is_treasury_cap_type(ty: &str) -> bool {
+    ty.trim().replace(' ', "").contains("TreasuryCap<")
+}
+
+fn type_key_from_type_name(type_name: &str) -> String {
+    let clean = type_name.trim();
+    let no_generics = clean.split('<').next().unwrap_or(clean).trim();
+    no_generics
+        .split("::")
+        .last()
+        .unwrap_or(no_generics)
+        .trim()
+        .to_lowercase()
+}
+
+fn split_params_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut angle = 0i32;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '<' => angle += 1,
+            '>' => angle -= 1,
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            ',' if angle == 0 && paren == 0 && bracket == 0 && brace == 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+fn find_function_headers(lines: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        let is_fun = t.starts_with("public entry fun ")
+            || t.starts_with("entry fun ")
+            || t.starts_with("public fun ")
+            || t.starts_with("public(package) fun ")
+            || t.starts_with("fun ");
+        if !is_fun {
+            i += 1;
+            continue;
+        }
+        let mut header = t.to_string();
+        let mut j = i + 1;
+        while j < lines.len() && !header.contains(')') {
+            header.push(' ');
+            header.push_str(lines[j].trim());
+            j += 1;
+        }
+        out.push(header);
+        i = j;
+    }
+    out
+}
+
+fn extract_param_types_from_header(header: &str) -> Vec<(bool, String)> {
+    let params_src = header
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(p, _)| p)
+        .unwrap_or("");
+    let parts = split_params_top_level(params_src);
+    let mut out = Vec::new();
+    for p in parts {
+        let Some((_name, ty)) = p.split_once(':') else {
+            continue;
+        };
+        let ty_raw = ty.trim();
+        let by_ref = ty_raw.starts_with('&');
+        let ty_norm = normalize_setup_type(ty_raw);
+        if ty_norm.is_empty() {
+            continue;
+        }
+        out.push((by_ref, ty_norm));
+    }
+    out
+}
+
+fn is_container_field_type(ty: &str) -> bool {
+    let t = ty.trim().replace(' ', "");
+    t.contains("::table::Table<")
+        || t.contains("::vec_map::VecMap<")
+        || t.contains("::vec_set::VecSet<")
+        || t.contains("::bag::Bag")
+}
+
+fn extract_treasury_cap_inner_type(ty: &str) -> Option<String> {
+    let start = ty.find('<')?;
+    let end = ty.rfind('>')?;
+    if end <= start + 1 {
+        return None;
+    }
+    let inner = ty[start + 1..end].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+fn dedup_type_pairs(v: &mut Vec<(String, String)>) {
+    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    v.retain(|item| seen.insert(item.clone()));
+}
+
 pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use serde::Deserialize;
 
@@ -271,6 +403,28 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
     }
     info.struct_field_types = struct_field_types;
 
+    let mut demanded_ref_public_structs: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut demanded_treasury_caps: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for header in find_function_headers(&lines) {
+        for (by_ref, ty) in extract_param_types_from_header(&header) {
+            if ty.contains("TxContext") {
+                continue;
+            }
+            if ty.replace(' ', "").contains("Coin<") {
+                continue;
+            }
+            if is_treasury_cap_type(&ty) {
+                demanded_treasury_caps.insert(ty);
+                continue;
+            }
+            if by_ref && public_structs.contains(&ty) {
+                demanded_ref_public_structs.insert(ty);
+            }
+        }
+    }
+
     let file_name = path
         .file_name()
         .unwrap_or_default()
@@ -296,6 +450,22 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
             info.init_field_values_by_type
                 .entry(type_name.clone())
                 .or_insert_with(|| field_values.clone());
+        }
+    }
+
+    // Generic helper synthesis for TreasuryCap params used in module APIs.
+    for cap_ty in demanded_treasury_caps {
+        info.cap_types.push((info.module_name.clone(), cap_ty));
+    }
+
+    // Generic helper synthesis for container-backed public structs used by ref.
+    for struct_ty in demanded_ref_public_structs {
+        let Some(fields) = info.struct_field_types.get(&struct_ty) else {
+            continue;
+        };
+        if fields.iter().any(|(_, field_ty)| is_container_field_type(field_ty)) {
+            info.shared_types
+                .push((info.module_name.clone(), struct_ty));
         }
     }
 
@@ -365,6 +535,9 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
             }
         }
     }
+
+    dedup_type_pairs(&mut info.shared_types);
+    dedup_type_pairs(&mut info.cap_types);
 
     Ok(info)
 }
@@ -873,6 +1046,7 @@ fn generate_in_module_test_only_snippet(
         }
     }
     for type_name in shared {
+        let helper_key = type_key_from_type_name(type_name);
         body.push("#[test_only]".to_string());
         body.push(format!(
             "/// Create and share {} for testing (replicating init).",
@@ -880,7 +1054,7 @@ fn generate_in_module_test_only_snippet(
         ));
         body.push(format!(
             "public fun create_and_share_{}_for_testing(ctx: &mut sui::tx_context::TxContext) {{",
-            type_name.to_lowercase()
+            helper_key
         ));
         body.push(format!("    let obj = {} {{", type_name));
         if let Some(fields) = struct_fields.get(type_name) {
@@ -901,6 +1075,7 @@ fn generate_in_module_test_only_snippet(
         body.push("".to_string());
     }
     for type_name in caps {
+        let helper_key = type_key_from_type_name(type_name);
         body.push("#[test_only]".to_string());
         body.push(format!(
             "/// Create {} for testing (caller receives it).",
@@ -908,23 +1083,34 @@ fn generate_in_module_test_only_snippet(
         ));
         body.push(format!(
             "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
-            type_name.to_lowercase(),
+            helper_key,
             type_name
         ));
-        body.push(format!("    {} {{", type_name));
-        if let Some(fields) = struct_fields.get(type_name) {
-            for (field_name, field_ty) in fields {
-                let init = init_field_values
-                    .get(type_name)
-                    .and_then(|vals| vals.get(field_name))
-                    .cloned()
-                    .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
-                body.push(format!("        {}: {},", field_name, init));
+        if is_treasury_cap_type(type_name) {
+            if let Some(inner_ty) = extract_treasury_cap_inner_type(type_name) {
+                body.push(format!(
+                    "    sui::coin::create_treasury_cap_for_testing<{}>(ctx)",
+                    inner_ty
+                ));
+            } else {
+                body.push("    abort 100001; // malformed TreasuryCap helper type".to_string());
             }
         } else {
-            body.push("        id: sui::object::new(ctx),".to_string());
+            body.push(format!("    {} {{", type_name));
+            if let Some(fields) = struct_fields.get(type_name) {
+                for (field_name, field_ty) in fields {
+                    let init = init_field_values
+                        .get(type_name)
+                        .and_then(|vals| vals.get(field_name))
+                        .cloned()
+                        .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
+                    body.push(format!("        {}: {},", field_name, init));
+                }
+            } else {
+                body.push("        id: sui::object::new(ctx),".to_string());
+            }
+            body.push("    }".to_string());
         }
-        body.push("    }".to_string());
         body.push("}".to_string());
         body.push("".to_string());
     }
@@ -1062,6 +1248,18 @@ fn default_field_initializer(field_name: &str, field_ty: &str) -> String {
     }
     if t.starts_with("vector<") {
         return "vector[]".to_string();
+    }
+    if tn.contains("::table::Table<") {
+        return "sui::table::new(ctx)".to_string();
+    }
+    if tn.contains("::vec_map::VecMap<") {
+        return "sui::vec_map::empty()".to_string();
+    }
+    if tn.contains("::vec_set::VecSet<") {
+        return "sui::vec_set::empty()".to_string();
+    }
+    if tn.contains("::bag::Bag") {
+        return "sui::bag::new(ctx)".to_string();
     }
     if tn == "String" || tn.ends_with("string::String") {
         return "std::string::utf8(b\"tidewalker\")".to_string();
