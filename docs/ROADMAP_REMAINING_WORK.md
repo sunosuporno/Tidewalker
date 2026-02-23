@@ -1,61 +1,67 @@
 # Tidewalker Roadmap: Remaining Work
 
 Tidewalker is a Move (Sui) test bootstrap tool.
-It generates baseline tests from protocol code, including state-change assertions where confidence is high.
+It generates baseline tests from protocol code, including state-change assertions where confidence is high and `potential_change` fallbacks where confidence is lower.
 
-## Current Coverage
+## Current Coverage (Implemented)
 
-1. Generates `#[test_only]` setup helpers for common shared-object and cap flows.
-2. Generates best-effort tests for public and entry functions.
-3. Tracks direct and chained state changes (bounded static depth).
-4. Emits specific assertions when safe.
-5. Emits `potential_change` comments when certainty is lower.
+1. Test generation and setup
+   - Generates best-effort tests for public and entry functions.
+   - Generates/uses `#[test_only]` helpers for shared/owned object setup in common cases.
+   - Supports `@tidewalker requires ...` precondition chains.
 
-Implemented state categories today:
+2. Chained static analysis
+   - Tracks direct and bounded chained state changes (depth-limited static pass).
+   - Emits conservative deep-chain `potential_change` when certainty drops.
 
-1. Numeric/operator state changes (`+`, `-`, `*`, `/`, `%`, direct set, generic changed).
-2. Vector length-driven changes (`push`, `pop`, `insert`, `remove`, `swap_remove`, `append`).
-3. Option presence changes (`some`, `none`, changed via accessor).
-4. String mutation detection as `potential_change`.
+3. Non-blockchain state categories
+   - Numeric/operator state assertions (`+`, `-`, `*`, `/`, `%`, direct set, changed fallback).
+   - Vector length-state assertions (`push`, `pop`, `insert`, `remove`, `swap_remove`, `append` where safe).
+   - Option presence assertions (`some`/`none`) through detected bool accessors.
+   - String mutation detection (currently reported as `potential_change`).
+   - Map/set-like containers (safe subset):
+     - `table`
+     - `vec_map`
+     - `vec_set`
+     - `bag`
+     - `dynamic_field`
+     - with assert strategy: add/insert/remove -> `contains/exists` post-check when safe.
+
+4. Blockchain-state categories
+   - Coin value assertions for safe `split/join/mint/burn/transfer` patterns.
+   - TreasuryCap total-supply assertions for safe mint/burn patterns.
+   - Cap auth/ownership summaries and ownership checks (transfer/share/destroy signals in safe subset).
+   - Staking-like flow detection is surfaced as `potential_change` note.
 
 ## What's Left
 
-### 1) Non-blockchain state types
+### 1) Function-level checks (primary remaining milestone)
 
-1. Map/set-like containers:
-   `table`, `object_table`, `vec_map`, `vec_set`, and equivalent helper APIs.
-2. Struct-level/nested replacement flows:
-   whole-struct rewrites and deeper field rewrite patterns.
+1. Infer expected abort tests from guards (`assert!`/abort-like flows).
+2. Generate explicit success-path guard tests.
+3. Verify expected abort code vs unexpected failures.
 
-### 2) Blockchain-specific state assertions
+### 2) Control-flow precision
 
-1. Treasury authority flows:
-   `TreasuryCap<T>`-aware mint/burn permission checks and supply-control assertions.
-2. Ownership transitions (owned/shared/wrapped/object movement).
-3. Cap mint/transfer/burn lifecycle checks.
-4. Object creation/destruction assertions by type and owner.
+1. Better branch-aware reasoning (`if/else`) for effect certainty.
+2. Better loop-aware reasoning.
+3. Fewer conservative fallbacks in mixed mutation paths.
 
-### 3) Function-level checks (assert/abort behavior)
+### 3) Remaining state-model gaps
 
-1. Infer and generate expected abort tests from guards.
-2. Generate success-path tests for assert preconditions.
-3. Distinguish expected abort code vs unexpected failure.
+1. Additional container/object variants not in current safe subset (for example `object_table` style flows).
+2. More precise nested/whole-struct rewrite reasoning.
+3. Expand alias/key resolution so every safe `vec_map` remove-style flow can be asserted (currently some paths still downgrade to `potential_change`).
 
-### 4) Control-flow precision
+### 4) DX and maintainability
 
-1. Improve branch-aware reasoning (`if/else`).
-2. Improve loop-aware reasoning.
-3. Reduce false positives in mixed/complex mutation paths.
-
-### 5) Confidence and DX
-
-1. Add per-assert confidence tagging.
-2. Improve summary readability for large functions.
-3. Expand docs/examples against mature real-world protocols.
+1. Keep extractor/parsing code as modular as render modules (ongoing refactor target).
+2. Add optional confidence tags per assertion.
+3. Expand protocol-based examples/docs for edge-case behavior.
 
 ## Suggested Next Build Order
 
-1. Map/set container support.
-2. Coin/ownership/cap blockchain-state support.
-3. Assert/abort expectation synthesis.
-4. Control-flow precision improvements.
+1. Assert/abort expectation synthesis (function-level checks).
+2. Control-flow precision improvements.
+3. Remaining state-model gaps (`object_table`, deeper struct/key tracking).
+4. DX + maintainability cleanup.
