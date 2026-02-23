@@ -28,6 +28,8 @@ struct FnDecl {
     requires: Vec<String>,
     numeric_effects: Vec<NumericEffect>,
     vector_effects: Vec<VectorEffect>,
+    coin_effects: Vec<CoinEffect>,
+    coin_notes: Vec<CoinNote>,
     option_effects: Vec<OptionEffect>,
     string_effects: Vec<StringEffect>,
     calls: Vec<CallSite>,
@@ -51,6 +53,12 @@ struct VectorEffect {
     base_var: String,
     field: String,
     op: VectorOp,
+}
+
+#[derive(Debug, Clone)]
+struct CoinEffect {
+    base_var: String,
+    op: CoinOp,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +111,22 @@ enum VectorOp {
         src_field: String,
     },
     ContentChanged,
+}
+
+#[derive(Debug, Clone)]
+enum CoinOp {
+    Split(String),
+    Join { src_base_var: String },
+    Mint(String),
+    Burn(String),
+    Changed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CoinNote {
+    MintFlow,
+    BurnFlow,
+    StakeFlow,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +244,8 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let fn_lookup = catalog::build_fn_lookup(&decls);
     let effects_map = chain::build_chained_effect_map(&decls, 4);
     let vector_effects_map = chain::build_chained_vector_effect_map(&decls, 4);
+    let coin_effects_map = chain::build_chained_coin_effect_map(&decls, 4);
+    let coin_notes_map = chain::build_chained_coin_note_map(&decls, 4);
     let option_effects_map = chain::build_chained_option_effect_map(&decls, 4);
     let string_effects_map = chain::build_chained_string_effect_map(&decls, 4);
     let deep_overflow_map = chain::build_deep_overflow_map(&decls, 4);
@@ -239,6 +265,14 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.vector_effects.clone());
+        let resolved_coin_effects = coin_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.coin_effects.clone());
+        let resolved_coin_notes = coin_notes_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.coin_notes.clone());
         let resolved_option_effects = option_effects_map
             .get(&key)
             .cloned()
@@ -259,6 +293,8 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             &fn_lookup,
             &resolved_effects,
             &resolved_vector_effects,
+            &resolved_coin_effects,
+            &resolved_coin_notes,
             &resolved_option_effects,
             &resolved_string_effects,
             &deep_overflow_paths,
@@ -465,6 +501,8 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         };
         let numeric_effects = extract_numeric_effects_from_body(&body_lines);
         let vector_effects = extract_vector_effects_from_body(&body_lines);
+        let coin_effects = extract_coin_effects_from_body(&body_lines, &params);
+        let coin_notes = extract_coin_notes_from_body(&body_lines);
         let option_effects =
             extract_option_effects_from_body(&body_lines, &params, &option_fields_by_type);
         let string_effects =
@@ -483,6 +521,8 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             requires: std::mem::take(&mut pending_requires),
             numeric_effects,
             vector_effects,
+            coin_effects,
+            coin_notes,
             option_effects,
             string_effects,
             calls,
@@ -956,6 +996,345 @@ fn extract_vector_effects_from_body(body_lines: &[String]) -> Vec<VectorEffect> 
         }
     }
     out
+}
+
+fn extract_coin_effects_from_body(body_lines: &[String], params: &[ParamDecl]) -> Vec<CoinEffect> {
+    let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut minted_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut coin_params: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in params {
+        if is_coin_type(&normalize_param_object_type(&p.ty)) {
+            coin_params.insert(p.name.clone());
+        }
+    }
+
+    for line in body_lines {
+        let t = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((name, target)) = parse_alias_binding(t) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if t.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(t) {
+                aliases.remove(&name);
+                minted_vars.remove(&name);
+                if let Some((_, rhs)) = t.split_once('=') {
+                    if let Some(amount) = parse_mint_amount_from_expr(rhs.trim()) {
+                        minted_vars.insert(name, amount);
+                    }
+                }
+            }
+        }
+        if t.contains("==") {
+            continue;
+        }
+
+        if let Some((base_var, amount)) = parse_coin_burn_with_split(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Burn(amount),
+                });
+            }
+            continue;
+        }
+
+        if let Some((base_var, amount)) = parse_coin_split_method(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Split(amount),
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, amount)) = parse_coin_split_namespace(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Split(amount),
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, amount)) = parse_coin_join_mint_method(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Mint(amount),
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, amount)) = parse_coin_join_mint_namespace(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Mint(amount),
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, src_base_var)) = parse_coin_join_method(t, &aliases) {
+            if let Some(amount) = minted_vars.get(&src_base_var) {
+                if coin_params.contains(&base_var) {
+                    out.push(CoinEffect {
+                        base_var,
+                        op: CoinOp::Mint(amount.clone()),
+                    });
+                }
+            } else if coin_params.contains(&base_var) && coin_params.contains(&src_base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Join { src_base_var },
+                });
+            } else if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Changed,
+                });
+            }
+            continue;
+        }
+        if let Some((base_var, src_base_var)) = parse_coin_join_namespace(t, &aliases) {
+            if let Some(amount) = minted_vars.get(&src_base_var) {
+                if coin_params.contains(&base_var) {
+                    out.push(CoinEffect {
+                        base_var,
+                        op: CoinOp::Mint(amount.clone()),
+                    });
+                }
+            } else if coin_params.contains(&base_var) && coin_params.contains(&src_base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Join { src_base_var },
+                });
+            } else if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Changed,
+                });
+            }
+            continue;
+        }
+        if let Some(base_var) = parse_coin_transfer_arg(t, &aliases) {
+            if coin_params.contains(&base_var) {
+                out.push(CoinEffect {
+                    base_var,
+                    op: CoinOp::Changed,
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!("{}::{:?}", eff.base_var, eff.op);
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
+    deduped
+}
+
+fn extract_coin_notes_from_body(body_lines: &[String]) -> Vec<CoinNote> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<CoinNote> = std::collections::HashSet::new();
+    for line in body_lines {
+        let stmt = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let lower = stmt.to_ascii_lowercase();
+        let has_mint = (lower.contains("coin::mint(") || lower.contains("::mint("))
+            && !lower.contains("mint_for_testing(");
+        if has_mint && seen.insert(CoinNote::MintFlow) {
+            out.push(CoinNote::MintFlow);
+        }
+        if lower.contains("coin::burn(") || lower.contains("::burn(") {
+            if seen.insert(CoinNote::BurnFlow) {
+                out.push(CoinNote::BurnFlow);
+            }
+        }
+        let has_stake = lower.contains("request_add_stake(")
+            || lower.contains("request_withdraw_stake(")
+            || lower.contains("staking::")
+            || lower.contains("staking_pool::")
+            || lower.contains("validator::")
+            || lower.contains("stake::");
+        if has_stake && seen.insert(CoinNote::StakeFlow) {
+            out.push(CoinNote::StakeFlow);
+        }
+    }
+    out
+}
+
+fn parse_coin_target_expr(
+    arg: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let first_arg = arg
+        .trim()
+        .trim_start_matches("&mut")
+        .trim_start_matches('&')
+        .trim();
+    if !is_ident(first_arg) {
+        return None;
+    }
+    let resolved = resolve_alias_path(first_arg, aliases);
+    if is_ident(&resolved) {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+fn normalize_coin_amount_expr(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some(lit) = parse_numeric_literal(t) {
+        return Some(lit);
+    }
+    if is_ident(t) {
+        return Some(t.to_string());
+    }
+    Some(remove_whitespace(t))
+}
+
+fn parse_coin_split_method(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let idx = line.find(".split(")?;
+    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let base_var = parse_coin_target_expr(before, aliases)?;
+    let args = extract_method_args(line, "split(")?;
+    let amount = normalize_coin_amount_expr(args.first()?.as_str())?;
+    Some((base_var, amount))
+}
+
+fn parse_coin_split_namespace(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let args = extract_namespace_args(line, "coin::split(")?;
+    let base_var = parse_coin_target_expr(args.first()?.as_str(), aliases)?;
+    let amount = normalize_coin_amount_expr(args.get(1)?.as_str())?;
+    Some((base_var, amount))
+}
+
+fn parse_coin_join_method(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let idx = line.find(".join(")?;
+    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let base_var = parse_coin_target_expr(before, aliases)?;
+    let args = extract_method_args(line, "join(")?;
+    let src_base_var = parse_coin_target_expr(args.first()?.as_str(), aliases)?;
+    Some((base_var, src_base_var))
+}
+
+fn parse_coin_join_namespace(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let args = extract_namespace_args(line, "coin::join(")?;
+    let base_var = parse_coin_target_expr(args.first()?.as_str(), aliases)?;
+    let src_base_var = parse_coin_target_expr(args.get(1)?.as_str(), aliases)?;
+    Some((base_var, src_base_var))
+}
+
+fn parse_coin_transfer_arg(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let args = extract_namespace_args(line, "transfer::public_transfer(")
+        .or_else(|| extract_namespace_args(line, "transfer::transfer("))?;
+    parse_coin_target_expr(args.first()?.as_str(), aliases)
+}
+
+fn parse_coin_join_mint_method(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let idx = line.find(".join(")?;
+    let before = line[..idx].split('=').last()?.trim().trim_end_matches('.').trim();
+    let base_var = parse_coin_target_expr(before, aliases)?;
+    let args = extract_method_args(line, "join(")?;
+    let mint_amount = parse_mint_amount_from_expr(args.first()?.as_str())?;
+    Some((base_var, mint_amount))
+}
+
+fn parse_coin_join_mint_namespace(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let args = extract_namespace_args(line, "coin::join(")?;
+    let base_var = parse_coin_target_expr(args.first()?.as_str(), aliases)?;
+    let mint_amount = parse_mint_amount_from_expr(args.get(1)?.as_str())?;
+    Some((base_var, mint_amount))
+}
+
+fn parse_coin_burn_with_split(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let args = extract_namespace_args(line, "coin::burn(")
+        .or_else(|| extract_suffix_call_args(line, "::burn("))?;
+    let burn_arg = args.get(1)?.as_str();
+    parse_coin_split_expr(burn_arg, aliases)
+}
+
+fn parse_coin_split_expr(
+    expr: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let t = expr.trim();
+    if let Some((base, amount)) = parse_coin_split_method(t, aliases) {
+        return Some((base, amount));
+    }
+    if let Some((base, amount)) = parse_coin_split_namespace(t, aliases) {
+        return Some((base, amount));
+    }
+    None
+}
+
+fn parse_mint_amount_from_expr(expr: &str) -> Option<String> {
+    let t = expr.trim();
+    if t.contains("mint_for_testing(") {
+        return None;
+    }
+    let args = extract_namespace_args(t, "coin::mint(")
+        .or_else(|| extract_suffix_call_args(t, "::mint("))?;
+    let raw = args.get(1)?.as_str();
+    normalize_coin_amount_expr(raw)
+}
+
+fn extract_suffix_call_args(line: &str, suffix_call_prefix: &str) -> Option<Vec<String>> {
+    let idx = line.find(suffix_call_prefix)?;
+    let after = line[idx + suffix_call_prefix.len()..].trim();
+    let args_raw = after.strip_suffix(')')?;
+    Some(split_args(args_raw))
 }
 
 fn extract_option_effects_from_body(
@@ -1505,6 +1884,11 @@ fn is_ident(s: &str) -> bool {
 fn is_string_type(ty: &str) -> bool {
     let norm = ty.trim().replace(' ', "");
     norm == "String" || norm.ends_with("string::String")
+}
+
+fn is_coin_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    norm.contains("Coin<")
 }
 
 fn is_option_type(ty: &str) -> bool {

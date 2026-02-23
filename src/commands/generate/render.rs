@@ -1,5 +1,162 @@
 use super::*;
-use super::catalog::{synthesize_call_args_for_fn, ModuleHelperCatalog};
+use super::catalog::ModuleHelperCatalog;
+
+#[derive(Debug, Clone)]
+struct CoinNeed {
+    var_name: String,
+    moved_on_main_call: bool,
+    needs_mut_binding: bool,
+}
+
+fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
+    needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
+}
+
+fn default_u64_arg_for_param(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("ratio") {
+        "101".to_string()
+    } else {
+        "1".to_string()
+    }
+}
+
+fn requires_chain_uses_coin_slot_later(
+    req_chain: &[&FnDecl],
+    current_step_idx: usize,
+    coin_slot_idx: usize,
+    main_coin_slots: usize,
+) -> bool {
+    // Main function call happens after all preconditions; if it has this slot,
+    // consuming here would starve the function under test.
+    if coin_slot_idx < main_coin_slots {
+        return true;
+    }
+    for req in req_chain.iter().skip(current_step_idx + 1) {
+        let mut slot_idx = 0usize;
+        for p in &req.params {
+            if is_coin_type(p.ty.trim()) {
+                if slot_idx == coin_slot_idx {
+                    return true;
+                }
+                slot_idx += 1;
+            }
+        }
+    }
+    false
+}
+
+fn synthesize_requires_call_args(
+    d: &FnDecl,
+    req_step_idx: usize,
+    req_chain: &[&FnDecl],
+    object_vars_by_type: &std::collections::HashMap<String, String>,
+    main_coin_vars: &[String],
+    requires_extra_coin_slots: &mut std::collections::HashMap<usize, String>,
+    pre_coin_counter: &mut usize,
+    requires_cleanup_coin_vars: &mut Vec<String>,
+    requires_consumed_coin_vars: &mut std::collections::HashSet<String>,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut args = Vec::new();
+    let mut prep = Vec::new();
+    let mut coin_slot_idx = 0usize;
+    for p in &d.params {
+        let t = p.ty.trim();
+        if t.starts_with('&') && !t.contains("TxContext") && !is_coin_type(t) {
+            let ty = normalize_param_object_type(t);
+            let key = type_key_from_type_name(&ty);
+            let var = object_vars_by_type.get(&key)?;
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else {
+                args.push(format!("&{}", var));
+            }
+        } else if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_coin_type(t) {
+            if t.starts_with('&') {
+                if let Some(var) = main_coin_vars.get(coin_slot_idx) {
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var));
+                    } else {
+                        args.push(format!("&{}", var));
+                    }
+                } else if let Some(var) = requires_extra_coin_slots.get(&coin_slot_idx) {
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var));
+                    } else {
+                        args.push(format!("&{}", var));
+                    }
+                } else {
+                    let var = format!("pre_req_coin_{}", *pre_coin_counter);
+                    *pre_coin_counter += 1;
+                    let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    prep.push(format!(
+                        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                        maybe_mut, var
+                    ));
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var));
+                    } else {
+                        args.push(format!("&{}", var));
+                    }
+                    requires_extra_coin_slots.insert(coin_slot_idx, var.clone());
+                    requires_cleanup_coin_vars.push(var);
+                }
+                coin_slot_idx += 1;
+            } else {
+                let must_preserve_for_later = requires_chain_uses_coin_slot_later(
+                    req_chain,
+                    req_step_idx,
+                    coin_slot_idx,
+                    main_coin_vars.len(),
+                );
+                if must_preserve_for_later {
+                    // This precondition consumes a coin slot still needed later.
+                    // Mint a dedicated object only for this call.
+                    let var = format!("pre_req_coin_{}", *pre_coin_counter);
+                    *pre_coin_counter += 1;
+                    prep.push(format!(
+                        "let {} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                        var
+                    ));
+                    args.push(var);
+                } else if let Some(var) = main_coin_vars.get(coin_slot_idx) {
+                    args.push(var.clone());
+                } else if let Some(var) = requires_extra_coin_slots.remove(&coin_slot_idx) {
+                    // Reuse and consume an existing precondition slot coin when no later
+                    // step needs this slot.
+                    requires_consumed_coin_vars.insert(var.clone());
+                    requires_cleanup_coin_vars.retain(|v| v != &var);
+                    args.push(var);
+                } else {
+                    // One-off by-value precondition coin (consumed in this call).
+                    let var = format!("pre_req_coin_{}", *pre_coin_counter);
+                    *pre_coin_counter += 1;
+                    prep.push(format!(
+                        "let {} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                        var
+                    ));
+                    args.push(var);
+                }
+                coin_slot_idx += 1;
+            }
+        } else if t == "u64" {
+            args.push(default_u64_arg_for_param(&p.name));
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("OTHER".to_string());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            return None;
+        }
+    }
+    Some((args, prep))
+}
 
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
@@ -9,6 +166,8 @@ pub(super) fn render_best_effort_test(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
     vector_effects: &[VectorEffect],
+    coin_effects: &[CoinEffect],
+    coin_notes: &[CoinNote],
     option_effects: &[OptionEffect],
     string_effects: &[StringEffect],
     deep_overflow_paths: &std::collections::HashSet<String>,
@@ -24,12 +183,16 @@ pub(super) fn render_best_effort_test(
     lines.push("    let mut scenario = test_scenario::begin(SUPER_USER);".to_string());
 
     let mut args: Vec<String> = Vec::new();
-    let mut needs_coin = false;
     let mut param_runtime: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut param_coin_runtime: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut param_coin_is_ref: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
     let mut param_arg_values: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
+    let mut coin_needs: Vec<CoinNeed> = Vec::new();
 
     for param in &d.params {
         let t = param.ty.trim();
@@ -40,7 +203,7 @@ pub(super) fn render_best_effort_test(
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if t == "u64" {
-            let v = "1".to_string();
+            let v = default_u64_arg_for_param(&param.name);
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if t == "bool" {
@@ -52,13 +215,24 @@ pub(super) fn render_best_effort_test(
         } else if is_string_type(t) {
             let v = "std::string::utf8(b\"tidewalker\")".to_string();
             args.push(v);
-        } else if t.contains("Coin<") || t.contains("Coin <") {
-            needs_coin = true;
-            if t.starts_with("&mut") {
-                args.push("&mut coin".to_string());
+        } else if is_coin_type(t) {
+            let var_name = format!("coin_{}", sanitize_ident(&param.name));
+            let is_ref = t.starts_with('&');
+            let arg = if t.starts_with("&mut") {
+                format!("&mut {}", var_name)
+            } else if t.starts_with('&') {
+                format!("&{}", var_name)
             } else {
-                args.push("&coin".to_string());
-            }
+                var_name.clone()
+            };
+            args.push(arg);
+            param_coin_runtime.insert(param.name.clone(), var_name.clone());
+            param_coin_is_ref.insert(param.name.clone(), is_ref);
+            coin_needs.push(CoinNeed {
+                var_name,
+                moved_on_main_call: !is_ref,
+                needs_mut_binding: t.starts_with("&mut"),
+            });
         } else if t.starts_with('&') {
             let obj = ObjectNeed::new(param);
             if obj.is_mut {
@@ -108,6 +282,13 @@ pub(super) fn render_best_effort_test(
             .entry(obj.type_key.clone())
             .or_insert_with(|| obj.var_name.clone());
     }
+    let coin_vars_for_calls = coin_var_names(&coin_needs);
+    let mut pre_coin_counter = 0usize;
+    let mut requires_cleanup_coin_vars: Vec<String> = Vec::new();
+    let mut requires_consumed_coin_vars: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut requires_extra_coin_slots: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
 
     let (snapshot_before_lines, snapshot_after_lines, mut numeric_summary) =
         build_numeric_assertion_lines(
@@ -123,6 +304,14 @@ pub(super) fn render_best_effort_test(
         vector_effects,
         &param_runtime,
         accessor_map,
+        deep_overflow_paths,
+    );
+    let (coin_before_lines, coin_after_lines, coin_summary) = build_coin_assertion_lines(
+        d,
+        coin_effects,
+        &param_coin_runtime,
+        &param_coin_is_ref,
+        &param_arg_values,
         deep_overflow_paths,
     );
     let (option_before_lines, option_after_lines, option_summary) = build_option_assertion_lines(
@@ -141,14 +330,21 @@ pub(super) fn render_best_effort_test(
     let mut state_summary = StateChangeSummary::default();
     state_summary.merge(numeric_summary);
     state_summary.merge(vector_summary);
+    state_summary.merge(coin_summary);
+    state_summary.merge(build_coin_note_summary(coin_notes));
     state_summary.merge(option_summary);
     state_summary.merge(string_summary);
     state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
     let summary_lines = render_state_change_summary_lines(&state_summary);
 
     lines.push("    {".to_string());
-    if needs_coin {
-        lines.push("        let mut coin = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));".to_string());
+    for coin in &coin_needs {
+        let maybe_mut = if coin.needs_mut_binding { "mut " } else { "" };
+        lines.push(format!(
+            "        let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+            maybe_mut,
+            coin.var_name
+        ));
     }
     for obj in &owned_objects {
         let maybe_mut = if obj.is_mut { "mut " } else { "" };
@@ -166,26 +362,44 @@ pub(super) fn render_best_effort_test(
         ));
     }
 
-    for req in &d.requires {
-        if let Some(module_fns) = fn_lookup.get(&d.module_name) {
+    let mut requires_chain: Vec<&FnDecl> = Vec::new();
+    if let Some(module_fns) = fn_lookup.get(&d.module_name) {
+        for req in &d.requires {
             if let Some(req_decl) = module_fns.get(req) {
-                if let Some(req_args) =
-                    synthesize_call_args_for_fn(req_decl, &object_vars_by_type, needs_coin)
-                {
-                    lines.push(format!(
-                        "        {}::{}({});",
-                        d.module_name,
-                        req_decl.fn_name,
-                        req_args.join(", ")
-                    ));
-                }
+                requires_chain.push(req_decl);
             }
+        }
+    }
+    for (req_idx, req_decl) in requires_chain.iter().enumerate() {
+        if let Some((req_args, pre_lines)) = synthesize_requires_call_args(
+            req_decl,
+            req_idx,
+            &requires_chain,
+            &object_vars_by_type,
+            &coin_vars_for_calls,
+            &mut requires_extra_coin_slots,
+            &mut pre_coin_counter,
+            &mut requires_cleanup_coin_vars,
+            &mut requires_consumed_coin_vars,
+        ) {
+            for l in pre_lines {
+                lines.push(format!("        {}", l));
+            }
+            lines.push(format!(
+                "        {}::{}({});",
+                d.module_name,
+                req_decl.fn_name,
+                req_args.join(", ")
+            ));
         }
     }
     for l in snapshot_before_lines {
         lines.push(format!("        {}", l));
     }
     for l in vector_before_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in coin_before_lines {
         lines.push(format!("        {}", l));
     }
     for l in option_before_lines {
@@ -196,6 +410,9 @@ pub(super) fn render_best_effort_test(
         lines.push(format!("        {}", l));
     }
     for l in vector_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in coin_after_lines {
         lines.push(format!("        {}", l));
     }
     for l in option_after_lines {
@@ -210,14 +427,32 @@ pub(super) fn render_best_effort_test(
             obj.var_name
         ));
     }
+    let mut seen_req_coin_cleanup: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for var in &requires_cleanup_coin_vars {
+        if requires_consumed_coin_vars.contains(var) {
+            continue;
+        }
+        if seen_req_coin_cleanup.insert(var.clone()) {
+            lines.push(format!(
+                "        transfer::public_transfer({}, SUPER_USER);",
+                var
+            ));
+        }
+    }
     for obj in &owned_objects {
         lines.push(format!(
             "        transfer::public_transfer({}, SUPER_USER);",
             obj.var_name
         ));
     }
-    if needs_coin {
-        lines.push("        transfer::public_transfer(coin, SUPER_USER);".to_string());
+    for coin in &coin_needs {
+        if !coin.moved_on_main_call {
+            lines.push(format!(
+                "        transfer::public_transfer({}, SUPER_USER);",
+                coin.var_name
+            ));
+        }
     }
     lines.push("    };".to_string());
 
@@ -225,6 +460,19 @@ pub(super) fn render_best_effort_test(
     lines.push("    test_scenario::end(scenario);".to_string());
     lines.push("}".to_string());
     Some(lines)
+}
+
+fn build_coin_note_summary(coin_notes: &[CoinNote]) -> StateChangeSummary {
+    let mut summary = StateChangeSummary::default();
+    for note in coin_notes {
+        let target = match note {
+            CoinNote::MintFlow => "coin mint flow".to_string(),
+            CoinNote::BurnFlow => "coin burn flow".to_string(),
+            CoinNote::StakeFlow => "staking flow".to_string(),
+        };
+        summary.add_potential(target);
+    }
+    summary
 }
 
 fn resolve_read_expr(
@@ -581,6 +829,163 @@ fn build_vector_assertion_lines(
 
     for t in potential_targets {
         summary.add_potential(format!("vector {}", t));
+    }
+
+    (before, after, summary)
+}
+
+fn overflow_may_affect_coin_target(
+    deep_overflow_paths: &std::collections::HashSet<String>,
+    base_var: &str,
+) -> bool {
+    deep_overflow_paths.contains(base_var)
+}
+
+fn build_coin_assertion_lines(
+    d: &FnDecl,
+    coin_effects: &[CoinEffect],
+    param_coin_runtime: &std::collections::HashMap<String, String>,
+    param_coin_is_ref: &std::collections::HashMap<String, bool>,
+    param_arg_values: &std::collections::HashMap<String, String>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut summary = StateChangeSummary::default();
+    if coin_effects.is_empty() {
+        return (before, after, summary);
+    }
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<&CoinEffect>> =
+        std::collections::BTreeMap::new();
+    for eff in coin_effects {
+        grouped.entry(eff.base_var.clone()).or_default().push(eff);
+    }
+
+    let has_internal_calls = !d.calls.is_empty();
+    let mut seen_before_snapshots: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut idx = 0u64;
+
+    for (base_var, effects) in grouped {
+        let target_label = format!("coin {}", base_var);
+        if overflow_may_affect_coin_target(deep_overflow_paths, &base_var) {
+            summary.add_potential(target_label);
+            continue;
+        }
+        let runtime_var = match param_coin_runtime.get(&base_var) {
+            Some(v) => v,
+            None => {
+                summary.add_potential(target_label);
+                continue;
+            }
+        };
+        if !param_coin_is_ref.get(&base_var).copied().unwrap_or(false) {
+            // Cannot observe post-call value for by-value coin params.
+            summary.add_potential(target_label);
+            continue;
+        }
+        if has_internal_calls || effects.len() != 1 {
+            summary.add_potential(target_label);
+            continue;
+        }
+
+        let first = effects[0];
+        let before_name = format!("before_{}_coin_value", sanitize_ident(runtime_var));
+        let after_name = format!("after_{}_coin_value", sanitize_ident(runtime_var));
+        if seen_before_snapshots.insert(before_name.clone()) {
+            before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
+        }
+        after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
+
+        match &first.op {
+            CoinOp::Split(amount) => {
+                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                    Some(v) => v,
+                    None => {
+                        summary.add_potential(target_label);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                after.push(format!(
+                    "assert!({} == {} - {}, {});",
+                    after_name,
+                    before_name,
+                    resolved_amount,
+                    990 + idx
+                ));
+                summary.add_asserted(target_label);
+            }
+            CoinOp::Mint(amount) => {
+                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                    Some(v) => v,
+                    None => {
+                        summary.add_potential(target_label);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                after.push(format!(
+                    "assert!({} == {} + {}, {});",
+                    after_name,
+                    before_name,
+                    resolved_amount,
+                    990 + idx
+                ));
+                summary.add_asserted(target_label);
+            }
+            CoinOp::Burn(amount) => {
+                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                    Some(v) => v,
+                    None => {
+                        summary.add_potential(target_label);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                after.push(format!(
+                    "assert!({} == {} - {}, {});",
+                    after_name,
+                    before_name,
+                    resolved_amount,
+                    990 + idx
+                ));
+                summary.add_asserted(target_label);
+            }
+            CoinOp::Join { src_base_var } => {
+                let src_runtime = match param_coin_runtime.get(src_base_var) {
+                    Some(v) => v,
+                    None => {
+                        summary.add_potential(target_label);
+                        idx += 1;
+                        continue;
+                    }
+                };
+                let src_before_name = format!("before_{}_coin_value", sanitize_ident(src_runtime));
+                if seen_before_snapshots.insert(src_before_name.clone()) {
+                    before.push(format!("let {} = coin::value(&{});", src_before_name, src_runtime));
+                }
+                after.push(format!(
+                    "assert!({} == {} + {}, {});",
+                    after_name,
+                    before_name,
+                    src_before_name,
+                    990 + idx
+                ));
+                summary.add_asserted(target_label);
+            }
+            CoinOp::Changed => {
+                after.push(format!(
+                    "assert!({} != {}, {});",
+                    after_name,
+                    before_name,
+                    990 + idx
+                ));
+                summary.add_asserted(target_label);
+            }
+        }
+        idx += 1;
     }
 
     (before, after, summary)

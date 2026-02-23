@@ -65,6 +65,70 @@ pub(super) fn build_chained_vector_effect_map(
     cache
 }
 
+pub(super) fn build_chained_coin_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<CoinEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<CoinEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_coin_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
+pub(super) fn build_chained_coin_note_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<CoinNote>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<CoinNote>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_coin_notes_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
 pub(super) fn build_chained_option_effect_map(
     decls: &[FnDecl],
     max_depth: usize,
@@ -381,6 +445,188 @@ fn collect_option_effects_for_fn(
         }
     }
 
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
+}
+
+fn map_coin_op_to_caller(op: &CoinOp, callee: &FnDecl, call: &CallSite) -> CoinOp {
+    match op {
+        CoinOp::Split(amount) => {
+            if is_ident(amount) {
+                if let Some(idx) = callee.params.iter().position(|p| p.name == *amount) {
+                    if let Some(arg) = call.arg_exprs.get(idx) {
+                        let mapped = arg.trim();
+                        if parse_numeric_literal(mapped).is_some() || is_ident(mapped) {
+                            return CoinOp::Split(mapped.to_string());
+                        }
+                    }
+                }
+            }
+            CoinOp::Split(amount.clone())
+        }
+        CoinOp::Mint(amount) => {
+            if is_ident(amount) {
+                if let Some(idx) = callee.params.iter().position(|p| p.name == *amount) {
+                    if let Some(arg) = call.arg_exprs.get(idx) {
+                        let mapped = arg.trim();
+                        if parse_numeric_literal(mapped).is_some() || is_ident(mapped) {
+                            return CoinOp::Mint(mapped.to_string());
+                        }
+                    }
+                }
+            }
+            CoinOp::Mint(amount.clone())
+        }
+        CoinOp::Burn(amount) => {
+            if is_ident(amount) {
+                if let Some(idx) = callee.params.iter().position(|p| p.name == *amount) {
+                    if let Some(arg) = call.arg_exprs.get(idx) {
+                        let mapped = arg.trim();
+                        if parse_numeric_literal(mapped).is_some() || is_ident(mapped) {
+                            return CoinOp::Burn(mapped.to_string());
+                        }
+                    }
+                }
+            }
+            CoinOp::Burn(amount.clone())
+        }
+        CoinOp::Join { src_base_var } => {
+            if let Some(idx) = callee.params.iter().position(|p| p.name == *src_base_var) {
+                if let Some(arg) = call.arg_exprs.get(idx) {
+                    let mapped = arg.trim();
+                    if is_ident(mapped) {
+                        return CoinOp::Join {
+                            src_base_var: mapped.to_string(),
+                        };
+                    }
+                }
+            }
+            CoinOp::Join {
+                src_base_var: src_base_var.clone(),
+            }
+        }
+        CoinOp::Changed => CoinOp::Changed,
+    }
+}
+
+fn collect_coin_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<CoinEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<CoinEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.coin_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.coin_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_coin_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                let mapped_op = map_coin_op_to_caller(&eff.op, callee, call);
+                out.push(CoinEffect {
+                    base_var: arg.to_string(),
+                    op: mapped_op,
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!("{}::{:?}", eff.base_var, eff.op);
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
+
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
+}
+
+fn collect_coin_notes_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<CoinNote>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<CoinNote> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.coin_notes.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.coin_notes.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_notes = collect_coin_notes_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            out.extend(callee_notes);
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<CoinNote> = std::collections::HashSet::new();
+    for note in out {
+        if seen.insert(note.clone()) {
+            deduped.push(note);
+        }
+    }
     visiting.remove(&key);
     cache.insert(key, deduped.clone());
     deduped

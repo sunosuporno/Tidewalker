@@ -33,7 +33,7 @@ pub fn run_tests_and_log(package_path: &Path) -> Result<(), Box<dyn std::error::
         .filter(|e| {
             e.path()
                 .extension()
-                .map_or(false, |ext| ext == "zst" || ext == "json")
+                .is_some_and(|ext| ext == "zst" || ext == "json")
         })
         .collect();
     entries.sort_by_key(|e| e.file_name());
@@ -60,10 +60,20 @@ fn log_trace_for_test(
     test_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = fs::read(trace_path)?;
-    let mut decoder = zstd::Decoder::new(bytes.as_slice())?;
     let mut ndjson = String::new();
-    decoder.read_to_string(&mut ndjson)?;
-    drop(decoder);
+    match trace_path.extension().and_then(|e| e.to_str()) {
+        Some("zst") => {
+            let mut decoder = zstd::Decoder::new(bytes.as_slice())?;
+            decoder.read_to_string(&mut ndjson)?;
+        }
+        Some("json") => {
+            ndjson = String::from_utf8(bytes)?;
+        }
+        _ => {
+            // Should be unreachable due to the upstream extension filter.
+            return Ok(());
+        }
+    }
 
     let mut call_stack: Vec<String> = Vec::new();
     let mut functions_seen: std::collections::HashSet<String> = std::collections::HashSet::new();

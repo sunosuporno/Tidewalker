@@ -9,6 +9,7 @@ struct ModuleSetupInfo {
     shared_types: Vec<(String, String)>,
     cap_types: Vec<(String, String)>,
     struct_field_types: std::collections::HashMap<String, Vec<(String, String)>>,
+    init_field_values_by_type: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     cannot_generate: Vec<(String, String)>,
     /// (type_name, function_name) for share_object in non-init functions
     non_init_shared: Vec<(String, String)>,
@@ -70,6 +71,10 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         String,
         std::collections::HashMap<String, Vec<(String, String)>>,
     > = std::collections::HashMap::new();
+    let mut init_field_values_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    > = std::collections::HashMap::new();
     let mut alerts: Vec<(String, String)> = Vec::new();
     let mut file_for_module: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -85,6 +90,10 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
                 file_for_module.insert(info.module_name.clone(), file_name.clone());
                 struct_fields_by_module
                     .insert(info.module_name.clone(), info.struct_field_types.clone());
+                init_field_values_by_module.insert(
+                    info.module_name.clone(),
+                    info.init_field_values_by_type.clone(),
+                );
                 for (mod_name, type_name) in info.shared_types {
                     all_shared.push((mod_name.clone(), type_name));
                 }
@@ -180,7 +189,21 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         let struct_fields = struct_fields_by_module
             .get(mod_name)
             .unwrap_or(&empty_fields);
-        match inject_test_only_helpers(&source_path, mod_name, shared, caps, struct_fields) {
+        let empty_init_values: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = std::collections::HashMap::new();
+        let init_field_values = init_field_values_by_module
+            .get(mod_name)
+            .unwrap_or(&empty_init_values);
+        match inject_test_only_helpers(
+            &source_path,
+            mod_name,
+            shared,
+            caps,
+            struct_fields,
+            init_field_values,
+        ) {
             Ok(()) => println!("Injected test_only helpers into {}", source_path.display()),
             Err(e) => alerts.push((
                 file_name.clone(),
@@ -266,11 +289,23 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
     let init_complex_trigger = init_body
         .as_ref()
         .and_then(|body| first_disallowed_call_in_body(body));
-    let (shared_vars, cap_vars) = if let Some(body) = init_body {
+    let (shared_vars, cap_vars, init_struct_field_values_by_var) = if let Some(body) = init_body {
         parse_init_body(body)
     } else {
-        (Vec::new(), Vec::new())
+        (
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::<String, std::collections::HashMap<String, String>>::new(),
+        )
     };
+    for (var_name, type_name) in shared_vars.iter().chain(cap_vars.iter()) {
+        if let Some(field_values) = init_struct_field_values_by_var.get(var_name) {
+            info
+                .init_field_values_by_type
+                .entry(type_name.clone())
+                .or_insert_with(|| field_values.clone());
+        }
+    }
 
     let skip_init_generation =
         info.init_one_time_witness.is_some() || init_complex_trigger.is_some();
@@ -335,7 +370,7 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
         if fn_name.starts_with("create_") && fn_name.ends_with("_for_testing") {
             continue;
         }
-        let (shared, caps) = parse_init_body(body);
+        let (shared, caps, _) = parse_init_body(body);
         for (_, type_name) in shared {
             if !type_name.is_empty() {
                 info.non_init_shared.push((type_name, fn_name.clone()));
@@ -489,14 +524,27 @@ fn find_init_body<'a>(lines: &'a [&'a str]) -> Option<Vec<&'a str>> {
     None
 }
 
-fn parse_init_body(body: Vec<&str>) -> (Vec<(String, String)>, Vec<(String, String)>) {
+fn parse_init_body(
+    body: Vec<&str>,
+) -> (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+) {
     let mut var_to_type: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for line in &body {
         let t = line.trim();
         if t.starts_with("let ") {
             if let Some(rest) = t.strip_prefix("let ") {
-                let mut name = rest.split_whitespace().next().unwrap_or("").to_string();
+                let lhs = rest.split('=').next().unwrap_or("").trim();
+                let mut lhs_tokens = lhs.split_whitespace();
+                let first = lhs_tokens.next().unwrap_or("");
+                let mut name = if first == "mut" {
+                    lhs_tokens.next().unwrap_or("").to_string()
+                } else {
+                    first.to_string()
+                };
                 if name.ends_with(',') {
                     name.pop();
                 }
@@ -514,6 +562,7 @@ fn parse_init_body(body: Vec<&str>) -> (Vec<(String, String)>, Vec<(String, Stri
             }
         }
     }
+    let struct_field_values_by_var = parse_struct_literal_fields_from_body(&body);
     let mut shared = Vec::new();
     let mut caps = Vec::new();
     for line in &body {
@@ -533,7 +582,109 @@ fn parse_init_body(body: Vec<&str>) -> (Vec<(String, String)>, Vec<(String, Stri
             }
         }
     }
-    (shared, caps)
+    (shared, caps, struct_field_values_by_var)
+}
+
+fn parse_struct_literal_fields_from_body(
+    body: &[&str],
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+        std::collections::HashMap::new();
+    let mut i = 0usize;
+    while i < body.len() {
+        let t = strip_line_comment(body[i]).trim().to_string();
+        if !t.starts_with("let ") || !t.contains('=') || !t.contains('{') {
+            i += 1;
+            continue;
+        }
+        let after_let = t.trim_start_matches("let ").trim();
+        let lhs = after_let.split('=').next().unwrap_or("").trim();
+        let mut lhs_tokens = lhs.split_whitespace();
+        let first = lhs_tokens.next().unwrap_or("");
+        let var_name = if first == "mut" {
+            lhs_tokens.next().unwrap_or("").to_string()
+        } else {
+            first.to_string()
+        };
+        if var_name.is_empty() {
+            i += 1;
+            continue;
+        }
+        let mut depth: i32 = 0;
+        for ch in t.chars() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+            }
+        }
+        if depth <= 0 {
+            i += 1;
+            continue;
+        }
+        let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        i += 1;
+        while i < body.len() && depth > 0 {
+            let line_clean = strip_line_comment(body[i]).trim().to_string();
+            if depth == 1 {
+                if let Some((field_name, expr)) = parse_struct_field_value_line(&line_clean) {
+                    if is_safe_helper_initializer_expr(&expr) {
+                        fields.entry(field_name).or_insert(expr);
+                    }
+                }
+            }
+            for ch in line_clean.chars() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            i += 1;
+        }
+        if !fields.is_empty() {
+            out.entry(var_name).or_insert(fields);
+        }
+    }
+    out
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or("")
+}
+
+fn parse_struct_field_value_line(line: &str) -> Option<(String, String)> {
+    let t = line.trim().trim_end_matches(',').trim();
+    if t.is_empty() || t.starts_with('}') || t.starts_with('{') {
+        return None;
+    }
+    let (field_name, expr) = t.split_once(':')?;
+    let field = field_name.trim();
+    let value = expr.trim();
+    if field.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((field.to_string(), value.to_string()))
+}
+
+fn is_safe_helper_initializer_expr(expr: &str) -> bool {
+    let e = expr.trim();
+    if e.is_empty() {
+        return false;
+    }
+    if e == "true" || e == "false" {
+        return true;
+    }
+    if e.starts_with('@') || e.starts_with("b\"") || e.starts_with("x\"") {
+        return true;
+    }
+    if e.starts_with("vector[") {
+        return true;
+    }
+    if e.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return true;
+    }
+    e.contains("::")
 }
 
 fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
@@ -581,7 +732,7 @@ fn first_disallowed_call_in_body(body: &[&str]) -> Option<String> {
         "transfer::transfer",
         "transfer::public_transfer",
         "tx_context::sender",
-        "std::string::utf8",
+        "string::utf8",
         "option::none",
         "option::some",
         "vector::empty",
@@ -711,6 +862,7 @@ fn generate_in_module_test_only_snippet(
     shared: &[String],
     caps: &[String],
     struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
+    init_field_values: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     out.push("".to_string());
@@ -728,7 +880,11 @@ fn generate_in_module_test_only_snippet(
         out.push(format!("    let obj = {} {{", type_name));
         if let Some(fields) = struct_fields.get(type_name) {
             for (field_name, field_ty) in fields {
-                let init = default_field_initializer(field_name, field_ty);
+                let init = init_field_values
+                    .get(type_name)
+                    .and_then(|vals| vals.get(field_name))
+                    .cloned()
+                    .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
                 out.push(format!("        {}: {},", field_name, init));
             }
         } else {
@@ -753,7 +909,11 @@ fn generate_in_module_test_only_snippet(
         out.push(format!("    {} {{", type_name));
         if let Some(fields) = struct_fields.get(type_name) {
             for (field_name, field_ty) in fields {
-                let init = default_field_initializer(field_name, field_ty);
+                let init = init_field_values
+                    .get(type_name)
+                    .and_then(|vals| vals.get(field_name))
+                    .cloned()
+                    .unwrap_or_else(|| default_field_initializer(field_name, field_ty));
                 out.push(format!("        {}: {},", field_name, init));
             }
         } else {
@@ -786,36 +946,40 @@ fn find_tidewalker_block(lines: &[String]) -> Option<(usize, usize)> {
         }
     }
 
-    // New format: find the *last* "Tidewalker generated test helpers" so we only remove the block at the end.
-    let is_border = |l: &str| {
+    // New format: strict box matching to avoid partial/incorrect removals.
+    let is_border_line = |l: &str| {
         let t = l.trim();
         t.starts_with("//") && t.len() > 4 && t[2..].trim_start().starts_with('/')
     };
-    let last_title_idx = lines
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, l)| l.contains("Tidewalker generated test helpers"))
-        .map(|(i, _)| i)?;
-    // First box: border is a few lines before this title. Go back at most 5 lines.
-    let first_box_start = (last_title_idx.saturating_sub(4))..=last_title_idx;
-    let first = first_box_start
-        .into_iter()
-        .find(|&i| is_border(lines[i].as_str()))?;
-    // Second box: after the first box (5 lines) and the helpers, find the closing box.
-    let after_first_box = first + 5;
-    if after_first_box >= lines.len() {
-        return None;
+    let is_tidewalker_box_at = |idx: usize| -> bool {
+        if idx + 4 >= lines.len() {
+            return false;
+        }
+        is_border_line(lines[idx].as_str())
+            && lines[idx + 2].contains("Tidewalker generated test helpers")
+            && is_border_line(lines[idx + 4].as_str())
+    };
+
+    let mut box_starts: Vec<usize> = Vec::new();
+    for i in 0..lines.len() {
+        if is_tidewalker_box_at(i) {
+            box_starts.push(i);
+        }
     }
-    let second_box_start = lines[after_first_box..]
-        .iter()
-        .position(|l| is_border(l.as_str()))
-        .map(|i| after_first_box + i)?;
-    let second_box_end = second_box_start + 4;
-    if second_box_end >= lines.len() {
-        return None;
+    for start in box_starts.iter().rev().copied() {
+        let search_from = start + 5;
+        if search_from >= lines.len() {
+            continue;
+        }
+        if let Some(end_start) = box_starts
+            .iter()
+            .copied()
+            .find(|&i| i >= search_from && is_tidewalker_box_at(i))
+        {
+            return Some((start, end_start + 4));
+        }
     }
-    Some((first, second_box_end))
+    None
 }
 
 /// Returns true if we should skip this file: it has #[test_only] code that is not inside our
@@ -845,11 +1009,18 @@ fn inject_test_only_helpers(
     shared: &[String],
     caps: &[String],
     struct_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
+    init_field_values: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(source_path)?;
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
 
-    let snippet = generate_in_module_test_only_snippet(mod_name, shared, caps, struct_fields);
+    let snippet = generate_in_module_test_only_snippet(
+        mod_name,
+        shared,
+        caps,
+        struct_fields,
+        init_field_values,
+    );
 
     // Only remove our own block (identified by Tidewalker box/sentinels). Do not touch other test_only code.
     if let Some((s, e)) = find_tidewalker_block(&lines) {
@@ -874,6 +1045,7 @@ fn default_field_initializer(field_name: &str, field_ty: &str) -> String {
         return "sui::object::new(ctx)".to_string();
     }
     let t = field_ty.trim();
+    let tn = t.replace(' ', "");
     if matches!(t, "u8" | "u16" | "u32" | "u64" | "u128" | "u256") {
         return "0".to_string();
     }
@@ -885,6 +1057,12 @@ fn default_field_initializer(field_name: &str, field_ty: &str) -> String {
     }
     if t.starts_with("vector<") {
         return "vector[]".to_string();
+    }
+    if tn == "String" || tn.ends_with("string::String") {
+        return "std::string::utf8(b\"tidewalker\")".to_string();
+    }
+    if tn.starts_with("Option<") || tn.contains("::option::Option<") {
+        return "std::option::none()".to_string();
     }
     "0".to_string()
 }
