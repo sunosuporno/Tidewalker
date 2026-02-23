@@ -29,6 +29,7 @@ struct FnDecl {
     numeric_effects: Vec<NumericEffect>,
     vector_effects: Vec<VectorEffect>,
     coin_effects: Vec<CoinEffect>,
+    treasury_cap_effects: Vec<TreasuryCapEffect>,
     coin_notes: Vec<CoinNote>,
     option_effects: Vec<OptionEffect>,
     string_effects: Vec<StringEffect>,
@@ -59,6 +60,12 @@ struct VectorEffect {
 struct CoinEffect {
     base_var: String,
     op: CoinOp,
+}
+
+#[derive(Debug, Clone)]
+struct TreasuryCapEffect {
+    base_var: String,
+    op: TreasuryCapOp,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +124,13 @@ enum VectorOp {
 enum CoinOp {
     Split(String),
     Join { src_base_var: String },
+    Mint(String),
+    Burn(String),
+    Changed,
+}
+
+#[derive(Debug, Clone)]
+enum TreasuryCapOp {
     Mint(String),
     Burn(String),
     Changed,
@@ -245,6 +259,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let effects_map = chain::build_chained_effect_map(&decls, 4);
     let vector_effects_map = chain::build_chained_vector_effect_map(&decls, 4);
     let coin_effects_map = chain::build_chained_coin_effect_map(&decls, 4);
+    let treasury_cap_effects_map = chain::build_chained_treasury_cap_effect_map(&decls, 4);
     let coin_notes_map = chain::build_chained_coin_note_map(&decls, 4);
     let option_effects_map = chain::build_chained_option_effect_map(&decls, 4);
     let string_effects_map = chain::build_chained_string_effect_map(&decls, 4);
@@ -269,6 +284,10 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.coin_effects.clone());
+        let resolved_treasury_cap_effects = treasury_cap_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.treasury_cap_effects.clone());
         let resolved_coin_notes = coin_notes_map
             .get(&key)
             .cloned()
@@ -294,6 +313,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             &resolved_effects,
             &resolved_vector_effects,
             &resolved_coin_effects,
+            &resolved_treasury_cap_effects,
             &resolved_coin_notes,
             &resolved_option_effects,
             &resolved_string_effects,
@@ -502,6 +522,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         let numeric_effects = extract_numeric_effects_from_body(&body_lines);
         let vector_effects = extract_vector_effects_from_body(&body_lines);
         let coin_effects = extract_coin_effects_from_body(&body_lines, &params);
+        let treasury_cap_effects = extract_treasury_cap_effects_from_body(&body_lines, &params);
         let coin_notes = extract_coin_notes_from_body(&body_lines);
         let option_effects =
             extract_option_effects_from_body(&body_lines, &params, &option_fields_by_type);
@@ -522,6 +543,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             numeric_effects,
             vector_effects,
             coin_effects,
+            treasury_cap_effects,
             coin_notes,
             option_effects,
             string_effects,
@@ -1137,15 +1159,81 @@ fn extract_coin_effects_from_body(body_lines: &[String], params: &[ParamDecl]) -
         }
     }
 
-    let mut deduped = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for eff in out {
-        let sig = format!("{}::{:?}", eff.base_var, eff.op);
-        if seen.insert(sig) {
-            deduped.push(eff);
+    out
+}
+
+fn extract_treasury_cap_effects_from_body(
+    body_lines: &[String],
+    params: &[ParamDecl],
+) -> Vec<TreasuryCapEffect> {
+    let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut split_coin_amounts: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut treasury_cap_params: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for p in params {
+        if p.ty.trim().starts_with("&mut") && is_treasury_cap_type(&normalize_param_object_type(&p.ty))
+        {
+            treasury_cap_params.insert(p.name.clone());
         }
     }
-    deduped
+
+    for line in body_lines {
+        let t = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some((name, target)) = parse_alias_binding(t) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if t.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(t) {
+                aliases.remove(&name);
+                split_coin_amounts.remove(&name);
+                if let Some((_, rhs)) = t.split_once('=') {
+                    if let Some((_, amount)) = parse_coin_split_expr(rhs.trim(), &aliases) {
+                        split_coin_amounts.insert(name, amount);
+                    }
+                }
+            }
+        }
+        if t.contains("==") {
+            continue;
+        }
+
+        if let Some((cap_var, amount)) = parse_treasury_mint_call(t, &aliases) {
+            if treasury_cap_params.contains(&cap_var) {
+                out.push(TreasuryCapEffect {
+                    base_var: cap_var,
+                    op: TreasuryCapOp::Mint(amount),
+                });
+            }
+            continue;
+        }
+        if let Some((cap_var, burn_amount)) =
+            parse_treasury_burn_call(t, &aliases, &split_coin_amounts)
+        {
+            if treasury_cap_params.contains(&cap_var) {
+                out.push(TreasuryCapEffect {
+                    base_var: cap_var,
+                    op: match burn_amount {
+                        Some(amount) => TreasuryCapOp::Burn(amount),
+                        None => TreasuryCapOp::Changed,
+                    },
+                });
+            }
+        }
+    }
+
+    out
 }
 
 fn extract_coin_notes_from_body(body_lines: &[String]) -> Vec<CoinNote> {
@@ -1300,7 +1388,7 @@ fn parse_coin_burn_with_split(
     aliases: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
     let args = extract_namespace_args(line, "coin::burn(")
-        .or_else(|| extract_suffix_call_args(line, "::burn("))?;
+        .or_else(|| extract_call_args_by_suffix(line, "::burn("))?;
     let burn_arg = args.get(1)?.as_str();
     parse_coin_split_expr(burn_arg, aliases)
 }
@@ -1325,16 +1413,108 @@ fn parse_mint_amount_from_expr(expr: &str) -> Option<String> {
         return None;
     }
     let args = extract_namespace_args(t, "coin::mint(")
-        .or_else(|| extract_suffix_call_args(t, "::mint("))?;
+        .or_else(|| extract_call_args_by_suffix(t, "::mint("))?;
     let raw = args.get(1)?.as_str();
     normalize_coin_amount_expr(raw)
 }
 
-fn extract_suffix_call_args(line: &str, suffix_call_prefix: &str) -> Option<Vec<String>> {
+fn parse_treasury_mint_call(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    if !line.contains("coin::mint(") || line.contains("mint_for_testing(") {
+        return None;
+    }
+    let args = extract_call_args_by_suffix(line, "::mint(")?;
+    let cap_var = parse_treasury_cap_arg(args.first()?.as_str(), aliases)?;
+    let amount = normalize_coin_amount_expr(args.get(1)?.as_str())?;
+    Some((cap_var, amount))
+}
+
+fn parse_treasury_burn_call(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    split_coin_amounts: &std::collections::HashMap<String, String>,
+) -> Option<(String, Option<String>)> {
+    if !line.contains("coin::burn(") {
+        return None;
+    }
+    let args = extract_call_args_by_suffix(line, "::burn(")?;
+    let cap_var = parse_treasury_cap_arg(args.first()?.as_str(), aliases)?;
+    let burn_arg = args.get(1)?.as_str();
+    if let Some((_, amount)) = parse_coin_split_expr(burn_arg, aliases) {
+        return Some((cap_var, Some(amount)));
+    }
+    let burn_token = strip_ref_and_parens_text(burn_arg);
+    if is_ident(burn_token) {
+        let resolved = resolve_alias_path(burn_token, aliases);
+        if let Some(amount) = split_coin_amounts.get(&resolved) {
+            return Some((cap_var, Some(amount.clone())));
+        }
+        if let Some(amount) = split_coin_amounts.get(burn_token) {
+            return Some((cap_var, Some(amount.clone())));
+        }
+    }
+    Some((cap_var, None))
+}
+
+fn parse_treasury_cap_arg(
+    arg: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let token = strip_ref_and_parens_text(arg);
+    if !is_ident(token) {
+        return None;
+    }
+    let resolved = resolve_alias_path(token, aliases);
+    if is_ident(&resolved) {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+fn extract_call_args_by_suffix(line: &str, suffix_call_prefix: &str) -> Option<Vec<String>> {
     let idx = line.find(suffix_call_prefix)?;
-    let after = line[idx + suffix_call_prefix.len()..].trim();
-    let args_raw = after.strip_suffix(')')?;
+    let start = idx + suffix_call_prefix.len();
+    let mut depth = 1i32;
+    let mut end: Option<usize> = None;
+    for (offset, ch) in line[start..].char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(start + offset);
+                break;
+            }
+        }
+    }
+    let end_idx = end?;
+    let args_raw = &line[start..end_idx];
     Some(split_args(args_raw))
+}
+
+fn strip_ref_and_parens_text(raw: &str) -> &str {
+    let mut s = raw.trim();
+    loop {
+        let mut changed = false;
+        if let Some(rest) = s.strip_prefix("&mut") {
+            s = rest.trim();
+            changed = true;
+        } else if let Some(rest) = s.strip_prefix('&') {
+            s = rest.trim();
+            changed = true;
+        }
+        if s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+            s = s[1..s.len() - 1].trim();
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    s
 }
 
 fn extract_option_effects_from_body(
@@ -1889,6 +2069,23 @@ fn is_string_type(ty: &str) -> bool {
 fn is_coin_type(ty: &str) -> bool {
     let norm = ty.trim().replace(' ', "");
     norm.contains("Coin<")
+}
+
+fn is_treasury_cap_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    norm.contains("TreasuryCap<")
+}
+
+fn is_cap_type(ty: &str) -> bool {
+    let norm = ty.trim().replace(' ', "");
+    if norm.is_empty() {
+        return false;
+    }
+    if is_treasury_cap_type(&norm) {
+        return true;
+    }
+    let base = norm.split('<').next().unwrap_or(&norm);
+    base.ends_with("Cap") || base.ends_with("::Cap")
 }
 
 fn is_option_type(ty: &str) -> bool {

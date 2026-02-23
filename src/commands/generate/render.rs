@@ -8,6 +8,12 @@ struct CoinNeed {
     needs_mut_binding: bool,
 }
 
+#[derive(Debug, Clone)]
+struct CapTransferCheck {
+    recipient: String,
+    cap_type: String,
+}
+
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
 }
@@ -19,6 +25,28 @@ fn default_u64_arg_for_param(name: &str) -> String {
     } else {
         "1".to_string()
     }
+}
+
+fn has_branch_or_loop(body_lines: &[String]) -> bool {
+    for line in body_lines {
+        let t = line.split("//").next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("if ")
+            || t.starts_with("if(")
+            || t.starts_with("else")
+            || t.starts_with("while ")
+            || t.starts_with("while(")
+            || t.starts_with("loop ")
+            || t.starts_with("loop{")
+            || t.starts_with("for ")
+            || t.starts_with("for(")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn requires_chain_uses_coin_slot_later(
@@ -167,6 +195,7 @@ pub(super) fn render_best_effort_test(
     numeric_effects: &[NumericEffect],
     vector_effects: &[VectorEffect],
     coin_effects: &[CoinEffect],
+    treasury_cap_effects: &[TreasuryCapEffect],
     coin_notes: &[CoinNote],
     option_effects: &[OptionEffect],
     string_effects: &[StringEffect],
@@ -314,6 +343,14 @@ pub(super) fn render_best_effort_test(
         &param_arg_values,
         deep_overflow_paths,
     );
+    let (treasury_before_lines, treasury_after_lines, treasury_summary) =
+        build_treasury_cap_assertion_lines(
+            d,
+            treasury_cap_effects,
+            &param_runtime,
+            &param_arg_values,
+            deep_overflow_paths,
+        );
     let (option_before_lines, option_after_lines, option_summary) = build_option_assertion_lines(
         d,
         option_effects,
@@ -321,6 +358,9 @@ pub(super) fn render_best_effort_test(
         option_accessor_map,
         deep_overflow_paths,
     );
+    let (cap_transfer_checks, cap_transfer_summary) =
+        build_cap_transfer_checks(d, &param_arg_values);
+    let cap_auth_summary = build_cap_auth_summary(d);
     let string_summary = build_string_summary(string_effects, &param_runtime, deep_overflow_paths);
     for eff in string_effects {
         let operator_target = format!("operator {}.{}", eff.base_var, eff.field);
@@ -331,7 +371,10 @@ pub(super) fn render_best_effort_test(
     state_summary.merge(numeric_summary);
     state_summary.merge(vector_summary);
     state_summary.merge(coin_summary);
+    state_summary.merge(treasury_summary);
     state_summary.merge(build_coin_note_summary(coin_notes));
+    state_summary.merge(cap_auth_summary);
+    state_summary.merge(cap_transfer_summary);
     state_summary.merge(option_summary);
     state_summary.merge(string_summary);
     state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
@@ -402,6 +445,9 @@ pub(super) fn render_best_effort_test(
     for l in coin_before_lines {
         lines.push(format!("        {}", l));
     }
+    for l in treasury_before_lines {
+        lines.push(format!("        {}", l));
+    }
     for l in option_before_lines {
         lines.push(format!("        {}", l));
     }
@@ -413,6 +459,9 @@ pub(super) fn render_best_effort_test(
         lines.push(format!("        {}", l));
     }
     for l in coin_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in treasury_after_lines {
         lines.push(format!("        {}", l));
     }
     for l in option_after_lines {
@@ -455,6 +504,22 @@ pub(super) fn render_best_effort_test(
         }
     }
     lines.push("    };".to_string());
+    for (idx, check) in cap_transfer_checks.iter().enumerate() {
+        lines.push(format!(
+            "    test_scenario::next_tx(&mut scenario, {});",
+            check.recipient
+        ));
+        lines.push("    {".to_string());
+        lines.push(format!(
+            "        let moved_cap_{} = test_scenario::take_from_sender<{}>(&scenario);",
+            idx, check.cap_type
+        ));
+        lines.push(format!(
+            "        test_scenario::return_to_sender(&scenario, moved_cap_{});",
+            idx
+        ));
+        lines.push("    };".to_string());
+    }
 
     // Ensure scenario is closed.
     lines.push("    test_scenario::end(scenario);".to_string());
@@ -473,6 +538,324 @@ fn build_coin_note_summary(coin_notes: &[CoinNote]) -> StateChangeSummary {
         summary.add_potential(target);
     }
     summary
+}
+
+fn build_cap_auth_summary(d: &FnDecl) -> StateChangeSummary {
+    let mut summary = StateChangeSummary::default();
+    for p in &d.params {
+        let ty = normalize_param_object_type(&p.ty);
+        if p.ty.trim().starts_with('&') && is_cap_type(&ty) && !is_treasury_cap_type(&ty) {
+            summary.add_asserted(format!("cap auth {}", p.name));
+        }
+    }
+    summary
+}
+
+fn build_cap_transfer_checks(
+    d: &FnDecl,
+    param_arg_values: &std::collections::HashMap<String, String>,
+) -> (Vec<CapTransferCheck>, StateChangeSummary) {
+    let mut checks = Vec::new();
+    let mut summary = StateChangeSummary::default();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut local_cap_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut param_cap_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for p in &d.params {
+        let ty = normalize_param_object_type(&p.ty);
+        if is_cap_type(&ty) {
+            param_cap_types.insert(p.name.clone(), ty);
+        }
+    }
+
+    for line in &d.body_lines {
+        let stmt = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some((name, target)) = parse_alias_binding(stmt) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if stmt.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(stmt) {
+                aliases.remove(&name);
+                if let Some((_, rhs)) = stmt.split_once('=') {
+                    let rhs = rhs.trim();
+                    if let Some(type_token) = rhs.split('{').next() {
+                        let ty = type_token.trim();
+                        if is_cap_type(ty) || ty.ends_with("Cap") {
+                            local_cap_types.insert(name, ty.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let args = extract_namespace_args(stmt, "transfer::public_transfer(")
+            .or_else(|| extract_namespace_args(stmt, "transfer::transfer("));
+        let Some(args) = args else {
+            continue;
+        };
+        let obj_arg = match args.first() {
+            Some(v) => v.as_str(),
+            None => continue,
+        };
+        let recipient_arg = match args.get(1) {
+            Some(v) => v.as_str(),
+            None => continue,
+        };
+
+        let obj_token = strip_ref_and_parens_text(obj_arg);
+        if !is_ident(obj_token) {
+            continue;
+        }
+        let resolved_obj = resolve_alias_path(obj_token, &aliases);
+        let cap_ty = if let Some(ty) = param_cap_types.get(&resolved_obj) {
+            ty.clone()
+        } else if let Some(ty) = local_cap_types.get(&resolved_obj) {
+            ty.clone()
+        } else if let Some(ty) = local_cap_types.get(obj_token) {
+            ty.clone()
+        } else {
+            continue;
+        };
+        if !is_cap_type(&cap_ty) {
+            continue;
+        }
+
+        let label_ty = if cap_ty.contains("::") {
+            cap_ty.clone()
+        } else {
+            qualify_type_for_module(&d.module_name, &cap_ty)
+        };
+        let target_label = format!("cap transfer {}", label_ty);
+        if let Some(recipient) = resolve_cap_transfer_recipient(recipient_arg, param_arg_values) {
+            checks.push(CapTransferCheck {
+                recipient,
+                cap_type: label_ty,
+            });
+            summary.add_asserted(target_label);
+        } else {
+            summary.add_potential(target_label);
+        }
+    }
+
+    (checks, summary)
+}
+
+fn resolve_cap_transfer_recipient(
+    raw: &str,
+    param_arg_values: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let t = raw.trim();
+    if t.contains("sender(") || t.contains("tx_context::sender") {
+        return Some("SUPER_USER".to_string());
+    }
+    if t == "SUPER_USER" || t == "OTHER" {
+        return Some(t.to_string());
+    }
+    if t.starts_with('@') {
+        return Some(t.to_string());
+    }
+    if is_ident(t) {
+        return param_arg_values.get(t).cloned();
+    }
+    None
+}
+
+fn overflow_may_affect_treasury_target(
+    deep_overflow_paths: &std::collections::HashSet<String>,
+    base_var: &str,
+) -> bool {
+    deep_overflow_paths.contains(base_var)
+}
+
+fn build_treasury_cap_assertion_lines(
+    d: &FnDecl,
+    treasury_cap_effects: &[TreasuryCapEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    param_arg_values: &std::collections::HashMap<String, String>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut summary = StateChangeSummary::default();
+    let mut mutable_treasury_params: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for p in &d.params {
+        let ty = normalize_param_object_type(&p.ty);
+        if p.ty.trim().starts_with("&mut") && is_treasury_cap_type(&ty) {
+            mutable_treasury_params.insert(p.name.clone());
+        }
+    }
+    if mutable_treasury_params.is_empty() {
+        return (before, after, summary);
+    }
+
+    let mut grouped: std::collections::BTreeMap<String, Vec<&TreasuryCapEffect>> =
+        std::collections::BTreeMap::new();
+    for eff in treasury_cap_effects {
+        grouped.entry(eff.base_var.clone()).or_default().push(eff);
+    }
+    let has_internal_calls = !d.calls.is_empty();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
+    let mut idx = 0u64;
+
+    for base_var in mutable_treasury_params {
+        let target_label = format!("treasury_cap {}", base_var);
+        if overflow_may_affect_treasury_target(deep_overflow_paths, &base_var) {
+            summary.add_potential(target_label);
+            continue;
+        }
+        let runtime_var = match param_runtime.get(&base_var) {
+            Some(v) => v,
+            None => {
+                summary.add_potential(target_label);
+                continue;
+            }
+        };
+
+        let effects = grouped.get(&base_var).cloned().unwrap_or_default();
+        if has_non_linear_flow {
+            summary.add_potential(target_label);
+            idx += 1;
+            continue;
+        }
+        if has_internal_calls {
+            if effects.len() != 1 {
+                summary.add_potential(target_label);
+                idx += 1;
+                continue;
+            }
+
+            let first = effects[0];
+            let assert_expr = match &first.op {
+                TreasuryCapOp::Mint(amount) => {
+                    let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            summary.add_potential(target_label);
+                            idx += 1;
+                            continue;
+                        }
+                    };
+                    Some(format!("before_total_supply + {}", resolved_amount))
+                }
+                TreasuryCapOp::Burn(amount) => {
+                    let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            summary.add_potential(target_label);
+                            idx += 1;
+                            continue;
+                        }
+                    };
+                    Some(format!("before_total_supply - {}", resolved_amount))
+                }
+                TreasuryCapOp::Changed => None,
+            };
+            let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
+            let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
+            before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
+            after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+            if let Some(expr) = assert_expr {
+                after.push(format!(
+                    "assert!({} == {}, {});",
+                    after_name,
+                    expr.replace("before_total_supply", &before_name),
+                    995 + idx
+                ));
+            } else {
+                after.push(format!(
+                    "assert!({} != {}, {});",
+                    after_name,
+                    before_name,
+                    995 + idx
+                ));
+            }
+            summary.add_asserted(target_label);
+            idx += 1;
+            continue;
+        }
+
+        let mut expr = "before_total_supply".to_string();
+        let mut exact = true;
+        if effects.is_empty() {
+            expr = "before_total_supply".to_string();
+        } else {
+            for eff in &effects {
+                match &eff.op {
+                    TreasuryCapOp::Mint(amount) => {
+                        let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                            Some(v) => v,
+                            None => {
+                                exact = false;
+                                break;
+                            }
+                        };
+                        expr = format!("({} + {})", expr, resolved_amount);
+                    }
+                    TreasuryCapOp::Burn(amount) => {
+                        let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                            Some(v) => v,
+                            None => {
+                                exact = false;
+                                break;
+                            }
+                        };
+                        expr = format!("({} - {})", expr, resolved_amount);
+                    }
+                    TreasuryCapOp::Changed => {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !exact {
+            if effects.len() == 1 && matches!(&effects[0].op, TreasuryCapOp::Changed) {
+                let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
+                let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
+                before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
+                after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+                after.push(format!(
+                    "assert!({} != {}, {});",
+                    after_name,
+                    before_name,
+                    995 + idx
+                ));
+                summary.add_asserted(target_label);
+            } else {
+                summary.add_potential(target_label);
+            }
+            idx += 1;
+            continue;
+        }
+
+        let before_name = format!("before_{}_total_supply", sanitize_ident(runtime_var));
+        let after_name = format!("after_{}_total_supply", sanitize_ident(runtime_var));
+        before.push(format!("let {} = coin::total_supply(&{});", before_name, runtime_var));
+        after.push(format!("let {} = coin::total_supply(&{});", after_name, runtime_var));
+        after.push(format!(
+            "assert!({} == {}, {});",
+            after_name,
+            expr.replace("before_total_supply", &before_name),
+            995 + idx
+        ));
+        summary.add_asserted(target_label);
+        idx += 1;
+    }
+
+    (before, after, summary)
 }
 
 fn resolve_read_expr(
@@ -522,83 +905,188 @@ fn build_numeric_assertion_lines(
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut summary = StateChangeSummary::default();
-    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut direct_effect_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for eff in &d.numeric_effects {
-        let key = format!("{}.{}", eff.base_var, eff.field);
-        *direct_effect_counts.entry(key).or_insert(0) += 1;
+    if numeric_effects.is_empty() {
+        return (before, after, summary);
+    }
+    let mut grouped: std::collections::BTreeMap<String, Vec<&NumericEffect>> =
+        std::collections::BTreeMap::new();
+    for eff in numeric_effects {
+        grouped
+            .entry(format!("{}.{}", eff.base_var, eff.field))
+            .or_default()
+            .push(eff);
     }
     let has_internal_calls = !d.calls.is_empty();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
     let mut idx = 0usize;
 
-    for eff in numeric_effects {
-        let target_label = format!("operator {}.{}", eff.base_var, eff.field);
-        if overflow_may_affect_target(deep_overflow_paths, &eff.base_var, &eff.field) {
+    for (_target, effects) in grouped {
+        let first = effects[0];
+        let target_label = format!("operator {}.{}", first.base_var, first.field);
+        if overflow_may_affect_target(deep_overflow_paths, &first.base_var, &first.field) {
             summary.add_potential(target_label);
             continue;
         }
-        let runtime_var = match param_runtime.get(&eff.base_var) {
+        let runtime_var = match param_runtime.get(&first.base_var) {
             Some(v) => v,
             None => {
                 summary.add_potential(target_label);
                 continue;
             }
         };
-        let key = format!("{}.{}", runtime_var, eff.field);
-        if seen_targets.contains(&key) {
-            continue;
-        }
-        let read_expr = match resolve_read_expr(d, eff, runtime_var, accessor_map) {
+        let read_expr = match resolve_read_expr(d, first, runtime_var, accessor_map) {
             Some(expr) => expr,
             None => {
                 summary.add_potential(target_label);
                 continue;
             }
         };
-        seen_targets.insert(key.clone());
 
         let before_name = format!(
             "before_{}_{}",
             sanitize_ident(runtime_var),
-            sanitize_ident(&eff.field)
+            sanitize_ident(&first.field)
         );
         let after_name = format!(
             "after_{}_{}",
             sanitize_ident(runtime_var),
-            sanitize_ident(&eff.field)
+            sanitize_ident(&first.field)
         );
-        before.push(format!("let {} = {};", before_name, read_expr));
-        after.push(format!("let {} = {};", after_name, read_expr));
 
-        let direct_key = format!("{}.{}", eff.base_var, eff.field);
-        let direct_count = direct_effect_counts.get(&direct_key).copied().unwrap_or(0);
-        let prefer_unqualified = has_internal_calls || direct_count > 1;
+        if has_non_linear_flow {
+            summary.add_potential(target_label);
+            idx += 1;
+            continue;
+        }
 
-        let exact_assert = if !prefer_unqualified {
-            build_exact_assert_line(
-                &eff.op,
+        if has_internal_calls {
+            if effects.len() != 1 {
+                summary.add_potential(target_label);
+                idx += 1;
+                continue;
+            }
+            before.push(format!("let {} = {};", before_name, read_expr.clone()));
+            after.push(format!("let {} = {};", after_name, read_expr));
+            if let Some(line) = build_exact_assert_line(
+                &effects[0].op,
                 &after_name,
                 &before_name,
                 param_arg_values,
                 900 + idx as u64,
-            )
-        } else {
-            None
-        };
-
-        if let Some(line) = exact_assert {
-            after.push(line);
-            summary.add_asserted(target_label);
-        } else {
-            after.push(format!(
-                "assert!({} != {}, {});",
-                after_name,
-                before_name,
-                900 + idx as u64
-            ));
-            summary.add_asserted(target_label);
+            ) {
+                after.push(line);
+                summary.add_asserted(target_label);
+            } else {
+                after.push(format!(
+                    "assert!({} != {}, {});",
+                    after_name,
+                    before_name,
+                    900 + idx as u64
+                ));
+                summary.add_asserted(target_label);
+            }
+            idx += 1;
+            continue;
         }
+
+        let mut expr = "before_value".to_string();
+        let mut exact = true;
+        for eff in &effects {
+            match &eff.op {
+                NumericOp::Add(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} + {})", expr, resolved);
+                }
+                NumericOp::Sub(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} - {})", expr, resolved);
+                }
+                NumericOp::Mul(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} * {})", expr, resolved);
+                }
+                NumericOp::Div(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} / {})", expr, resolved);
+                }
+                NumericOp::Mod(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} % {})", expr, resolved);
+                }
+                NumericOp::Set(v) => {
+                    let resolved = match resolve_numeric_operand(v, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = resolved;
+                }
+                NumericOp::Changed => {
+                    exact = false;
+                    break;
+                }
+            }
+        }
+
+        if !exact {
+            if effects.len() == 1 && matches!(&effects[0].op, NumericOp::Changed) {
+                before.push(format!("let {} = {};", before_name, read_expr.clone()));
+                after.push(format!("let {} = {};", after_name, read_expr));
+                after.push(format!(
+                    "assert!({} != {}, {});",
+                    after_name,
+                    before_name,
+                    900 + idx as u64
+                ));
+                summary.add_asserted(target_label);
+            } else {
+                summary.add_potential(target_label);
+            }
+            idx += 1;
+            continue;
+        }
+
+        before.push(format!("let {} = {};", before_name, read_expr.clone()));
+        after.push(format!("let {} = {};", after_name, read_expr));
+        after.push(format!(
+            "assert!({} == {}, {});",
+            after_name,
+            expr.replace("before_value", &before_name),
+            900 + idx as u64
+        ));
+        summary.add_asserted(target_label);
         idx += 1;
     }
 
@@ -717,8 +1205,10 @@ fn build_vector_assertion_lines(
             .or_default()
             .push(eff);
     }
+    let modified_targets: std::collections::HashSet<String> = grouped.keys().cloned().collect();
 
     let has_internal_calls = !d.calls.is_empty();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
     let mut potential_targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut seen_len_snapshots: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut idx = 0u64;
@@ -736,7 +1226,7 @@ fn build_vector_assertion_lines(
                 continue;
             }
         };
-        if has_internal_calls || effects.len() != 1 {
+        if has_internal_calls || has_non_linear_flow {
             potential_targets.insert(target);
             continue;
         }
@@ -748,81 +1238,106 @@ fn build_vector_assertion_lines(
                     continue;
                 }
             };
-        let before_name = format!(
+        let before_name_tpl = format!(
             "before_{}_{}_len",
             sanitize_ident(runtime_var),
             sanitize_ident(&first.field)
         );
-        let after_name = format!(
+        let after_name_tpl = format!(
             "after_{}_{}_len",
             sanitize_ident(runtime_var),
             sanitize_ident(&first.field)
         );
-        if seen_len_snapshots.insert(before_name.clone()) {
-            before.push(format!("let {} = {};", before_name, read_expr));
-        }
-        after.push(format!("let {} = {};", after_name, read_expr));
-        match &first.op {
-            VectorOp::PushBack | VectorOp::Insert => after.push(format!(
-                "assert!({} == {} + 1, {});",
-                after_name,
-                before_name,
-                960 + idx
-            )),
-            VectorOp::PopBack | VectorOp::Remove | VectorOp::SwapRemove => after.push(format!(
-                "assert!({} + 1 == {}, {});",
-                after_name,
-                before_name,
-                960 + idx
-            )),
-            VectorOp::Append {
-                src_base_var,
-                src_field,
-            } => {
-                let src_runtime_var = match param_runtime.get(src_base_var) {
-                    Some(v) => v,
-                    None => {
-                        potential_targets.insert(target);
-                        idx += 1;
-                        continue;
-                    }
-                };
-                let src_len_expr = match resolve_vector_len_expr(
-                    d,
+
+        let mut expr = "before_len".to_string();
+        let mut required_src: Vec<(String, String)> = Vec::new(); // (name, read_expr)
+        let mut exact = true;
+        for eff in &effects {
+            match &eff.op {
+                VectorOp::PushBack | VectorOp::Insert => {
+                    expr = format!("({} + 1)", expr);
+                }
+                VectorOp::PopBack | VectorOp::Remove | VectorOp::SwapRemove => {
+                    expr = format!("({} - 1)", expr);
+                }
+                VectorOp::Append {
                     src_base_var,
                     src_field,
-                    src_runtime_var,
-                    accessor_map,
-                ) {
-                    Some(v) => v,
-                    None => {
+                } => {
+                    let src_target = format!("{}.{}", src_base_var, src_field);
+                    if modified_targets.contains(&src_target) {
+                        exact = false;
+                        break;
+                    }
+                    let src_runtime_var = match param_runtime.get(src_base_var) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    let src_len_expr = match resolve_vector_len_expr(
+                        d,
+                        src_base_var,
+                        src_field,
+                        src_runtime_var,
+                        accessor_map,
+                    ) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    let src_before_name = format!(
+                        "before_{}_{}_len",
+                        sanitize_ident(src_runtime_var),
+                        sanitize_ident(src_field)
+                    );
+                    required_src.push((src_before_name.clone(), src_len_expr));
+                    expr = format!("({} + {})", expr, src_before_name);
+                }
+                VectorOp::ContentChanged => {
+                    exact = false;
+                    break;
+                }
+            }
+        }
+        if !exact {
+            if effects.len() == 1 {
+                match &first.op {
+                    VectorOp::PushBack | VectorOp::Insert | VectorOp::PopBack | VectorOp::Remove
+                    | VectorOp::SwapRemove => {}
+                    _ => {
                         potential_targets.insert(target);
                         idx += 1;
                         continue;
                     }
-                };
-                let src_before_name = format!(
-                    "before_{}_{}_len",
-                    sanitize_ident(src_runtime_var),
-                    sanitize_ident(src_field)
-                );
-                if seen_len_snapshots.insert(src_before_name.clone()) {
-                    before.push(format!("let {} = {};", src_before_name, src_len_expr));
                 }
-                after.push(format!(
-                    "assert!({} == {} + {}, {});",
-                    after_name,
-                    before_name,
-                    src_before_name,
-                    960 + idx
-                ));
-            }
-            VectorOp::ContentChanged => {
+            } else {
                 potential_targets.insert(target);
                 idx += 1;
                 continue;
             }
         }
+
+        let before_name = before_name_tpl;
+        let after_name = after_name_tpl;
+        if seen_len_snapshots.insert(before_name.clone()) {
+            before.push(format!("let {} = {};", before_name, read_expr.clone()));
+        }
+        for (src_before_name, src_len_expr) in required_src {
+            if seen_len_snapshots.insert(src_before_name.clone()) {
+                before.push(format!("let {} = {};", src_before_name, src_len_expr));
+            }
+        }
+        after.push(format!("let {} = {};", after_name, read_expr));
+        after.push(format!(
+            "assert!({} == {}, {});",
+            after_name,
+            expr.replace("before_len", &before_name),
+            960 + idx
+        ));
         summary.add_asserted(format!("vector {}", target));
         idx += 1;
     }
@@ -861,8 +1376,10 @@ fn build_coin_assertion_lines(
     for eff in coin_effects {
         grouped.entry(eff.base_var.clone()).or_default().push(eff);
     }
+    let modified_coin_targets: std::collections::HashSet<String> = grouped.keys().cloned().collect();
 
     let has_internal_calls = !d.calls.is_empty();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
     let mut seen_before_snapshots: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut idx = 0u64;
@@ -885,97 +1402,67 @@ fn build_coin_assertion_lines(
             summary.add_potential(target_label);
             continue;
         }
-        if has_internal_calls || effects.len() != 1 {
+        if has_internal_calls || has_non_linear_flow {
             summary.add_potential(target_label);
             continue;
         }
 
-        let first = effects[0];
         let before_name = format!("before_{}_coin_value", sanitize_ident(runtime_var));
         let after_name = format!("after_{}_coin_value", sanitize_ident(runtime_var));
-        if seen_before_snapshots.insert(before_name.clone()) {
-            before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
-        }
-        after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
-
-        match &first.op {
-            CoinOp::Split(amount) => {
-                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
-                    Some(v) => v,
-                    None => {
-                        summary.add_potential(target_label);
-                        idx += 1;
-                        continue;
-                    }
-                };
-                after.push(format!(
-                    "assert!({} == {} - {}, {});",
-                    after_name,
-                    before_name,
-                    resolved_amount,
-                    990 + idx
-                ));
-                summary.add_asserted(target_label);
-            }
-            CoinOp::Mint(amount) => {
-                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
-                    Some(v) => v,
-                    None => {
-                        summary.add_potential(target_label);
-                        idx += 1;
-                        continue;
-                    }
-                };
-                after.push(format!(
-                    "assert!({} == {} + {}, {});",
-                    after_name,
-                    before_name,
-                    resolved_amount,
-                    990 + idx
-                ));
-                summary.add_asserted(target_label);
-            }
-            CoinOp::Burn(amount) => {
-                let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
-                    Some(v) => v,
-                    None => {
-                        summary.add_potential(target_label);
-                        idx += 1;
-                        continue;
-                    }
-                };
-                after.push(format!(
-                    "assert!({} == {} - {}, {});",
-                    after_name,
-                    before_name,
-                    resolved_amount,
-                    990 + idx
-                ));
-                summary.add_asserted(target_label);
-            }
-            CoinOp::Join { src_base_var } => {
-                let src_runtime = match param_coin_runtime.get(src_base_var) {
-                    Some(v) => v,
-                    None => {
-                        summary.add_potential(target_label);
-                        idx += 1;
-                        continue;
-                    }
-                };
-                let src_before_name = format!("before_{}_coin_value", sanitize_ident(src_runtime));
-                if seen_before_snapshots.insert(src_before_name.clone()) {
-                    before.push(format!("let {} = coin::value(&{});", src_before_name, src_runtime));
+        let mut expr = "before_coin_value".to_string();
+        let mut exact = true;
+        let mut required_src_snapshots: Vec<(String, String)> = Vec::new();
+        for eff in &effects {
+            match &eff.op {
+                CoinOp::Split(amount) | CoinOp::Burn(amount) => {
+                    let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} - {})", expr, resolved_amount);
                 }
-                after.push(format!(
-                    "assert!({} == {} + {}, {});",
-                    after_name,
-                    before_name,
-                    src_before_name,
-                    990 + idx
-                ));
-                summary.add_asserted(target_label);
+                CoinOp::Mint(amount) => {
+                    let resolved_amount = match resolve_numeric_operand(amount, param_arg_values) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    expr = format!("({} + {})", expr, resolved_amount);
+                }
+                CoinOp::Join { src_base_var } => {
+                    if modified_coin_targets.contains(src_base_var) {
+                        exact = false;
+                        break;
+                    }
+                    let src_runtime = match param_coin_runtime.get(src_base_var) {
+                        Some(v) => v,
+                        None => {
+                            exact = false;
+                            break;
+                        }
+                    };
+                    let src_before_name = format!("before_{}_coin_value", sanitize_ident(src_runtime));
+                    required_src_snapshots.push((src_before_name.clone(), src_runtime.clone()));
+                    expr = format!("({} + {})", expr, src_before_name);
+                }
+                CoinOp::Changed => {
+                    exact = false;
+                    break;
+                }
             }
-            CoinOp::Changed => {
+        }
+
+        if !exact {
+            if effects.len() == 1 && matches!(&effects[0].op, CoinOp::Changed) {
+                if seen_before_snapshots.insert(before_name.clone()) {
+                    before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
+                }
+                after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
                 after.push(format!(
                     "assert!({} != {}, {});",
                     after_name,
@@ -983,8 +1470,29 @@ fn build_coin_assertion_lines(
                     990 + idx
                 ));
                 summary.add_asserted(target_label);
+            } else {
+                summary.add_potential(target_label);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if seen_before_snapshots.insert(before_name.clone()) {
+            before.push(format!("let {} = coin::value(&{});", before_name, runtime_var));
+        }
+        for (src_before_name, src_runtime) in required_src_snapshots {
+            if seen_before_snapshots.insert(src_before_name.clone()) {
+                before.push(format!("let {} = coin::value(&{});", src_before_name, src_runtime));
             }
         }
+        after.push(format!("let {} = coin::value(&{});", after_name, runtime_var));
+        after.push(format!(
+            "assert!({} == {}, {});",
+            after_name,
+            expr.replace("before_coin_value", &before_name),
+            990 + idx
+        ));
+        summary.add_asserted(target_label);
         idx += 1;
     }
 
@@ -1039,14 +1547,8 @@ fn build_option_assertion_lines(
             .push(eff);
     }
 
-    let mut direct_effect_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for eff in &d.option_effects {
-        let key = format!("{}.{}", eff.base_var, eff.field);
-        *direct_effect_counts.entry(key).or_insert(0) += 1;
-    }
-
     let has_internal_calls = !d.calls.is_empty();
+    let has_non_linear_flow = has_branch_or_loop(&d.body_lines);
     let mut seen_before_snapshots: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut idx = 0u64;
@@ -1083,17 +1585,42 @@ fn build_option_assertion_lines(
             sanitize_ident(&first.field)
         );
 
-        let direct_key = format!("{}.{}", first.base_var, first.field);
-        let direct_count = direct_effect_counts.get(&direct_key).copied().unwrap_or(0);
-        let prefer_generic = has_internal_calls || direct_count > 1 || effects.len() != 1;
-        let needs_before = prefer_generic || matches!(first.op, OptionOp::Changed);
-
-        if needs_before && seen_before_snapshots.insert(before_name.clone()) {
-            before.push(format!("let {} = {};", before_name, read_expr.clone()));
+        if has_internal_calls || has_non_linear_flow {
+            summary.add_potential(format!("option {}", target));
+            idx += 1;
+            continue;
         }
-        after.push(format!("let {} = {};", after_name, read_expr));
 
-        if prefer_generic {
+        let mut final_known: Option<bool> = None;
+        let mut exact = true;
+        for eff in &effects {
+            match eff.op {
+                OptionOp::SetSome => final_known = Some(true),
+                OptionOp::SetNone => final_known = Some(false),
+                OptionOp::Changed => {
+                    final_known = None;
+                    exact = false;
+                }
+            }
+        }
+
+        if let Some(v) = final_known {
+            after.push(format!("let {} = {};", after_name, read_expr));
+            if v {
+                after.push(format!("assert!({}, {});", after_name, 980 + idx));
+            } else {
+                after.push(format!("assert!(!{}, {});", after_name, 980 + idx));
+            }
+            summary.add_asserted(format!("option {}", target));
+            idx += 1;
+            continue;
+        }
+
+        if !exact && effects.len() == 1 && matches!(&effects[0].op, OptionOp::Changed) {
+            if seen_before_snapshots.insert(before_name.clone()) {
+                before.push(format!("let {} = {};", before_name, read_expr.clone()));
+            }
+            after.push(format!("let {} = {};", after_name, read_expr));
             after.push(format!(
                 "assert!({} != {}, {});",
                 after_name,
@@ -1101,23 +1628,9 @@ fn build_option_assertion_lines(
                 980 + idx
             ));
             summary.add_asserted(format!("option {}", target));
-            idx += 1;
-            continue;
+        } else {
+            summary.add_potential(format!("option {}", target));
         }
-
-        match first.op {
-            OptionOp::SetSome => after.push(format!("assert!({}, {});", after_name, 980 + idx)),
-            OptionOp::SetNone => {
-                after.push(format!("assert!(!{}, {});", after_name, 980 + idx))
-            }
-            OptionOp::Changed => after.push(format!(
-                "assert!({} != {}, {});",
-                after_name,
-                before_name,
-                980 + idx
-            )),
-        }
-        summary.add_asserted(format!("option {}", target));
         idx += 1;
     }
 

@@ -97,6 +97,38 @@ pub(super) fn build_chained_coin_effect_map(
     cache
 }
 
+pub(super) fn build_chained_treasury_cap_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<TreasuryCapEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<TreasuryCapEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_treasury_cap_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
 pub(super) fn build_chained_coin_note_map(
     decls: &[FnDecl],
     max_depth: usize,
@@ -510,6 +542,42 @@ fn map_coin_op_to_caller(op: &CoinOp, callee: &FnDecl, call: &CallSite) -> CoinO
     }
 }
 
+fn map_treasury_cap_op_to_caller(
+    op: &TreasuryCapOp,
+    callee: &FnDecl,
+    call: &CallSite,
+) -> TreasuryCapOp {
+    match op {
+        TreasuryCapOp::Mint(amount) => {
+            if is_ident(amount) {
+                if let Some(idx) = callee.params.iter().position(|p| p.name == *amount) {
+                    if let Some(arg) = call.arg_exprs.get(idx) {
+                        let mapped = arg.trim();
+                        if parse_numeric_literal(mapped).is_some() || is_ident(mapped) {
+                            return TreasuryCapOp::Mint(mapped.to_string());
+                        }
+                    }
+                }
+            }
+            TreasuryCapOp::Mint(amount.clone())
+        }
+        TreasuryCapOp::Burn(amount) => {
+            if is_ident(amount) {
+                if let Some(idx) = callee.params.iter().position(|p| p.name == *amount) {
+                    if let Some(arg) = call.arg_exprs.get(idx) {
+                        let mapped = arg.trim();
+                        if parse_numeric_literal(mapped).is_some() || is_ident(mapped) {
+                            return TreasuryCapOp::Burn(mapped.to_string());
+                        }
+                    }
+                }
+            }
+            TreasuryCapOp::Burn(amount.clone())
+        }
+        TreasuryCapOp::Changed => TreasuryCapOp::Changed,
+    }
+}
+
 fn collect_coin_effects_for_fn(
     d: &FnDecl,
     by_module_and_fn: &std::collections::HashMap<
@@ -567,18 +635,71 @@ fn collect_coin_effects_for_fn(
         }
     }
 
-    let mut deduped = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for eff in out {
-        let sig = format!("{}::{:?}", eff.base_var, eff.op);
-        if seen.insert(sig) {
-            deduped.push(eff);
+    visiting.remove(&key);
+    cache.insert(key, out.clone());
+    out
+}
+
+fn collect_treasury_cap_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<TreasuryCapEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<TreasuryCapEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.treasury_cap_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.treasury_cap_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_treasury_cap_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                let mapped_op = map_treasury_cap_op_to_caller(&eff.op, callee, call);
+                out.push(TreasuryCapEffect {
+                    base_var: arg.to_string(),
+                    op: mapped_op,
+                });
+            }
         }
     }
 
     visiting.remove(&key);
-    cache.insert(key, deduped.clone());
-    deduped
+    cache.insert(key, out.clone());
+    out
 }
 
 fn collect_coin_notes_for_fn(
