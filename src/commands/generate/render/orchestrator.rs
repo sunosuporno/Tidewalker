@@ -245,14 +245,30 @@ pub(super) fn render_best_effort_test(
     let mut shared_objects: Vec<ObjectNeed> = Vec::new();
     let mut owned_objects: Vec<ObjectNeed> = Vec::new();
     if !object_needs.is_empty() {
-        let module_helpers = helper_catalog.get(&d.module_name)?;
+        let empty_helpers = ModuleHelperCatalog::default();
+        let module_helpers = helper_catalog.get(&d.module_name).unwrap_or(&empty_helpers);
+        let module_fns = fn_lookup.get(&d.module_name);
         for obj in &object_needs {
             if module_helpers.shared_types.contains(&obj.type_key) {
                 shared_objects.push(obj.clone());
             } else if module_helpers.owned_types.contains(&obj.type_key) {
                 owned_objects.push(obj.clone());
             } else {
-                return None;
+                let shared_helper = format!("create_and_share_{}_for_testing", obj.type_key);
+                let owned_helper = format!("create_{}_for_testing", obj.type_key);
+                let has_shared_helper = module_fns
+                    .map(|fns| fns.contains_key(&shared_helper))
+                    .unwrap_or(false);
+                let has_owned_helper = module_fns
+                    .map(|fns| fns.contains_key(&owned_helper))
+                    .unwrap_or(false);
+                if has_shared_helper {
+                    shared_objects.push(obj.clone());
+                } else if has_owned_helper {
+                    owned_objects.push(obj.clone());
+                } else {
+                    return None;
+                }
             }
         }
     }
