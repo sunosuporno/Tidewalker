@@ -225,6 +225,38 @@ pub(super) fn build_chained_string_effect_map(
     cache
 }
 
+pub(super) fn build_chained_container_effect_map(
+    decls: &[FnDecl],
+    max_depth: usize,
+) -> std::collections::HashMap<String, Vec<ContainerEffect>> {
+    let mut by_module_and_fn: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    > = std::collections::HashMap::new();
+    for d in decls {
+        by_module_and_fn
+            .entry(d.module_name.clone())
+            .or_default()
+            .insert(d.fn_name.clone(), d);
+    }
+    let mut cache: std::collections::HashMap<String, Vec<ContainerEffect>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = format!("{}::{}", d.module_name, d.fn_name);
+        let resolved = collect_container_effects_for_fn(
+            d,
+            &by_module_and_fn,
+            &mut cache,
+            &mut visiting,
+            0,
+            max_depth,
+        );
+        cache.insert(key, resolved);
+    }
+    cache
+}
+
 pub(super) fn build_deep_overflow_map(
     decls: &[FnDecl],
     max_depth: usize,
@@ -880,6 +912,114 @@ fn collect_string_effects_for_fn(
         }
     }
 
+    visiting.remove(&key);
+    cache.insert(key, deduped.clone());
+    deduped
+}
+
+fn map_container_op_to_caller(op: &ContainerOp, callee: &FnDecl, call: &CallSite) -> ContainerOp {
+    match op {
+        ContainerOp::Insert(key) => {
+            ContainerOp::Insert(map_container_key_to_caller(key, callee, call))
+        }
+        ContainerOp::Remove(key) => {
+            ContainerOp::Remove(map_container_key_to_caller(key, callee, call))
+        }
+        ContainerOp::Changed => ContainerOp::Changed,
+    }
+}
+
+fn map_container_key_to_caller(key: &str, callee: &FnDecl, call: &CallSite) -> String {
+    if !is_ident(key) {
+        return key.to_string();
+    }
+    let Some(idx) = callee.params.iter().position(|p| p.name == key) else {
+        return key.to_string();
+    };
+    let Some(arg) = call.arg_exprs.get(idx) else {
+        return key.to_string();
+    };
+    let mapped = strip_ref_and_parens(arg);
+    if parse_numeric_literal(mapped).is_some()
+        || is_ident(mapped)
+        || is_bool_literal(mapped)
+        || is_address_literal(mapped)
+    {
+        mapped.to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+fn collect_container_effects_for_fn(
+    d: &FnDecl,
+    by_module_and_fn: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, &FnDecl>,
+    >,
+    cache: &mut std::collections::HashMap<String, Vec<ContainerEffect>>,
+    visiting: &mut std::collections::HashSet<String>,
+    depth: usize,
+    max_depth: usize,
+) -> Vec<ContainerEffect> {
+    let key = format!("{}::{}", d.module_name, d.fn_name);
+    if let Some(cached) = cache.get(&key) {
+        return cached.clone();
+    }
+    if depth > max_depth || visiting.contains(&key) {
+        return d.container_effects.clone();
+    }
+    visiting.insert(key.clone());
+
+    let mut out = d.container_effects.clone();
+    if let Some(module_map) = by_module_and_fn.get(&d.module_name) {
+        for call in &d.calls {
+            let callee = match module_map.get(&call.callee_fn) {
+                Some(c) => *c,
+                None => continue,
+            };
+            let callee_effects = collect_container_effects_for_fn(
+                callee,
+                by_module_and_fn,
+                cache,
+                visiting,
+                depth + 1,
+                max_depth,
+            );
+            for eff in callee_effects {
+                let callee_idx = callee.params.iter().position(|p| p.name == eff.base_var);
+                let idx = match callee_idx {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let arg = match call.arg_exprs.get(idx) {
+                    Some(a) => a.trim(),
+                    None => continue,
+                };
+                if !is_ident(arg) {
+                    continue;
+                }
+                out.push(ContainerEffect {
+                    base_var: arg.to_string(),
+                    field: eff.field,
+                    kind: eff.kind,
+                    op: map_container_op_to_caller(&eff.op, callee, call),
+                });
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for eff in out {
+        let sig = format!(
+            "{}::{}::{:?}::{:?}",
+            eff.base_var, eff.field, eff.kind, eff.op
+        );
+        if seen.insert(sig) {
+            deduped.push(eff);
+        }
+    }
     visiting.remove(&key);
     cache.insert(key, deduped.clone());
     deduped

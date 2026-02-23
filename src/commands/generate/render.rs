@@ -1,6 +1,7 @@
 use super::catalog::ModuleHelperCatalog;
 use super::*;
 mod coin;
+mod container;
 mod numeric;
 mod option;
 mod orchestrator;
@@ -52,6 +53,7 @@ pub(super) fn render_best_effort_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
     option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
+    container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
@@ -61,12 +63,14 @@ pub(super) fn render_best_effort_test(
     coin_notes: &[CoinNote],
     option_effects: &[OptionEffect],
     string_effects: &[StringEffect],
+    container_effects: &[ContainerEffect],
     deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
     orchestrator::render_best_effort_test(
         d,
         accessor_map,
         option_accessor_map,
+        container_accessor_map,
         helper_catalog,
         fn_lookup,
         numeric_effects,
@@ -76,6 +80,7 @@ pub(super) fn render_best_effort_test(
         coin_notes,
         option_effects,
         string_effects,
+        container_effects,
         deep_overflow_paths,
     )
 }
@@ -403,6 +408,24 @@ fn build_string_summary(
     deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> StateChangeSummary {
     summary::build_string_summary(string_effects, param_runtime, deep_overflow_paths)
+}
+
+fn build_container_assertion_lines(
+    d: &FnDecl,
+    container_effects: &[ContainerEffect],
+    param_runtime: &std::collections::HashMap<String, String>,
+    param_arg_values: &std::collections::HashMap<String, String>,
+    container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
+    deep_overflow_paths: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>, StateChangeSummary) {
+    container::build_container_assertion_lines(
+        d,
+        container_effects,
+        param_runtime,
+        param_arg_values,
+        container_accessor_map,
+        deep_overflow_paths,
+    )
 }
 
 fn build_deep_chain_summary(

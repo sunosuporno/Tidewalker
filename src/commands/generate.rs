@@ -33,6 +33,7 @@ struct FnDecl {
     coin_notes: Vec<CoinNote>,
     option_effects: Vec<OptionEffect>,
     string_effects: Vec<StringEffect>,
+    container_effects: Vec<ContainerEffect>,
     calls: Vec<CallSite>,
 }
 
@@ -78,6 +79,21 @@ struct OptionEffect {
 #[derive(Debug, Clone)]
 struct StringEffect {
     base_var: String,
+    field: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContainerEffect {
+    base_var: String,
+    field: String,
+    kind: ContainerKind,
+    op: ContainerOp,
+}
+
+#[derive(Debug, Clone)]
+struct ContainerAccessorSig {
+    fn_name: String,
+    param_ty: String,
     field: String,
 }
 
@@ -147,6 +163,22 @@ enum CoinNote {
 enum OptionOp {
     SetSome,
     SetNone,
+    Changed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ContainerKind {
+    Table,
+    VecMap,
+    VecSet,
+    Bag,
+    DynamicField,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ContainerOp {
+    Insert(String),
+    Remove(String),
     Changed,
 }
 
@@ -254,6 +286,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
 
     let accessor_map = catalog::build_accessor_map(&decls);
     let option_accessor_map = catalog::build_option_accessor_map(&decls);
+    let container_accessor_map = catalog::build_container_accessor_map(&decls);
     let helper_catalog = catalog::build_helper_catalog(&decls);
     let fn_lookup = catalog::build_fn_lookup(&decls);
     let effects_map = chain::build_chained_effect_map(&decls, 4);
@@ -263,6 +296,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let coin_notes_map = chain::build_chained_coin_note_map(&decls, 4);
     let option_effects_map = chain::build_chained_option_effect_map(&decls, 4);
     let string_effects_map = chain::build_chained_string_effect_map(&decls, 4);
+    let container_effects_map = chain::build_chained_container_effect_map(&decls, 4);
     let deep_overflow_map = chain::build_deep_overflow_map(&decls, 4);
     for d in decls {
         if d.is_test_only {
@@ -300,11 +334,16 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .get(&key)
             .cloned()
             .unwrap_or_else(|| d.string_effects.clone());
+        let resolved_container_effects = container_effects_map
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| d.container_effects.clone());
         let deep_overflow_paths = deep_overflow_map.get(&key).cloned().unwrap_or_default();
         if let Some(test_lines) = render::render_best_effort_test(
             &d,
             &accessor_map,
             &option_accessor_map,
+            &container_accessor_map,
             &helper_catalog,
             &fn_lookup,
             &resolved_effects,
@@ -314,6 +353,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             &resolved_coin_notes,
             &resolved_option_effects,
             &resolved_string_effects,
+            &resolved_container_effects,
             &deep_overflow_paths,
         ) {
             for l in test_lines {
@@ -525,6 +565,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             extract_option_effects_from_body(&body_lines, &params, &option_fields_by_type);
         let string_effects =
             extract_string_effects_from_body(&body_lines, &params, &string_fields_by_type);
+        let container_effects = extract_container_effects_from_body(&body_lines);
         let calls = extract_same_module_calls_from_body(&body_lines, &module_name);
 
         out.push(FnDecl {
@@ -544,6 +585,7 @@ fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             coin_notes,
             option_effects,
             string_effects,
+            container_effects,
             calls,
         });
         i = body_end.map(|e| e + 1).unwrap_or(j);
@@ -1741,6 +1783,200 @@ fn extract_string_effects_from_body(
     out
 }
 
+fn extract_container_effects_from_body(body_lines: &[String]) -> Vec<ContainerEffect> {
+    let mut out = Vec::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in body_lines {
+        let no_comments = line.split("//").next().unwrap_or("").trim();
+        if no_comments.is_empty() || no_comments.starts_with("assert!") {
+            continue;
+        }
+        let stmt = no_comments.trim_end_matches(';').trim();
+        if let Some((name, target)) = parse_alias_binding(stmt) {
+            aliases.insert(name, target);
+            continue;
+        }
+        if stmt.starts_with("let ") {
+            if let Some(name) = parse_let_binding_name(stmt) {
+                aliases.remove(&name);
+            }
+        }
+
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "table::add", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::Table,
+                ContainerOp::Insert(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "table::remove", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::Table,
+                ContainerOp::Remove(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "bag::add", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::Bag,
+                ContainerOp::Insert(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "bag::remove", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::Bag,
+                ContainerOp::Remove(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "vec_map::insert", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::VecMap,
+                ContainerOp::Insert(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "vec_map::remove", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::VecMap,
+                ContainerOp::Remove(key),
+            );
+        }
+        if let Some((base_var, field)) =
+            parse_container_namespace_target(stmt, "vec_map::pop", &aliases, 0)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::VecMap,
+                ContainerOp::Changed,
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "vec_set::insert", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::VecSet,
+                ContainerOp::Insert(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "vec_set::remove", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::VecSet,
+                ContainerOp::Remove(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "dynamic_field::add", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::DynamicField,
+                ContainerOp::Insert(key),
+            );
+        }
+        if let Some((base_var, field, key)) =
+            parse_container_namespace_effect(stmt, "dynamic_field::remove", &aliases, 0, 1)
+        {
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::DynamicField,
+                ContainerOp::Remove(key),
+            );
+        }
+        if let Some((base_var, field, key)) = parse_container_namespace_effect(
+            stmt,
+            "dynamic_field::remove_if_exists",
+            &aliases,
+            0,
+            1,
+        ) {
+            let _ = key;
+            push_container_effect(
+                &mut out,
+                &mut seen,
+                base_var,
+                field,
+                ContainerKind::DynamicField,
+                ContainerOp::Changed,
+            );
+        }
+    }
+
+    out
+}
+
+fn push_container_effect(
+    out: &mut Vec<ContainerEffect>,
+    seen: &mut std::collections::HashSet<String>,
+    base_var: String,
+    field: String,
+    kind: ContainerKind,
+    op: ContainerOp,
+) {
+    let sig = format!("{}::{}::{:?}::{:?}", base_var, field, kind, op);
+    if seen.insert(sig) {
+        out.push(ContainerEffect {
+            base_var,
+            field,
+            kind,
+            op,
+        });
+    }
+}
+
 fn extract_mut_borrow_targets(stmt: &str) -> Vec<String> {
     let mut out = Vec::new();
     for part in stmt.split("&mut").skip(1) {
@@ -1761,6 +1997,53 @@ fn extract_mut_borrow_targets(stmt: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn parse_container_namespace_effect(
+    line: &str,
+    call_name: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    target_idx: usize,
+    key_idx: usize,
+) -> Option<(String, String, String)> {
+    let args = extract_namespace_args_flexible(line, call_name)?;
+    let target = parse_container_target_expr(args.get(target_idx)?.as_str(), aliases)?;
+    let key = normalize_container_key_expr(args.get(key_idx)?.as_str())?;
+    Some((target.0, target.1, key))
+}
+
+fn parse_container_namespace_target(
+    line: &str,
+    call_name: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    target_idx: usize,
+) -> Option<(String, String)> {
+    let args = extract_namespace_args_flexible(line, call_name)?;
+    parse_container_target_expr(args.get(target_idx)?.as_str(), aliases)
+}
+
+fn parse_container_target_expr(
+    arg: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    let first_arg = strip_ref_and_parens_text(arg);
+    if let Some((base, field)) = parse_field_access(first_arg) {
+        return resolve_effect_target(&base, &field, aliases);
+    }
+    if is_ident(first_arg) {
+        let resolved = resolve_alias_path(first_arg, aliases);
+        return parse_simple_base_field(&resolved);
+    }
+    None
+}
+
+fn normalize_container_key_expr(raw: &str) -> Option<String> {
+    let token = strip_ref_and_parens_text(raw).trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 fn parse_vector_method_target(
@@ -1896,6 +2179,54 @@ fn extract_namespace_args(line: &str, call_prefix: &str) -> Option<Vec<String>> 
     let after = line.split_once(call_prefix)?.1.trim();
     let args_raw = after.strip_suffix(')')?;
     Some(split_args(args_raw))
+}
+
+fn extract_namespace_args_flexible(line: &str, call_name: &str) -> Option<Vec<String>> {
+    let idx = line.find(call_name)?;
+    let mut i = idx + call_name.len();
+    let bytes = line.as_bytes();
+    while i < line.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < line.len() && bytes[i] == b'<' {
+        let mut depth = 1i32;
+        i += 1;
+        while i < line.len() {
+            let ch = bytes[i] as char;
+            if ch == '<' {
+                depth += 1;
+            } else if ch == '>' {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            i += 1;
+        }
+    }
+    while i < line.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= line.len() || bytes[i] != b'(' {
+        return None;
+    }
+    let start = i + 1;
+    let mut depth = 1i32;
+    let mut end: Option<usize> = None;
+    for (offset, ch) in line[start..].char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(start + offset);
+                break;
+            }
+        }
+    }
+    let end_idx = end?;
+    Some(split_args(&line[start..end_idx]))
 }
 
 fn extract_return_type(header: &str) -> Option<String> {
@@ -2088,6 +2419,15 @@ fn parse_numeric_literal(raw: &str) -> Option<String> {
         return Some(lit.to_string());
     }
     None
+}
+
+fn is_bool_literal(raw: &str) -> bool {
+    matches!(raw.trim(), "true" | "false")
+}
+
+fn is_address_literal(raw: &str) -> bool {
+    let t = raw.trim();
+    t.starts_with('@') && t.len() > 1
 }
 
 fn is_ident(s: &str) -> bool {

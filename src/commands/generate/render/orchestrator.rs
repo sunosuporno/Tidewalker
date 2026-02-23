@@ -154,6 +154,7 @@ pub(super) fn render_best_effort_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
     option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
+    container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     numeric_effects: &[NumericEffect],
@@ -163,6 +164,7 @@ pub(super) fn render_best_effort_test(
     coin_notes: &[CoinNote],
     option_effects: &[OptionEffect],
     string_effects: &[StringEffect],
+    container_effects: &[ContainerEffect],
     deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
     let fq = format!("{}::{}", d.module_name, d.fn_name);
@@ -324,6 +326,15 @@ pub(super) fn render_best_effort_test(
         option_accessor_map,
         deep_overflow_paths,
     );
+    let (container_before_lines, container_after_lines, container_summary) =
+        build_container_assertion_lines(
+            d,
+            container_effects,
+            &param_runtime,
+            &param_arg_values,
+            container_accessor_map,
+            deep_overflow_paths,
+        );
     let (ownership_transfer_checks, ownership_share_checks, ownership_summary) =
         build_ownership_checks(d, &param_arg_values, &preexisting_shared_type_keys);
     let cap_auth_summary = build_cap_auth_summary(d);
@@ -342,6 +353,7 @@ pub(super) fn render_best_effort_test(
     state_summary.merge(cap_auth_summary);
     state_summary.merge(ownership_summary);
     state_summary.merge(option_summary);
+    state_summary.merge(container_summary);
     state_summary.merge(string_summary);
     state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
     let summary_lines = render_state_change_summary_lines(&state_summary);
@@ -417,6 +429,9 @@ pub(super) fn render_best_effort_test(
     for l in option_before_lines {
         lines.push(format!("        {}", l));
     }
+    for l in container_before_lines {
+        lines.push(format!("        {}", l));
+    }
     lines.push(format!("        {}({});", fq, args.join(", ")));
     for l in snapshot_after_lines {
         lines.push(format!("        {}", l));
@@ -431,6 +446,9 @@ pub(super) fn render_best_effort_test(
         lines.push(format!("        {}", l));
     }
     for l in option_after_lines {
+        lines.push(format!("        {}", l));
+    }
+    for l in container_after_lines {
         lines.push(format!("        {}", l));
     }
     for l in summary_lines {

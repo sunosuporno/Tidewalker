@@ -49,6 +49,89 @@ pub(super) fn build_option_accessor_map(
     out
 }
 
+pub(super) fn build_container_accessor_map(
+    decls: &[FnDecl],
+) -> std::collections::HashMap<String, Vec<ContainerAccessorSig>> {
+    let mut out: std::collections::HashMap<String, Vec<ContainerAccessorSig>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if d.is_test_only || !d.is_public {
+            continue;
+        }
+        let sig = match parse_container_accessor_sig(d) {
+            Some(v) => v,
+            None => continue,
+        };
+        out.entry(d.module_name.clone()).or_default().push(sig);
+    }
+    out
+}
+
+fn parse_container_accessor_sig(d: &FnDecl) -> Option<ContainerAccessorSig> {
+    if d.params.len() != 2 {
+        return None;
+    }
+    let ret = d.return_ty.as_ref()?.trim();
+    if ret != "bool" {
+        return None;
+    }
+    let obj_param = d.params.first()?;
+    if !obj_param.ty.trim().starts_with('&') {
+        return None;
+    }
+    let key_param = d.params.get(1)?;
+    let param_ty = normalize_param_object_type(&obj_param.ty);
+    let obj_name = obj_param.name.as_str();
+    let key_name = key_param.name.as_str();
+
+    for line in &d.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let stmt = stmt.trim_end_matches(';').trim();
+        if let Some(field) = parse_container_presence_from_expr(stmt, obj_name, key_name) {
+            return Some(ContainerAccessorSig {
+                fn_name: d.fn_name.clone(),
+                param_ty: param_ty.clone(),
+                field,
+            });
+        }
+    }
+    None
+}
+
+fn parse_container_presence_from_expr(
+    expr: &str,
+    obj_param_name: &str,
+    key_param_name: &str,
+) -> Option<String> {
+    for prefix in [
+        "table::contains",
+        "vec_map::contains",
+        "vec_set::contains",
+        "bag::contains",
+        "dynamic_field::exists_",
+    ] {
+        let args = match extract_namespace_args_flexible(expr, prefix) {
+            Some(v) => v,
+            None => continue,
+        };
+        let object_arg = args.first()?.as_str();
+        let key_arg = args.get(1)?.as_str();
+        let key_token = strip_ref_and_parens_text(key_arg);
+        if key_token != key_param_name {
+            continue;
+        }
+        let object_path = strip_ref_and_parens_text(object_arg);
+        let (base, field) = parse_field_access(object_path)?;
+        if base == obj_param_name {
+            return Some(field);
+        }
+    }
+    None
+}
+
 fn parse_option_accessor_sig(d: &FnDecl) -> Option<OptionAccessorSig> {
     if d.params.len() != 1 {
         return None;
