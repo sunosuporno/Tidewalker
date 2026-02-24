@@ -512,6 +512,8 @@ fn synthesize_guard_factory_args(factory: &FnDecl) -> Option<Vec<String>> {
         let t = p.ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_vector_type(t) && !t.starts_with('&') {
+            args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
             args.push(default_u64_arg_for_param(&p.name));
         } else if t == "bool" {
@@ -606,6 +608,20 @@ fn build_common_call_plan(
             call_args.push(option_none_expr_for_type(t));
         } else if is_string_type(t) {
             call_args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else if is_vector_type(t) {
+            let vec_expr = vector_literal_expr_for_type(t)?;
+            if t.starts_with('&') {
+                let var_name = format!("vec_{}", sanitize_ident(&param.name));
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                lines_before_tx.push(format!("let {}{} = {};", maybe_mut, var_name, vec_expr));
+                if t.starts_with("&mut") {
+                    call_args.push(format!("&mut {}", var_name));
+                } else {
+                    call_args.push(format!("&{}", var_name));
+                }
+            } else {
+                call_args.push(vec_expr);
+            }
         } else if is_coin_type(t) {
             let var_name = format!("coin_{}", sanitize_ident(&param.name));
             let is_ref = t.starts_with('&');

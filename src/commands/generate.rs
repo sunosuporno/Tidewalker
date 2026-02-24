@@ -22,6 +22,7 @@ pub fn run_generate(package_path: &Path) -> Result<(), Box<dyn std::error::Error
 struct FnDecl {
     module_name: String,
     fn_name: String,
+    type_params: Vec<String>,
     params: Vec<ParamDecl>,
     return_ty: Option<String>,
     body_lines: Vec<String>,
@@ -459,6 +460,10 @@ struct ObjectNeed {
 impl ObjectNeed {
     fn new(param: &ParamDecl) -> Self {
         let type_name = normalize_param_object_type(&param.ty);
+        Self::from_resolved(param, type_name)
+    }
+
+    fn from_resolved(param: &ParamDecl, type_name: String) -> Self {
         let type_key = type_key_from_type_name(&type_name);
         Self {
             type_name,
@@ -550,6 +555,49 @@ fn is_option_type(ty: &str) -> bool {
     norm.starts_with("Option<") || norm.contains("::option::Option<")
 }
 
+fn is_vector_type(ty: &str) -> bool {
+    let norm = normalize_param_object_type(ty).replace(' ', "");
+    norm.starts_with("vector<")
+}
+
+fn vector_literal_expr_for_type(ty: &str) -> Option<String> {
+    let norm = normalize_param_object_type(ty).replace(' ', "");
+    let inner = extract_vector_inner_type(&norm)?;
+    let inner_norm = inner.replace(' ', "");
+    if inner_norm != "u8" {
+        return None;
+    }
+    let elems = std::iter::repeat("0u8")
+        .take(32)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("vector[{}]", elems))
+}
+
+fn extract_vector_inner_type(ty: &str) -> Option<String> {
+    let start = ty.find('<')?;
+    let mut depth = 0i32;
+    let mut end_idx: Option<usize> = None;
+    for (i, ch) in ty.char_indices().skip(start) {
+        if ch == '<' {
+            depth += 1;
+        } else if ch == '>' {
+            depth -= 1;
+            if depth == 0 {
+                end_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let end = end_idx?;
+    let inner = ty[start + 1..end].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
 fn option_none_expr_for_type(ty: &str) -> String {
     if let Some(inner) = extract_option_inner_type(ty) {
         format!("std::option::none<{}>()", inner)
@@ -613,9 +661,98 @@ fn type_key_from_type_name(type_name: &str) -> String {
         .to_lowercase()
 }
 
+fn type_mentions_param(ty: &str, param: &str) -> bool {
+    let mut token = String::new();
+    for ch in ty.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+            continue;
+        }
+        if token == param {
+            return true;
+        }
+        token.clear();
+    }
+    token == param
+}
+
+fn has_unbound_type_params(d: &FnDecl) -> bool {
+    if d.type_params.is_empty() {
+        return false;
+    }
+    for tp in &d.type_params {
+        let mut seen = false;
+        for p in &d.params {
+            if type_mentions_param(&p.ty, tp) {
+                seen = true;
+                break;
+            }
+        }
+        if !seen {
+            if let Some(ret) = &d.return_ty {
+                if type_mentions_param(ret, tp) {
+                    seen = true;
+                }
+            }
+        }
+        if !seen {
+            return true;
+        }
+    }
+    false
+}
+
+fn default_type_args_for_params(type_params: &[String]) -> Vec<String> {
+    if type_params.is_empty() {
+        return Vec::new();
+    }
+    type_params
+        .iter()
+        .map(|_| "0x2::sui::SUI".to_string())
+        .collect::<Vec<_>>()
+}
+
+fn concretize_type_params(
+    ty: &str,
+    type_params: &[String],
+    concrete_args: &[String],
+) -> String {
+    if type_params.is_empty() || concrete_args.is_empty() {
+        return ty.to_string();
+    }
+    let mut out = String::new();
+    let mut token = String::new();
+    let flush_token = |out: &mut String, token: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        if let Some(idx) = type_params.iter().position(|tp| tp == token) {
+            if let Some(arg) = concrete_args.get(idx) {
+                out.push_str(arg);
+            } else {
+                out.push_str(token);
+            }
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for ch in ty.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            flush_token(&mut out, &mut token);
+            out.push(ch);
+        }
+    }
+    flush_token(&mut out, &mut token);
+    out
+}
+
 fn qualify_type_for_module(module_name: &str, type_name: &str) -> String {
     let clean = type_name.trim();
-    if clean.contains("::") {
+    let base = clean.split('<').next().unwrap_or(clean).trim();
+    if base.contains("::") {
         clean.to_string()
     } else {
         format!("{}::{}", module_name, clean)

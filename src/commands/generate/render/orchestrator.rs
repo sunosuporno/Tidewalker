@@ -5,9 +5,18 @@ use super::*;
 enum ObjectProvisionSource {
     SharedHelper,
     SharedInit,
+    SharedCreator,
     OwnedHelper,
     OwnedInit,
     OwnedFactory,
+    OwnedCreatorSender,
+}
+
+#[derive(Debug, Clone)]
+struct SharedCreatorPlan {
+    fn_name: String,
+    args: Vec<String>,
+    type_args: Vec<String>,
 }
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
@@ -84,7 +93,25 @@ fn synthesize_requires_call_args(
     let mut coin_slot_idx = 0usize;
     for p in &d.params {
         let t = p.ty.trim();
-        if t.starts_with('&') && !t.contains("TxContext") && !is_coin_type(t) {
+        if is_vector_type(t) {
+            let vec_expr = vector_literal_expr_for_type(t)?;
+            if t.starts_with('&') {
+                let var = format!(
+                    "pre_req_vec_{}_{}",
+                    req_step_idx,
+                    sanitize_ident(&p.name)
+                );
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                prep.push(format!("let {}{} = {};", maybe_mut, var, vec_expr));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", var));
+                } else {
+                    args.push(format!("&{}", var));
+                }
+            } else {
+                args.push(vec_expr);
+            }
+        } else if t.starts_with('&') && !t.contains("TxContext") && !is_coin_type(t) {
             let ty = normalize_param_object_type(t);
             let key = type_key_from_type_name(&ty);
             let var = object_vars_by_type.get(&key)?;
@@ -186,6 +213,8 @@ fn synthesize_factory_args(factory: &FnDecl) -> Option<Vec<String>> {
         let t = p.ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_vector_type(t) && !t.starts_with('&') {
+            args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
             args.push(default_u64_arg_for_param(&p.name));
         } else if t == "bool" {
@@ -238,6 +267,35 @@ fn pick_factory_call_for_type(
     best.map(|(_, name, args)| (name, args))
 }
 
+fn pick_shared_creator_plan(
+    d: &FnDecl,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Option<SharedCreatorPlan> {
+    let mut candidates = module_fns
+        .values()
+        .filter(|f| {
+            !f.is_test_only
+                && (f.is_public || f.is_entry)
+                && f.fn_name != d.fn_name
+                && f.fn_name.starts_with("create_shared_")
+                && f.params.iter().any(|p| p.ty.contains("TxContext"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|f| f.params.len());
+    let best = candidates.first()?;
+    let args = synthesize_factory_args(best)?;
+    let type_args = if has_unbound_type_params(best) {
+        default_type_args_for_params(&best.type_params)
+    } else {
+        Vec::new()
+    };
+    Some(SharedCreatorPlan {
+        fn_name: best.fn_name.clone(),
+        args,
+        type_args,
+    })
+}
+
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
@@ -256,6 +314,13 @@ pub(super) fn render_best_effort_test(
     container_effects: &[ContainerEffect],
     deep_overflow_paths: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
+    if d.params.iter().any(|p| {
+        p.name
+            .to_ascii_lowercase()
+            .contains("public_inputs")
+    }) {
+        return None;
+    }
     let fq = format!("{}::{}", d.module_name, d.fn_name);
     let mut lines = Vec::new();
     lines.push("#[test]".to_string());
@@ -277,9 +342,12 @@ pub(super) fn render_best_effort_test(
         std::collections::HashMap::new();
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
     let mut coin_needs: Vec<CoinNeed> = Vec::new();
+    let mut arg_setup_lines: Vec<String> = Vec::new();
+    let default_type_args = default_type_args_for_params(&d.type_params);
 
     for param in &d.params {
-        let t = param.ty.trim();
+        let resolved_ty = concretize_type_params(&param.ty, &d.type_params, &default_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if t == "address" {
@@ -299,6 +367,20 @@ pub(super) fn render_best_effort_test(
         } else if is_string_type(t) {
             let v = "std::string::utf8(b\"tidewalker\")".to_string();
             args.push(v);
+        } else if is_vector_type(t) {
+            let vec_expr = vector_literal_expr_for_type(t)?;
+            if t.starts_with('&') {
+                let var_name = format!("vec_{}", sanitize_ident(&param.name));
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                arg_setup_lines.push(format!("let {}{} = {};", maybe_mut, var_name, vec_expr));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", var_name));
+                } else {
+                    args.push(format!("&{}", var_name));
+                }
+            } else {
+                args.push(vec_expr);
+            }
         } else if is_coin_type(t) {
             let var_name = format!("coin_{}", sanitize_ident(&param.name));
             let is_ref = t.starts_with('&');
@@ -318,7 +400,7 @@ pub(super) fn render_best_effort_test(
                 needs_mut_binding: t.starts_with("&mut"),
             });
         } else if t.starts_with('&') {
-            let obj = ObjectNeed::new(param);
+            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
             if obj.is_mut {
                 args.push(format!("&mut {}", obj.var_name));
             } else {
@@ -337,6 +419,9 @@ pub(super) fn render_best_effort_test(
         std::collections::HashMap::new();
     let mut factory_calls: std::collections::HashMap<String, (String, Vec<String>)> =
         std::collections::HashMap::new();
+    let mut shared_creator_plan: Option<SharedCreatorPlan> = None;
+    let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     if !object_needs.is_empty() {
         let empty_helpers = ModuleHelperCatalog::default();
         let module_helpers = helper_catalog.get(&d.module_name).unwrap_or(&empty_helpers);
@@ -386,7 +471,31 @@ pub(super) fn render_best_effort_test(
                         .insert(obj.var_name.clone(), ObjectProvisionSource::OwnedFactory);
                     factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
                 } else {
-                    return None;
+                    if shared_creator_plan.is_none() {
+                        shared_creator_plan =
+                            module_fns.and_then(|fns| pick_shared_creator_plan(d, fns));
+                    }
+                    if shared_creator_plan.is_some() {
+                        if obj.type_key.contains("cap") {
+                            owned_objects.push(obj.clone());
+                            object_sources.insert(
+                                obj.var_name.clone(),
+                                ObjectProvisionSource::OwnedCreatorSender,
+                            );
+                        } else {
+                            creator_non_cap_type_keys.insert(obj.type_key.clone());
+                            if creator_non_cap_type_keys.len() > 1 {
+                                // A single create_shared_* bootstrap can safely seed only one
+                                // concrete shared object type in first-pass generation.
+                                return None;
+                            }
+                            shared_objects.push(obj.clone());
+                            object_sources
+                                .insert(obj.var_name.clone(), ObjectProvisionSource::SharedCreator);
+                        }
+                    } else {
+                        return None;
+                    }
                 }
             }
         }
@@ -428,6 +537,29 @@ pub(super) fn render_best_effort_test(
                     d.module_name, obj.type_key
                 ));
             }
+            lines.push("    };".to_string());
+            needs_next_tx_before_use = true;
+        }
+    }
+    if object_sources.values().any(|src| {
+        matches!(
+            src,
+            ObjectProvisionSource::SharedCreator | ObjectProvisionSource::OwnedCreatorSender
+        )
+    }) {
+        if let Some(plan) = &shared_creator_plan {
+            lines.push("    {".to_string());
+            let call_path = if plan.type_args.is_empty() {
+                format!("{}::{}", d.module_name, plan.fn_name)
+            } else {
+                format!(
+                    "{}::{}<{}>",
+                    d.module_name,
+                    plan.fn_name,
+                    plan.type_args.join(", ")
+                )
+            };
+            lines.push(format!("        {}({});", call_path, plan.args.join(", ")));
             lines.push("    };".to_string());
             needs_next_tx_before_use = true;
         }
@@ -568,6 +700,14 @@ pub(super) fn render_best_effort_test(
                     factory_args.join(", ")
                 ));
             }
+            Some(ObjectProvisionSource::OwnedCreatorSender) => {
+                lines.push(format!(
+                    "        let {}{} = test_scenario::take_from_sender<{}>(&scenario);",
+                    maybe_mut,
+                    obj.var_name,
+                    qualify_type_for_module(&d.module_name, &obj.type_name)
+                ));
+            }
             _ => {
                 lines.push(format!(
                     "        let {}{} = {}::create_{}_for_testing(test_scenario::ctx(&mut scenario));",
@@ -583,6 +723,9 @@ pub(super) fn render_best_effort_test(
             "        let {}{} = scenario.take_shared<{}>();",
             maybe_mut, obj.var_name, obj_ty
         ));
+    }
+    for l in &arg_setup_lines {
+        lines.push(format!("        {}", l));
     }
 
     let mut requires_chain: Vec<&FnDecl> = Vec::new();
@@ -634,7 +777,16 @@ pub(super) fn render_best_effort_test(
     for l in container_before_lines {
         lines.push(format!("        {}", l));
     }
-    let call_expr = format!("{}({})", fq, args.join(", "));
+    let call_target = if has_unbound_type_params(d) {
+        if default_type_args.is_empty() {
+            fq.clone()
+        } else {
+            format!("{}<{}>", fq, default_type_args.join(", "))
+        }
+    } else {
+        fq.clone()
+    };
+    let call_expr = format!("{}({})", call_target, args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
         if should_transfer_call_return(ret_ty, &d.module_name) {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));

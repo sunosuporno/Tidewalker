@@ -42,48 +42,29 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             i += 1;
             continue;
         }
-        let (is_fn_decl, is_public, is_entry, name) = if t.starts_with("public entry fun ") {
+        let (is_fn_decl, is_public, is_entry, name, type_params) =
+            if t.starts_with("public entry fun ") {
             let after = &t["public entry fun ".len()..];
-            let name = after
-                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            (true, true, true, name)
+            let (name, type_params) = extract_fn_name_and_type_params(after);
+            (true, true, true, name, type_params)
         } else if t.starts_with("entry fun ") {
             let after = &t["entry fun ".len()..];
-            let name = after
-                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            (true, false, true, name)
+            let (name, type_params) = extract_fn_name_and_type_params(after);
+            (true, false, true, name, type_params)
         } else if t.starts_with("public fun ") {
             let after = &t["public fun ".len()..];
-            let name = after
-                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            (true, true, false, name)
+            let (name, type_params) = extract_fn_name_and_type_params(after);
+            (true, true, false, name, type_params)
         } else if t.starts_with("public(package) fun ") {
             let after = &t["public(package) fun ".len()..];
-            let name = after
-                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            (true, true, false, name)
+            let (name, type_params) = extract_fn_name_and_type_params(after);
+            (true, true, false, name, type_params)
         } else if t.starts_with("fun ") {
             let after = &t["fun ".len()..];
-            let name = after
-                .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-                .next()
-                .unwrap_or("")
-                .to_string();
-            (true, false, false, name)
+            let (name, type_params) = extract_fn_name_and_type_params(after);
+            (true, false, false, name, type_params)
         } else {
-            (false, false, false, String::new())
+            (false, false, false, String::new(), Vec::new())
         };
         if !is_fn_decl || name.is_empty() {
             // Keep #[test_only] pending across blank lines and comments (docs often sit between
@@ -183,6 +164,7 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         out.push(FnDecl {
             module_name: module_name.clone(),
             fn_name: name,
+            type_params,
             params,
             return_ty,
             body_lines,
@@ -203,6 +185,54 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         i = body_end.map(|e| e + 1).unwrap_or(j);
     }
     out
+}
+
+fn extract_fn_name_and_type_params(after: &str) -> (String, Vec<String>) {
+    let trimmed = after.trim();
+    let mut name = String::new();
+    let mut idx = 0usize;
+    for (i, ch) in trimmed.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            name.push(ch);
+            idx = i + ch.len_utf8();
+        } else {
+            idx = i;
+            break;
+        }
+    }
+    if name.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let rest = trimmed[idx..].trim_start();
+    if !rest.starts_with('<') {
+        return (name, Vec::new());
+    }
+    let mut depth = 0i32;
+    let mut close_idx: Option<usize> = None;
+    for (i, ch) in rest.char_indices() {
+        if ch == '<' {
+            depth += 1;
+        } else if ch == '>' {
+            depth -= 1;
+            if depth == 0 {
+                close_idx = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(end) = close_idx else {
+        return (name, Vec::new());
+    };
+    let generic_body = &rest[1..end];
+    let mut params = Vec::new();
+    for raw in split_params(generic_body) {
+        let base = raw.split(':').next().unwrap_or("").trim();
+        if !base.is_empty() {
+            params.push(base.to_string());
+        }
+    }
+    (name, params)
 }
 
 pub(super) fn split_params(s: &str) -> Vec<String> {
