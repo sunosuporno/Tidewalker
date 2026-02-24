@@ -1,4 +1,4 @@
-use super::catalog::{ModuleBootstrapCatalog, ModuleHelperCatalog};
+use super::catalog::ModuleBootstrapCatalog;
 use super::*;
 mod coin;
 mod container;
@@ -49,44 +49,32 @@ fn has_branch_or_loop(body_lines: &[String]) -> bool {
     false
 }
 
+pub(super) struct RenderInputs<'a> {
+    pub(super) accessor_map: &'a std::collections::HashMap<String, Vec<AccessorSig>>,
+    pub(super) option_accessor_map: &'a std::collections::HashMap<String, Vec<OptionAccessorSig>>,
+    pub(super) container_accessor_map:
+        &'a std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
+    pub(super) bootstrap_catalog: &'a std::collections::HashMap<String, ModuleBootstrapCatalog>,
+    pub(super) fn_lookup:
+        &'a std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    pub(super) key_structs_by_module:
+        &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(super) numeric_effects: &'a [NumericEffect],
+    pub(super) vector_effects: &'a [VectorEffect],
+    pub(super) coin_effects: &'a [CoinEffect],
+    pub(super) treasury_cap_effects: &'a [TreasuryCapEffect],
+    pub(super) coin_notes: &'a [CoinNote],
+    pub(super) option_effects: &'a [OptionEffect],
+    pub(super) string_effects: &'a [StringEffect],
+    pub(super) container_effects: &'a [ContainerEffect],
+    pub(super) deep_overflow_paths: &'a std::collections::HashSet<String>,
+}
+
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
-    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
-    option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
-    container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
-    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    numeric_effects: &[NumericEffect],
-    vector_effects: &[VectorEffect],
-    coin_effects: &[CoinEffect],
-    treasury_cap_effects: &[TreasuryCapEffect],
-    coin_notes: &[CoinNote],
-    option_effects: &[OptionEffect],
-    string_effects: &[StringEffect],
-    container_effects: &[ContainerEffect],
-    deep_overflow_paths: &std::collections::HashSet<String>,
+    inputs: &RenderInputs<'_>,
 ) -> Option<Vec<String>> {
-    orchestrator::render_best_effort_test(
-        d,
-        accessor_map,
-        option_accessor_map,
-        container_accessor_map,
-        helper_catalog,
-        bootstrap_catalog,
-        fn_lookup,
-        key_structs_by_module,
-        numeric_effects,
-        vector_effects,
-        coin_effects,
-        treasury_cap_effects,
-        coin_notes,
-        option_effects,
-        string_effects,
-        container_effects,
-        deep_overflow_paths,
-    )
+    orchestrator::render_best_effort_test(d, inputs)
 }
 
 fn build_coin_note_summary(coin_notes: &[CoinNote]) -> StateChangeSummary {

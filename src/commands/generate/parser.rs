@@ -29,7 +29,7 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         }
         if t.contains("@tidewalker") && t.contains("requires") {
             // Example: `/// @tidewalker requires increment`
-            if let Some(after) = t.splitn(2, "requires").nth(1) {
+            if let Some((_, after)) = t.split_once("requires") {
                 for part in after
                     .trim()
                     .split(|c: char| c == ',' || c.is_whitespace())
@@ -43,26 +43,21 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             continue;
         }
         let (is_fn_decl, is_public, is_entry, name, type_params) =
-            if t.starts_with("public entry fun ") {
-                let after = &t["public entry fun ".len()..];
+            if let Some(after) = t.strip_prefix("public entry fun ") {
                 let (name, type_params) = extract_fn_name_and_type_params(after);
                 (true, true, true, name, type_params)
-            } else if t.starts_with("entry fun ") {
-                let after = &t["entry fun ".len()..];
+            } else if let Some(after) = t.strip_prefix("entry fun ") {
                 let (name, type_params) = extract_fn_name_and_type_params(after);
                 (true, false, true, name, type_params)
-            } else if t.starts_with("public fun ") {
-                let after = &t["public fun ".len()..];
+            } else if let Some(after) = t.strip_prefix("public fun ") {
                 let (name, type_params) = extract_fn_name_and_type_params(after);
                 (true, true, false, name, type_params)
-            } else if t.starts_with("public(package) fun ") {
-                let after = &t["public(package) fun ".len()..];
+            } else if let Some(after) = t.strip_prefix("public(package) fun ") {
                 let (name, type_params) = extract_fn_name_and_type_params(after);
                 // Treat package-visibility functions as internal helpers for Tidewalker test-target
                 // selection. We still parse them for call-chain analysis.
                 (true, false, false, name, type_params)
-            } else if t.starts_with("fun ") {
-                let after = &t["fun ".len()..];
+            } else if let Some(after) = t.strip_prefix("fun ") {
                 let (name, type_params) = extract_fn_name_and_type_params(after);
                 (true, false, false, name, type_params)
             } else {
@@ -938,10 +933,10 @@ pub(super) fn extract_coin_notes_from_body(body_lines: &[String]) -> Vec<CoinNot
         if has_mint && seen.insert(CoinNote::MintFlow) {
             out.push(CoinNote::MintFlow);
         }
-        if lower.contains("coin::burn(") || lower.contains("::burn(") {
-            if seen.insert(CoinNote::BurnFlow) {
-                out.push(CoinNote::BurnFlow);
-            }
+        if (lower.contains("coin::burn(") || lower.contains("::burn("))
+            && seen.insert(CoinNote::BurnFlow)
+        {
+            out.push(CoinNote::BurnFlow);
         }
         let has_stake = lower.contains("request_add_stake(")
             || lower.contains("request_withdraw_stake(")
@@ -997,7 +992,7 @@ pub(super) fn parse_coin_split_method(
     let idx = line.find(".split(")?;
     let before = line[..idx]
         .split('=')
-        .last()?
+        .next_back()?
         .trim()
         .trim_end_matches('.')
         .trim();
@@ -1024,7 +1019,7 @@ pub(super) fn parse_coin_join_method(
     let idx = line.find(".join(")?;
     let before = line[..idx]
         .split('=')
-        .last()?
+        .next_back()?
         .trim()
         .trim_end_matches('.')
         .trim();
@@ -1060,7 +1055,7 @@ pub(super) fn parse_coin_join_mint_method(
     let idx = line.find(".join(")?;
     let before = line[..idx]
         .split('=')
-        .last()?
+        .next_back()?
         .trim()
         .trim_end_matches('.')
         .trim();
@@ -1613,9 +1608,7 @@ pub(super) fn extract_mut_borrow_targets(stmt: &str) -> Vec<String> {
         while let Some(rest) = cand.strip_prefix('(') {
             cand = rest.trim_start();
         }
-        let end = cand
-            .find(|c: char| c == ',' || c == ')' || c == ';' || c == '=')
-            .unwrap_or(cand.len());
+        let end = cand.find([',', ')', ';', '=']).unwrap_or(cand.len());
         let token = cand[..end]
             .trim()
             .trim_matches('(')
@@ -1925,9 +1918,8 @@ pub(super) fn extract_same_module_calls_from_body(
             }
 
             let callee = if token.contains("::") {
-                if token.starts_with("Self::") {
-                    token.split("::").last().unwrap_or("").to_string()
-                } else if token.starts_with(&format!("{}::", module_short)) {
+                if token.starts_with("Self::") || token.starts_with(&format!("{}::", module_short))
+                {
                     token.split("::").last().unwrap_or("").to_string()
                 } else {
                     i += 1;

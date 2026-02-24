@@ -1,4 +1,4 @@
-use super::catalog::{ModuleBootstrapCatalog, ModuleHelperCatalog};
+use super::catalog::ModuleBootstrapCatalog;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,76 +28,6 @@ struct HelperCallPlan {
 
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
-}
-
-fn default_id_arg_expr() -> String {
-    "sui::object::id_from_address(OTHER)".to_string()
-}
-
-fn default_u64_arg_for_param(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("ratio") {
-        "101".to_string()
-    } else {
-        "1".to_string()
-    }
-}
-
-fn normalize_helper_key(key: &str) -> String {
-    key.chars()
-        .filter(|c| *c != '_')
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-fn split_type_module_and_base<'a>(ty: &'a str, default_module: &'a str) -> (&'a str, &'a str) {
-    let clean = ty.trim();
-    let no_ref = clean
-        .strip_prefix("&mut ")
-        .or_else(|| clean.strip_prefix('&'))
-        .unwrap_or(clean);
-    let no_generics = no_ref.split('<').next().unwrap_or(no_ref).trim();
-    if let Some((module, base)) = no_generics.rsplit_once("::") {
-        (module, base.trim())
-    } else {
-        (default_module, no_generics)
-    }
-}
-
-fn is_known_key_struct(
-    ty: &str,
-    default_module: &str,
-    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-) -> bool {
-    let (module, base) = split_type_module_and_base(ty, default_module);
-    key_structs_by_module
-        .get(module)
-        .map(|types| types.contains(base))
-        .unwrap_or(false)
-}
-
-fn should_transfer_call_return(
-    ret_ty: &str,
-    module_name: &str,
-    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-) -> bool {
-    let t = ret_ty.trim();
-    if t.is_empty() || t == "()" || t.starts_with('&') {
-        return false;
-    }
-    if is_numeric_type(t)
-        || t == "bool"
-        || t == "address"
-        || is_string_type(t)
-        || is_option_type(t)
-        || t.starts_with("vector<")
-    {
-        return false;
-    }
-    if is_coin_type(t) || is_treasury_cap_type(t) {
-        return true;
-    }
-    is_known_key_struct(t, module_name, key_structs_by_module)
 }
 
 fn requires_chain_uses_coin_slot_later(
@@ -497,23 +427,23 @@ fn pick_shared_creator_plan(
 
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
-    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
-    option_accessor_map: &std::collections::HashMap<String, Vec<OptionAccessorSig>>,
-    container_accessor_map: &std::collections::HashMap<String, Vec<ContainerAccessorSig>>,
-    _helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
-    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    numeric_effects: &[NumericEffect],
-    vector_effects: &[VectorEffect],
-    coin_effects: &[CoinEffect],
-    treasury_cap_effects: &[TreasuryCapEffect],
-    coin_notes: &[CoinNote],
-    option_effects: &[OptionEffect],
-    string_effects: &[StringEffect],
-    container_effects: &[ContainerEffect],
-    deep_overflow_paths: &std::collections::HashSet<String>,
+    inputs: &RenderInputs<'_>,
 ) -> Option<Vec<String>> {
+    let accessor_map = inputs.accessor_map;
+    let option_accessor_map = inputs.option_accessor_map;
+    let container_accessor_map = inputs.container_accessor_map;
+    let bootstrap_catalog = inputs.bootstrap_catalog;
+    let fn_lookup = inputs.fn_lookup;
+    let key_structs_by_module = inputs.key_structs_by_module;
+    let numeric_effects = inputs.numeric_effects;
+    let vector_effects = inputs.vector_effects;
+    let coin_effects = inputs.coin_effects;
+    let treasury_cap_effects = inputs.treasury_cap_effects;
+    let coin_notes = inputs.coin_notes;
+    let option_effects = inputs.option_effects;
+    let string_effects = inputs.string_effects;
+    let container_effects = inputs.container_effects;
+    let deep_overflow_paths = inputs.deep_overflow_paths;
     if d.params
         .iter()
         .any(|p| p.name.to_ascii_lowercase().contains("public_inputs"))
@@ -606,40 +536,44 @@ pub(super) fn render_best_effort_test(
                 moved_on_main_call: !is_ref,
                 needs_mut_binding: t.starts_with("&mut"),
             });
-        } else if {
-            let norm = normalize_param_object_type(t);
-            let avoid_constructor = is_cap_type(&norm)
-                || is_treasury_cap_type(&norm)
-                || is_known_key_struct(&norm, &d.module_name, key_structs_by_module);
-            !avoid_constructor
-        } {
-            let expr = synthesize_value_expr_for_type(t, &d.module_name, fn_lookup, Some(&fq), 0)?;
-            if t.starts_with('&') {
-                let var_name = format!("value_{}", sanitize_ident(&param.name));
-                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
-                arg_setup_lines.push(format!("let {}{} = {};", maybe_mut, var_name, expr));
-                if t.starts_with("&mut") {
-                    args.push(format!("&mut {}", var_name));
-                } else {
-                    args.push(format!("&{}", var_name));
-                }
-            } else {
-                args.push(expr);
-            }
-        } else if t.starts_with('&') {
-            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
-            if obj.is_mut {
-                args.push(format!("&mut {}", obj.var_name));
-            } else {
-                args.push(format!("&{}", obj.var_name));
-            }
-            param_runtime.insert(param.name.clone(), obj.var_name.clone());
-            object_needs.push(obj);
         } else {
-            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
-            args.push(obj.var_name.clone());
-            param_runtime.insert(param.name.clone(), obj.var_name.clone());
-            object_needs.push(obj);
+            let should_try_constructor = {
+                let norm = normalize_param_object_type(t);
+                let avoid_constructor = is_cap_type(&norm)
+                    || is_treasury_cap_type(&norm)
+                    || is_known_key_struct(&norm, &d.module_name, key_structs_by_module);
+                !avoid_constructor
+            };
+            if should_try_constructor {
+                let expr =
+                    synthesize_value_expr_for_type(t, &d.module_name, fn_lookup, Some(&fq), 0)?;
+                if t.starts_with('&') {
+                    let var_name = format!("value_{}", sanitize_ident(&param.name));
+                    let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    arg_setup_lines.push(format!("let {}{} = {};", maybe_mut, var_name, expr));
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var_name));
+                    } else {
+                        args.push(format!("&{}", var_name));
+                    }
+                } else {
+                    args.push(expr);
+                }
+            } else if t.starts_with('&') {
+                let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
+                if obj.is_mut {
+                    args.push(format!("&mut {}", obj.var_name));
+                } else {
+                    args.push(format!("&{}", obj.var_name));
+                }
+                param_runtime.insert(param.name.clone(), obj.var_name.clone());
+                object_needs.push(obj);
+            } else {
+                let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
+                args.push(obj.var_name.clone());
+                param_runtime.insert(param.name.clone(), obj.var_name.clone());
+                object_needs.push(obj);
+            }
         }
     }
     let moved_object_vars_on_main_call: std::collections::HashSet<String> = object_needs
@@ -1061,7 +995,7 @@ pub(super) fn render_best_effort_test(
     };
     let call_expr = format!("{}({})", call_target, args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
-        if should_transfer_call_return(ret_ty, &d.module_name, key_structs_by_module) {
+        if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module) {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
             lines.push("        transfer::public_transfer(tw_ret_obj, SUPER_USER);".to_string());
         } else {

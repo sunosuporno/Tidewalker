@@ -50,7 +50,7 @@ pub fn run_static_analysis(package_path: &Path) -> Result<(), Box<dyn std::error
     for entry in fs::read_dir(&src_root)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().map_or(false, |ext| ext == "move") {
+        if p.extension().is_some_and(|ext| ext == "move") {
             move_files.push(p);
         }
     }
@@ -301,7 +301,7 @@ fn find_cross_module_calls(
             if !before_paren.contains("::") {
                 continue;
             }
-            let candidate = before_paren.trim_end_matches(|c: char| c == '<' || c == '>');
+            let candidate = before_paren.trim_end_matches(['<', '>']);
             // Skip same-module calls we already accounted for.
             if candidate.starts_with(module_short)
                 || candidate.starts_with("Self::")

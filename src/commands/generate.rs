@@ -260,7 +260,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     for entry in fs::read_dir(&src_root)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().map_or(false, |ext| ext == "move") {
+        if p.extension().is_some_and(|ext| ext == "move") {
             move_files.push(p);
         }
     }
@@ -378,25 +378,24 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             .cloned()
             .unwrap_or_else(|| d.container_effects.clone());
         let deep_overflow_paths = deep_overflow_map.get(&key).cloned().unwrap_or_default();
-        if let Some(test_lines) = render::render_best_effort_test(
-            &d,
-            &accessor_map,
-            &option_accessor_map,
-            &container_accessor_map,
-            &helper_catalog,
-            &bootstrap_catalog,
-            &fn_lookup,
-            &key_structs_by_module,
-            &resolved_effects,
-            &resolved_vector_effects,
-            &resolved_coin_effects,
-            &resolved_treasury_cap_effects,
-            &resolved_coin_notes,
-            &resolved_option_effects,
-            &resolved_string_effects,
-            &resolved_container_effects,
-            &deep_overflow_paths,
-        ) {
+        let render_inputs = render::RenderInputs {
+            accessor_map: &accessor_map,
+            option_accessor_map: &option_accessor_map,
+            container_accessor_map: &container_accessor_map,
+            bootstrap_catalog: &bootstrap_catalog,
+            fn_lookup: &fn_lookup,
+            key_structs_by_module: &key_structs_by_module,
+            numeric_effects: &resolved_effects,
+            vector_effects: &resolved_vector_effects,
+            coin_effects: &resolved_coin_effects,
+            treasury_cap_effects: &resolved_treasury_cap_effects,
+            coin_notes: &resolved_coin_notes,
+            option_effects: &resolved_option_effects,
+            string_effects: &resolved_string_effects,
+            container_effects: &resolved_container_effects,
+            deep_overflow_paths: &deep_overflow_paths,
+        };
+        if let Some(test_lines) = render::render_best_effort_test(&d, &render_inputs) {
             for l in test_lines {
                 out.push(format!("    {}", l));
             }
@@ -407,6 +406,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
                 &helper_catalog,
                 &bootstrap_catalog,
                 &fn_lookup,
+                &key_structs_by_module,
             );
             for test in guard_tests {
                 for l in test {
@@ -651,6 +651,80 @@ fn sanitize_ident(s: &str) -> String {
         .collect::<String>()
 }
 
+fn default_id_arg_expr() -> String {
+    "sui::object::id_from_address(OTHER)".to_string()
+}
+
+fn default_u64_arg_for_param(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("ratio") {
+        "101".to_string()
+    } else {
+        "1".to_string()
+    }
+}
+
+fn normalize_helper_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| *c != '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn split_type_module_and_base<'a>(ty: &'a str, default_module: &'a str) -> (&'a str, &'a str) {
+    let clean = ty.trim();
+    let no_ref = clean
+        .strip_prefix("&mut ")
+        .or_else(|| clean.strip_prefix('&'))
+        .unwrap_or(clean);
+    let no_generics = no_ref.split('<').next().unwrap_or(no_ref).trim();
+    if let Some((module, base)) = no_generics.rsplit_once("::") {
+        (module, base.trim())
+    } else {
+        (default_module, no_generics)
+    }
+}
+
+fn is_known_key_struct(
+    ty: &str,
+    default_module: &str,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let (module, base) = split_type_module_and_base(ty, default_module);
+    key_structs_by_module
+        .get(module)
+        .map(|types| types.contains(base))
+        .unwrap_or(false)
+}
+
+fn should_transfer_call_return_basic(ret_ty: &str, _module_name: &str) -> bool {
+    let t = ret_ty.trim();
+    if t.is_empty() || t == "()" || t.starts_with('&') {
+        return false;
+    }
+    if is_numeric_type(t)
+        || t == "bool"
+        || t == "address"
+        || is_string_type(t)
+        || is_option_type(t)
+        || t.starts_with("vector<")
+    {
+        return false;
+    }
+    is_coin_type(t) || is_treasury_cap_type(t)
+}
+
+fn should_transfer_call_return_with_keys(
+    ret_ty: &str,
+    module_name: &str,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    if should_transfer_call_return_basic(ret_ty, module_name) {
+        return true;
+    }
+    is_known_key_struct(ret_ty, module_name, key_structs_by_module)
+}
+
 fn is_numeric_type(ty: &str) -> bool {
     matches!(ty.trim(), "u8" | "u16" | "u32" | "u64" | "u128" | "u256")
 }
@@ -689,26 +763,9 @@ fn has_unbound_type_params(d: &FnDecl) -> bool {
     if d.type_params.is_empty() {
         return false;
     }
-    for tp in &d.type_params {
-        let mut seen = false;
-        for p in &d.params {
-            if type_mentions_param(&p.ty, tp) {
-                seen = true;
-                break;
-            }
-        }
-        if !seen {
-            if let Some(ret) = &d.return_ty {
-                if type_mentions_param(ret, tp) {
-                    seen = true;
-                }
-            }
-        }
-        if !seen {
-            return true;
-        }
-    }
-    false
+    d.type_params
+        .iter()
+        .any(|tp| !d.params.iter().any(|p| type_mentions_param(&p.ty, tp)))
 }
 
 fn default_type_args_for_params(type_params: &[String]) -> Vec<String> {

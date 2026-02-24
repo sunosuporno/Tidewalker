@@ -318,7 +318,7 @@ fn parse_module_bootstrap_info(content: &str) -> ModuleBootstrapCatalog {
     out
 }
 
-fn find_init_header_and_body<'a>(lines: &[&'a str]) -> Option<(String, Vec<String>)> {
+fn find_init_header_and_body(lines: &[&str]) -> Option<(String, Vec<String>)> {
     let mut i = 0usize;
     while i < lines.len() {
         let t = lines[i].trim();
@@ -400,7 +400,6 @@ fn parse_init_struct_binding(stmt: &str) -> Option<(String, String)> {
         return None;
     }
     let ty = rhs
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("")

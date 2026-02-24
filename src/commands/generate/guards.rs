@@ -80,40 +80,19 @@ struct GuardHelperCallPlan {
     type_args: Vec<String>,
 }
 
-fn default_u64_arg_for_param(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("ratio") {
-        "101".to_string()
-    } else {
-        "1".to_string()
-    }
-}
+type GuardCallPlan = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+);
 
-fn normalize_helper_key(key: &str) -> String {
-    key.chars()
-        .filter(|c| *c != '_')
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-fn should_transfer_call_return(ret_ty: &str, module_name: &str) -> bool {
-    let t = ret_ty.trim();
-    if t.is_empty() || t == "()" || t.starts_with('&') {
-        return false;
-    }
-    if is_numeric_type(t)
-        || t == "bool"
-        || t == "address"
-        || is_string_type(t)
-        || is_option_type(t)
-        || t.starts_with("vector<")
-    {
-        return false;
-    }
-    if is_coin_type(t) || is_treasury_cap_type(t) {
-        return true;
-    }
-    !t.contains("::") || t.starts_with(&format!("{}::", module_name))
+struct GuardEnv<'a> {
+    helper_catalog: &'a std::collections::HashMap<String, ModuleHelperCatalog>,
+    bootstrap_catalog: &'a std::collections::HashMap<String, ModuleBootstrapCatalog>,
+    fn_lookup: &'a std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 fn module_fn_label(d: &FnDecl) -> String {
@@ -837,18 +816,7 @@ fn pick_guard_owned_test_helper_for_type(
     best.map(|(_, plan)| plan)
 }
 
-fn build_common_call_plan(
-    d: &FnDecl,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
-) -> Option<(
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-)> {
+fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPlan> {
     let mut lines_before_tx = Vec::new();
     let mut call_args = Vec::new();
     let mut cleanup = Vec::new();
@@ -862,12 +830,16 @@ fn build_common_call_plan(
     let mut coin_needs: Vec<GuardCoinNeed> = Vec::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
     let empty_helpers = ModuleHelperCatalog::default();
-    let module_helpers = helper_catalog.get(&d.module_name).unwrap_or(&empty_helpers);
+    let module_helpers = env
+        .helper_catalog
+        .get(&d.module_name)
+        .unwrap_or(&empty_helpers);
     let empty_bootstrap = ModuleBootstrapCatalog::default();
-    let module_bootstrap = bootstrap_catalog
+    let module_bootstrap = env
+        .bootstrap_catalog
         .get(&d.module_name)
         .unwrap_or(&empty_bootstrap);
-    let module_fns = fn_lookup.get(&d.module_name);
+    let module_fns = env.fn_lookup.get(&d.module_name);
     let module_fn_fq = module_fn_label(d);
 
     for param in &d.params {
@@ -889,7 +861,7 @@ fn build_common_call_plan(
             call_args.push("false".to_string());
             param_arg_values.insert(param.name.clone(), "false".to_string());
         } else if is_id_type(t) {
-            let v = "sui::object::id_from_address(OTHER)".to_string();
+            let v = default_id_arg_expr();
             call_args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if is_option_type(t) {
@@ -926,61 +898,64 @@ fn build_common_call_plan(
                 moved_on_call: !is_ref,
                 needs_mut_binding: t.starts_with("&mut"),
             });
-        } else if {
-            let norm = normalize_param_object_type(t);
-            let type_key = type_key_from_type_name(&norm);
-            let has_local_factory_for_type = module_fns
-                .map(|fns| {
-                    fns.values().any(|f| {
-                        f.return_ty
-                            .as_ref()
-                            .map(|r| type_key_from_type_name(r) == type_key)
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            let avoid_constructor = is_cap_type(&norm)
-                || is_treasury_cap_type(&norm)
-                || module_helpers.shared_types.contains(&type_key)
-                || module_helpers.owned_types.contains(&type_key)
-                || module_bootstrap.init_shared_types.contains(&type_key)
-                || module_bootstrap.init_owned_types.contains(&type_key)
-                || has_local_factory_for_type;
-            !avoid_constructor
-        } {
-            let expr = synthesize_value_expr_for_type(
-                t,
-                &d.module_name,
-                fn_lookup,
-                Some(&module_fn_fq),
-                0,
-            )?;
-            if t.starts_with('&') {
-                let var_name = format!("value_{}", sanitize_ident(&param.name));
-                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
-                lines_before_tx.push(format!("let {}{} = {};", maybe_mut, var_name, expr));
-                if t.starts_with("&mut") {
-                    call_args.push(format!("&mut {}", var_name));
-                } else {
-                    call_args.push(format!("&{}", var_name));
-                }
-            } else {
-                call_args.push(expr);
-            }
-        } else if t.starts_with('&') {
-            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
-            if obj.is_mut {
-                call_args.push(format!("&mut {}", obj.var_name));
-            } else {
-                call_args.push(format!("&{}", obj.var_name));
-            }
-            param_runtime.insert(param.name.clone(), obj.var_name.clone());
-            object_needs.push(obj);
         } else {
-            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
-            call_args.push(obj.var_name.clone());
-            param_runtime.insert(param.name.clone(), obj.var_name.clone());
-            object_needs.push(obj);
+            let should_try_constructor = {
+                let norm = normalize_param_object_type(t);
+                let type_key = type_key_from_type_name(&norm);
+                let has_local_factory_for_type = module_fns
+                    .map(|fns| {
+                        fns.values().any(|f| {
+                            f.return_ty
+                                .as_ref()
+                                .map(|r| type_key_from_type_name(r) == type_key)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                let avoid_constructor = is_cap_type(&norm)
+                    || is_treasury_cap_type(&norm)
+                    || module_helpers.shared_types.contains(&type_key)
+                    || module_helpers.owned_types.contains(&type_key)
+                    || module_bootstrap.init_shared_types.contains(&type_key)
+                    || module_bootstrap.init_owned_types.contains(&type_key)
+                    || has_local_factory_for_type;
+                !avoid_constructor
+            };
+            if should_try_constructor {
+                let expr = synthesize_value_expr_for_type(
+                    t,
+                    &d.module_name,
+                    env.fn_lookup,
+                    Some(&module_fn_fq),
+                    0,
+                )?;
+                if t.starts_with('&') {
+                    let var_name = format!("value_{}", sanitize_ident(&param.name));
+                    let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    lines_before_tx.push(format!("let {}{} = {};", maybe_mut, var_name, expr));
+                    if t.starts_with("&mut") {
+                        call_args.push(format!("&mut {}", var_name));
+                    } else {
+                        call_args.push(format!("&{}", var_name));
+                    }
+                } else {
+                    call_args.push(expr);
+                }
+            } else if t.starts_with('&') {
+                let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
+                if obj.is_mut {
+                    call_args.push(format!("&mut {}", obj.var_name));
+                } else {
+                    call_args.push(format!("&{}", obj.var_name));
+                }
+                param_runtime.insert(param.name.clone(), obj.var_name.clone());
+                object_needs.push(obj);
+            } else {
+                let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
+                call_args.push(obj.var_name.clone());
+                param_runtime.insert(param.name.clone(), obj.var_name.clone());
+                object_needs.push(obj);
+            }
         }
     }
     let moved_object_vars_on_call: std::collections::HashSet<String> = object_needs
@@ -1002,7 +977,7 @@ fn build_common_call_plan(
         std::collections::BTreeSet::new();
     for obj in &object_needs {
         let owned_helper_plan = module_fns.and_then(|fns| {
-            pick_guard_owned_test_helper_for_type(d, &obj.type_key, fns, fn_lookup)
+            pick_guard_owned_test_helper_for_type(d, &obj.type_key, fns, env.fn_lookup)
         });
         if obj.is_ref && module_helpers.shared_types.contains(&obj.type_key) {
             shared_objects.push(obj.clone());
@@ -1035,7 +1010,7 @@ fn build_common_call_plan(
             owned_objects.push(obj.clone());
             object_sources.insert(obj.var_name.clone(), GuardObjectProvisionSource::OwnedInit);
         } else if let Some((factory_fn, factory_args)) = module_fns
-            .and_then(|fns| pick_guard_factory_call_for_type(d, &obj.type_key, fns, fn_lookup))
+            .and_then(|fns| pick_guard_factory_call_for_type(d, &obj.type_key, fns, env.fn_lookup))
         {
             owned_objects.push(obj.clone());
             object_sources.insert(
@@ -1045,8 +1020,8 @@ fn build_common_call_plan(
             factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
         } else {
             if shared_creator_plan.is_none() {
-                shared_creator_plan =
-                    module_fns.and_then(|fns| pick_guard_shared_creator_plan(d, fns, fn_lookup));
+                shared_creator_plan = module_fns
+                    .and_then(|fns| pick_guard_shared_creator_plan(d, fns, env.fn_lookup));
             }
             if obj.is_ref && shared_creator_plan.is_some() {
                 if obj.type_key.contains("cap") {
@@ -1338,9 +1313,7 @@ fn render_cap_role_guard_test(
         "        let missing_cap = test_scenario::take_from_sender<{}>(&scenario);",
         qualify_type_for_module(&d.module_name, cap_type)
     ));
-    lines.push(format!(
-        "        test_scenario::return_to_sender(&scenario, missing_cap);"
-    ));
+    lines.push("        test_scenario::return_to_sender(&scenario, missing_cap);".to_string());
     lines.push(format!(
         "        // expected to fail before this line because OTHER should not own {}",
         qualify_type_for_module(&d.module_name, cap_type)
@@ -1353,27 +1326,31 @@ fn render_cap_role_guard_test(
 
 fn render_param_guard_test(
     d: &FnDecl,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     target_param: &str,
     prep_lines: &[String],
     bad_expr: &str,
 ) -> Option<Vec<String>> {
     let (setup_lines, mut call_args, cleanup, _param_runtime, _param_arg_values) =
-        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+        build_common_call_plan(d, env)?;
     let param_idx = d.params.iter().position(|p| p.name == target_param)?;
     call_args[param_idx] = bad_expr.to_string();
 
-    render_guard_call_test(d, case_idx, &setup_lines, prep_lines, &call_args, &cleanup)
+    render_guard_call_test(
+        d,
+        env,
+        case_idx,
+        &setup_lines,
+        prep_lines,
+        &call_args,
+        &cleanup,
+    )
 }
 
 fn render_coin_value_guard_test(
     d: &FnDecl,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     coin_param: &str,
     op: &str,
@@ -1382,7 +1359,7 @@ fn render_coin_value_guard_test(
     let bad_amount = violating_const_arg(op, rhs_literal)?;
     let _ = parse_numeric_literal(&bad_amount)?;
     let (mut setup_lines, mut call_args, mut cleanup, _param_runtime, _param_arg_values) =
-        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+        build_common_call_plan(d, env)?;
     let param_idx = d.params.iter().position(|p| p.name == coin_param)?;
     let param_ty = d.params.get(param_idx)?.ty.trim();
     if !is_coin_type(param_ty) {
@@ -1417,11 +1394,12 @@ fn render_coin_value_guard_test(
             bad_coin_var
         ));
     }
-    render_guard_call_test(d, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+    render_guard_call_test(d, env, case_idx, &setup_lines, &prep, &call_args, &cleanup)
 }
 
 fn render_guard_call_test(
     d: &FnDecl,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     setup_lines: &[String],
     prep_lines: &[String],
@@ -1461,7 +1439,8 @@ fn render_guard_call_test(
     };
     let call_expr = format!("{}({})", call_target, call_args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
-        if should_transfer_call_return(ret_ty, &d.module_name) {
+        if should_transfer_call_return_with_keys(ret_ty, &d.module_name, env.key_structs_by_module)
+        {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
             lines.push("        transfer::public_transfer(tw_ret_obj, SUPER_USER);".to_string());
         } else {
@@ -1562,9 +1541,7 @@ fn literal_compare(lhs: &str, op: &str, rhs: &str) -> Option<bool> {
 
 fn render_object_field_const_guard_test(
     d: &FnDecl,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     param_name: &str,
     field_name: &str,
@@ -1572,24 +1549,22 @@ fn render_object_field_const_guard_test(
     rhs_literal: &str,
 ) -> Option<Vec<String>> {
     let (setup_lines, call_args, cleanup, _param_runtime, _param_arg_values) =
-        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+        build_common_call_plan(d, env)?;
     let param = d.params.iter().find(|p| p.name == param_name)?;
     let type_name = normalize_param_object_type(&param.ty);
     let type_key = type_key_from_type_name(&type_name);
-    let module_fns = fn_lookup.get(&d.module_name)?;
+    let module_fns = env.fn_lookup.get(&d.module_name)?;
     let helper_default = lookup_helper_field_literal(module_fns, &type_key, field_name)?;
     let guard_holds = literal_compare(&helper_default, op, rhs_literal)?;
     if guard_holds {
         return None;
     }
-    render_guard_call_test(d, case_idx, &setup_lines, &[], &call_args, &cleanup)
+    render_guard_call_test(d, env, case_idx, &setup_lines, &[], &call_args, &cleanup)
 }
 
 fn render_object_field_sender_guard_test(
     d: &FnDecl,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     param_name: &str,
     _field_name: &str,
@@ -1601,7 +1576,7 @@ fn render_object_field_sender_guard_test(
         return None;
     }
     let (mut setup_lines, call_args, cleanup, param_runtime, _param_arg_values) =
-        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+        build_common_call_plan(d, env)?;
     let target_param = d.params.iter().find(|p| p.name == param_name)?;
     let runtime_obj = param_runtime.get(param_name)?.clone();
     let target_ty = qualify_type_for_module(
@@ -1667,23 +1642,20 @@ fn render_object_field_sender_guard_test(
         ));
     }
 
-    render_guard_call_test(d, case_idx, &setup_lines, &[], &call_args, &cleanup)
+    render_guard_call_test(d, env, case_idx, &setup_lines, &[], &call_args, &cleanup)
 }
 
 fn render_param_object_field_guard_test(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
-    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
-    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
-    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    env: &GuardEnv<'_>,
     case_idx: usize,
     param_name: &str,
     object_param: &str,
     field_name: &str,
     op: &str,
 ) -> Option<Vec<String>> {
-    let (_, _, _, param_runtime, _) =
-        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+    let (_, _, _, param_runtime, _) = build_common_call_plan(d, env)?;
     let runtime_obj = param_runtime.get(object_param)?;
     let getter_fn =
         pick_numeric_accessor_for_object_field(d, accessor_map, object_param, field_name)?;
@@ -1693,16 +1665,7 @@ fn render_param_object_field_guard_test(
         bound_var, d.module_name, getter_fn, runtime_obj
     )];
     let bad_expr = violating_getter_arg(op, &bound_var)?;
-    render_param_guard_test(
-        d,
-        helper_catalog,
-        bootstrap_catalog,
-        fn_lookup,
-        case_idx,
-        param_name,
-        &prep,
-        &bad_expr,
-    )
+    render_param_guard_test(d, env, case_idx, param_name, &prep, &bad_expr)
 }
 
 pub(super) fn render_guard_tests_for_function(
@@ -1711,9 +1674,16 @@ pub(super) fn render_guard_tests_for_function(
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> (Vec<Vec<String>>, Vec<String>) {
     let mut tests = Vec::new();
     let mut notes = Vec::new();
+    let env = GuardEnv {
+        helper_catalog,
+        bootstrap_catalog,
+        fn_lookup,
+        key_structs_by_module,
+    };
 
     let (cases, parse_notes) = parse_assert_guard_cases(d, accessor_map);
     notes.extend(parse_notes);
@@ -1755,16 +1725,9 @@ pub(super) fn render_guard_tests_for_function(
                     ));
                     continue;
                 };
-                if let Some(lines) = render_param_guard_test(
-                    d,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
-                    idx,
-                    param_name,
-                    &[],
-                    &bad_expr,
-                ) {
+                if let Some(lines) =
+                    render_param_guard_test(d, &env, idx, param_name, &[], &bad_expr)
+                {
                     tests.push(lines);
                 } else {
                     notes.push(format!(
@@ -1780,9 +1743,7 @@ pub(super) fn render_guard_tests_for_function(
                 getter_fn,
                 getter_param,
             } => {
-                let Some((_, _, _, param_runtime, _)) =
-                    build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)
-                else {
+                let Some((_, _, _, param_runtime, _)) = build_common_call_plan(d, &env) else {
                     notes.push(format!(
                         "{}: could not synthesize getter-bound failure test ({})",
                         module_fn_label(d),
@@ -1814,16 +1775,9 @@ pub(super) fn render_guard_tests_for_function(
                     ));
                     continue;
                 };
-                if let Some(lines) = render_param_guard_test(
-                    d,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
-                    idx,
-                    param_name,
-                    &prep,
-                    &bad_expr,
-                ) {
+                if let Some(lines) =
+                    render_param_guard_test(d, &env, idx, param_name, &prep, &bad_expr)
+                {
                     tests.push(lines);
                 } else {
                     notes.push(format!(
@@ -1841,9 +1795,7 @@ pub(super) fn render_guard_tests_for_function(
             } => {
                 if let Some(lines) = render_object_field_const_guard_test(
                     d,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
+                    &env,
                     idx,
                     param_name,
                     field_name,
@@ -1864,16 +1816,9 @@ pub(super) fn render_guard_tests_for_function(
                 field_name,
                 op,
             } => {
-                if let Some(lines) = render_object_field_sender_guard_test(
-                    d,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
-                    idx,
-                    param_name,
-                    field_name,
-                    op,
-                ) {
+                if let Some(lines) =
+                    render_object_field_sender_guard_test(d, &env, idx, param_name, field_name, op)
+                {
                     tests.push(lines);
                 } else {
                     notes.push(format!(
@@ -1892,9 +1837,7 @@ pub(super) fn render_guard_tests_for_function(
                 if let Some(lines) = render_param_object_field_guard_test(
                     d,
                     accessor_map,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
+                    &env,
                     idx,
                     param_name,
                     object_param,
@@ -1915,16 +1858,9 @@ pub(super) fn render_guard_tests_for_function(
                 op,
                 rhs_literal,
             } => {
-                if let Some(lines) = render_coin_value_guard_test(
-                    d,
-                    helper_catalog,
-                    bootstrap_catalog,
-                    fn_lookup,
-                    idx,
-                    coin_param,
-                    op,
-                    rhs_literal,
-                ) {
+                if let Some(lines) =
+                    render_coin_value_guard_test(d, &env, idx, coin_param, op, rhs_literal)
+                {
                     tests.push(lines);
                 } else {
                     notes.push(format!(

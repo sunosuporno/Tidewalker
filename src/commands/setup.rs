@@ -192,7 +192,7 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
     for entry in fs::read_dir(&src_root)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().map_or(false, |ext| ext == "move") {
+        if p.extension().is_some_and(|ext| ext == "move") {
             move_files.push(p);
         }
     }
@@ -551,40 +551,35 @@ fn find_all_function_bodies<'a>(lines: &'a [&'a str]) -> Vec<(String, Vec<&'a st
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
-        let (is_fun, name) = if t.starts_with("public entry fun ") {
-            let after = &t["public entry fun ".len()..];
+        let (is_fun, name) = if let Some(after) = t.strip_prefix("public entry fun ") {
             let name = after
                 .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                 .next()
                 .unwrap_or("")
                 .to_string();
             (true, name)
-        } else if t.starts_with("entry fun ") {
-            let after = &t["entry fun ".len()..];
+        } else if let Some(after) = t.strip_prefix("entry fun ") {
             let name = after
                 .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                 .next()
                 .unwrap_or("")
                 .to_string();
             (true, name)
-        } else if t.starts_with("public fun ") {
-            let after = &t["public fun ".len()..];
+        } else if let Some(after) = t.strip_prefix("public fun ") {
             let name = after
                 .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                 .next()
                 .unwrap_or("")
                 .to_string();
             (true, name)
-        } else if t.starts_with("public(package) fun ") {
-            let after = &t["public(package) fun ".len()..];
+        } else if let Some(after) = t.strip_prefix("public(package) fun ") {
             let name = after
                 .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                 .next()
                 .unwrap_or("")
                 .to_string();
             (true, name)
-        } else if t.starts_with("fun ") {
-            let after = &t["fun ".len()..];
+        } else if let Some(after) = t.strip_prefix("fun ") {
             let name = after
                 .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
                 .next()
@@ -852,7 +847,7 @@ fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
     let after = t.find(prefix).map(|i| &t[i + prefix.len()..])?;
     let arg = after
         .trim_start()
-        .split(|c: char| c == ',' || c == ')')
+        .split([',', ')'])
         .next()?
         .trim()
         .trim_end_matches(')');
