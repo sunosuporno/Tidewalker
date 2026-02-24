@@ -108,6 +108,15 @@ struct GuardFactoryArgPlan {
     cleanup_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GuardFactoryCallPlan {
+    fn_name: String,
+    type_args: Vec<String>,
+    args: Vec<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
+}
+
 type GuardCallPlan = (
     Vec<String>,
     Vec<String>,
@@ -301,6 +310,89 @@ fn parse_object_field_led_comparison(
         }
     }
     None
+}
+
+fn split_top_level_and_terms(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let chars = expr.char_indices().collect::<Vec<_>>();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            '&' if paren == 0 && bracket == 0 && brace == 0 => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '&' {
+                    let part = expr[start..idx].trim();
+                    if !part.is_empty() {
+                        out.push(part.to_string());
+                    }
+                    start = chars[i + 1].0 + 1;
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = expr[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    if out.is_empty() {
+        vec![expr.trim().to_string()]
+    } else {
+        out
+    }
+}
+
+fn parse_negated_object_field_expr(
+    expr: &str,
+    param_names: &[String],
+) -> Option<(String, String)> {
+    let mut s = expr.trim();
+    while s.starts_with('(') && s.ends_with(')') && s.len() > 2 {
+        s = s[1..s.len() - 1].trim();
+    }
+    if !s.starts_with('!') {
+        return None;
+    }
+    let mut inner = s[1..].trim();
+    while inner.starts_with('(') && inner.ends_with(')') && inner.len() > 2 {
+        inner = inner[1..inner.len() - 1].trim();
+    }
+    let norm = remove_whitespace(inner);
+    parse_direct_object_field_side(&norm, param_names)
+}
+
+fn parse_negated_param_expr(expr: &str, param_names: &[String]) -> Option<String> {
+    let mut s = expr.trim();
+    while s.starts_with('(') && s.ends_with(')') && s.len() > 2 {
+        s = s[1..s.len() - 1].trim();
+    }
+    if !s.starts_with('!') {
+        return None;
+    }
+    let mut inner = s[1..].trim();
+    while inner.starts_with('(') && inner.ends_with(')') && inner.len() > 2 {
+        inner = inner[1..inner.len() - 1].trim();
+    }
+    let ident = remove_whitespace(inner);
+    if !is_ident(&ident) {
+        return None;
+    }
+    if !param_names.iter().any(|p| p == &ident) {
+        return None;
+    }
+    Some(ident)
 }
 
 fn parse_direct_object_field_side(expr: &str, param_names: &[String]) -> Option<(String, String)> {
@@ -791,6 +883,71 @@ fn parse_assert_guard_cases(
             None => continue,
         };
         let resolved_cond = resolve_condition_aliases(&cond, &local_aliases);
+        if let Some((base, field)) = parse_negated_object_field_expr(&resolved_cond, &param_names) {
+            out.push(GuardCase {
+                kind: GuardKind::ObjectFieldConst {
+                    param_name: base,
+                    field_name: field,
+                    op: "==".to_string(),
+                    rhs_literal: "false".to_string(),
+                },
+                source: format!("{}: {}", fq, cond),
+            });
+            continue;
+        }
+        if let Some(param_name) = parse_negated_param_expr(&resolved_cond, &param_names) {
+            out.push(GuardCase {
+                kind: GuardKind::ParamConst {
+                    param_name,
+                    op: "==".to_string(),
+                    rhs_literal: "false".to_string(),
+                },
+                source: format!("{}: {}", fq, cond),
+            });
+            continue;
+        }
+        let and_terms = split_top_level_and_terms(&resolved_cond);
+        if and_terms.len() > 1 && !resolved_cond.contains("||") {
+            let mut parsed_all = true;
+            for term in &and_terms {
+                if let Some((param_side, term_op, other_side, flipped)) =
+                    parse_param_led_comparison(term, &param_names)
+                {
+                    let op = if flipped {
+                        reverse_comparison_op(&term_op)
+                    } else {
+                        term_op
+                    };
+                    if let Some(lit) = parse_numeric_literal(&other_side) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ParamConst {
+                                param_name: param_side,
+                                op,
+                                rhs_literal: lit,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    if is_bool_literal(&other_side) || is_address_literal(&other_side) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ParamConst {
+                                param_name: param_side,
+                                op,
+                                rhs_literal: other_side,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                }
+                parsed_all = false;
+                break;
+            }
+            if parsed_all {
+                continue;
+            }
+        }
         if let Some((lhs, op_raw, rhs)) = parse_ast_comparison(&resolved_cond) {
             let lhs_param = expr_ast::as_ident(&lhs).filter(|name| {
                 d.params
@@ -1064,6 +1221,15 @@ fn numeric_minus_one(v: &str) -> Option<String> {
     }
 }
 
+fn default_u64_guard_arg_for_param(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("ratio") {
+        "50".to_string()
+    } else {
+        "1".to_string()
+    }
+}
+
 fn violating_const_arg(op: &str, rhs_literal: &str) -> Option<String> {
     if let Some(n) = parse_numeric_literal(rhs_literal) {
         match op {
@@ -1150,7 +1316,7 @@ fn synthesize_guard_factory_args(
         } else if is_vector_type(t) && !t.starts_with('&') {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
-            args.push(default_u64_arg_for_param(&p.name));
+            args.push(default_u64_guard_arg_for_param(&p.name));
         } else if is_numeric_type(t) {
             args.push("1".to_string());
         } else if t == "bool" {
@@ -1237,33 +1403,49 @@ fn synthesize_guard_factory_args_with_refs(
         }
         if t.starts_with('&') {
             let inner_ty = normalize_param_object_type(t);
-            let expr = synthesize_value_expr_for_type(
-                &inner_ty,
-                &factory.module_name,
-                fn_lookup,
-                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
-                0,
-            )?;
             let var = format!("guard_factory_ref_{}_{}", idx, sanitize_ident(&p.name));
-            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
-            prep_lines.push(format!("let {}{} = {};", maybe_mut, var, expr));
-            if t.starts_with("&mut") {
-                args.push(format!("&mut {}", var));
-            } else {
-                args.push(format!("&{}", var));
-            }
-            if should_transfer_call_return_with_keys(
-                &inner_ty,
-                &factory.module_name,
-                key_structs_by_module,
-            ) {
-                cleanup_lines.push(cleanup_stmt_for_type(
-                    &factory.module_name,
-                    &inner_ty,
-                    &var,
-                    fn_lookup,
-                    key_structs_by_module,
+            if is_known_key_struct(&inner_ty, &factory.module_name, key_structs_by_module) {
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                prep_lines.push(format!(
+                    "let {}{} = scenario.take_shared<{}>();",
+                    maybe_mut,
+                    var,
+                    qualify_type_for_module(&factory.module_name, &inner_ty)
                 ));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", var));
+                } else {
+                    args.push(format!("&{}", var));
+                }
+                cleanup_lines.push(format!("test_scenario::return_shared({});", var));
+            } else {
+                let expr = synthesize_value_expr_for_type(
+                    &inner_ty,
+                    &factory.module_name,
+                    fn_lookup,
+                    Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                    0,
+                )?;
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                prep_lines.push(format!("let {}{} = {};", maybe_mut, var, expr));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", var));
+                } else {
+                    args.push(format!("&{}", var));
+                }
+                if should_transfer_call_return_with_keys(
+                    &inner_ty,
+                    &factory.module_name,
+                    key_structs_by_module,
+                ) {
+                    cleanup_lines.push(cleanup_stmt_for_type(
+                        &factory.module_name,
+                        &inner_ty,
+                        &var,
+                        fn_lookup,
+                        key_structs_by_module,
+                    ));
+                }
             }
             continue;
         }
@@ -1271,7 +1453,7 @@ fn synthesize_guard_factory_args_with_refs(
         if is_vector_type(t) {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
-            args.push(default_u64_arg_for_param(&p.name));
+            args.push(default_u64_guard_arg_for_param(&p.name));
         } else if is_numeric_type(t) {
             args.push("1".to_string());
         } else if t == "bool" {
@@ -1306,8 +1488,9 @@ fn pick_guard_factory_call_for_type(
     type_key: &str,
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
-) -> Option<(String, Vec<String>)> {
-    let mut best: Option<(usize, String, Vec<String>)> = None;
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<GuardFactoryCallPlan> {
+    let mut best: Option<(usize, GuardFactoryCallPlan)> = None;
     for f in module_fns.values() {
         if f.is_test_only {
             continue;
@@ -1325,16 +1508,30 @@ fn pick_guard_factory_call_for_type(
         if type_key_from_type_name(ret) != type_key {
             continue;
         }
-        let Some(args) = synthesize_guard_factory_args(f, fn_lookup) else {
+        let Some(arg_plan) =
+            synthesize_guard_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        else {
             continue;
         };
+        let type_args = if has_unbound_type_params(f) {
+            default_type_args_for_params(&f.type_params)
+        } else {
+            Vec::new()
+        };
+        let plan = GuardFactoryCallPlan {
+            fn_name: f.fn_name.clone(),
+            type_args,
+            args: arg_plan.args,
+            prep_lines: arg_plan.prep_lines,
+            cleanup_lines: arg_plan.cleanup_lines,
+        };
         let score = f.params.len();
-        let candidate = (score, f.fn_name.clone(), args);
+        let candidate = (score, plan);
         if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, name, args)| (name, args))
+    best.map(|(_, plan)| plan)
 }
 
 fn pick_guard_shared_creator_plan(
@@ -1510,7 +1707,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             call_args.push("OTHER".to_string());
             param_arg_values.insert(param.name.clone(), "OTHER".to_string());
         } else if t == "u64" {
-            let v = default_u64_arg_for_param(&param.name);
+            let v = default_u64_guard_arg_for_param(&param.name);
             call_args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if is_numeric_type(t) {
@@ -1627,7 +1824,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
     let mut owned_objects: Vec<ObjectNeed> = Vec::new();
     let mut object_sources: std::collections::HashMap<String, GuardObjectProvisionSource> =
         std::collections::HashMap::new();
-    let mut factory_calls: std::collections::HashMap<String, (String, Vec<String>)> =
+    let mut factory_calls: std::collections::HashMap<String, GuardFactoryCallPlan> =
         std::collections::HashMap::new();
     let mut owned_helper_calls: std::collections::HashMap<String, GuardHelperCallPlan> =
         std::collections::HashMap::new();
@@ -1697,15 +1894,22 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             } else {
                 return None;
             }
-        } else if let Some((factory_fn, factory_args)) = module_fns
-            .and_then(|fns| pick_guard_factory_call_for_type(d, &obj.type_key, fns, env.fn_lookup))
+        } else if let Some(factory_plan) = module_fns.and_then(|fns| {
+            pick_guard_factory_call_for_type(
+                d,
+                &obj.type_key,
+                fns,
+                env.fn_lookup,
+                env.key_structs_by_module,
+            )
+        })
         {
             owned_objects.push(obj.clone());
             object_sources.insert(
                 obj.var_name.clone(),
                 GuardObjectProvisionSource::OwnedFactory,
             );
-            factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
+            factory_calls.insert(obj.var_name.clone(), factory_plan);
         } else {
             if shared_creator_plan.is_none() {
                 shared_creator_plan = module_fns.and_then(|fns| {
@@ -1886,15 +2090,30 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                 ));
             }
             Some(GuardObjectProvisionSource::OwnedFactory) => {
-                let (factory_fn, factory_args) = factory_calls.get(&obj.var_name)?;
+                let plan = factory_calls.get(&obj.var_name)?;
+                for prep in &plan.prep_lines {
+                    lines_before_tx.push(prep.clone());
+                }
+                let call_path = if plan.type_args.is_empty() {
+                    format!("{}::{}", d.module_name, plan.fn_name)
+                } else {
+                    format!(
+                        "{}::{}<{}>",
+                        d.module_name,
+                        plan.fn_name,
+                        plan.type_args.join(", ")
+                    )
+                };
                 lines_before_tx.push(format!(
-                    "let {}{} = {}::{}({});",
+                    "let {}{} = {}({});",
                     maybe_mut,
                     obj.var_name,
-                    d.module_name,
-                    factory_fn,
-                    factory_args.join(", ")
+                    call_path,
+                    plan.args.join(", ")
                 ));
+                for cleanup_line in &plan.cleanup_lines {
+                    lines_before_tx.push(cleanup_line.clone());
+                }
             }
             Some(GuardObjectProvisionSource::OwnedCreatorSender) => {
                 lines_before_tx.push(format!(
@@ -2392,6 +2611,14 @@ fn render_object_field_sender_guard_test(
             continue;
         }
         if let Some(var) = param_runtime.get(&p.name) {
+            let shared_binding = setup_lines.iter().any(|l| {
+                l.contains("scenario.take_shared<")
+                    && (l.contains(&format!("let {} = ", var))
+                        || l.contains(&format!("let mut {} = ", var)))
+            });
+            if shared_binding {
+                continue;
+            }
             move_vars.push((
                 var.clone(),
                 qualify_type_for_module(&d.module_name, &normalize_param_object_type(t)),

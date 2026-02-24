@@ -36,6 +36,16 @@ struct FactoryArgPlan {
     cleanup_lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct FactoryCallPlan {
+    fn_name: String,
+    type_args: Vec<String>,
+    args: Vec<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
+    shared_ref_deps: Vec<(String, bool)>,
+}
+
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
 }
@@ -187,6 +197,282 @@ fn has_clock_ge_guard(body_lines: &[String]) -> bool {
         }
     }
     false
+}
+
+fn detect_index_of_guard_pattern(d: &FnDecl) -> Option<(String, String, String)> {
+    let mut candidates: Vec<(String, String, String, String)> = Vec::new();
+    for line in &d.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if !stmt.starts_with("let ") || !stmt.contains(".index_of(&") {
+            continue;
+        }
+        let Some((lhs_raw, rhs_raw)) = stmt.trim_end_matches(';').split_once('=') else {
+            continue;
+        };
+        let lhs = lhs_raw.trim().trim_start_matches("let").trim();
+        if !(lhs.starts_with('(') && lhs.contains(')')) {
+            continue;
+        }
+        let tuple_inner = lhs.trim_start_matches('(').split(')').next().unwrap_or("");
+        let bool_var = tuple_inner
+            .split(',')
+            .next()
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if !is_ident(bool_var) {
+            continue;
+        }
+        let rhs = remove_whitespace(rhs_raw);
+        let marker = ".index_of(&";
+        let Some(idx) = rhs.find(marker) else {
+            continue;
+        };
+        let base = rhs[..idx].trim();
+        let arg_start = idx + marker.len();
+        let Some(arg_end_rel) = rhs[arg_start..].find(')') else {
+            continue;
+        };
+        let value_var = rhs[arg_start..arg_start + arg_end_rel].trim();
+        let Some((obj_param, field)) = base.split_once('.') else {
+            continue;
+        };
+        if !is_ident(obj_param) || !is_ident(field) || !is_ident(value_var) {
+            continue;
+        }
+        candidates.push((
+            bool_var.to_string(),
+            obj_param.to_string(),
+            field.to_string(),
+            value_var.to_string(),
+        ));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    let assert_conds = d
+        .body_lines
+        .iter()
+        .filter_map(|line| {
+            let stmt = line.split("//").next().unwrap_or("").trim();
+            extract_assert_condition_local(stmt).map(|c| remove_whitespace(&c))
+        })
+        .collect::<Vec<_>>();
+    for (bool_var, obj_param, field, value_var) in &candidates {
+        let direct = bool_var.clone();
+        let wrapped = format!("({})", bool_var);
+        if assert_conds
+            .iter()
+            .any(|c| c == &direct || c == &wrapped || c.starts_with(&format!("{}&&", direct)))
+        {
+            return Some((obj_param.clone(), field.clone(), value_var.clone()));
+        }
+    }
+    candidates
+        .first()
+        .map(|(_, obj_param, field, value_var)| (obj_param.clone(), field.clone(), value_var.clone()))
+}
+
+fn find_seed_function_for_index_of_pattern<'a>(
+    d: &FnDecl,
+    module_fns: &'a std::collections::HashMap<String, FnDecl>,
+    object_param: &str,
+    field: &str,
+    value_param: &str,
+) -> Option<(&'a FnDecl, String)> {
+    let target_obj_ty = d
+        .params
+        .iter()
+        .find(|p| p.name == object_param)
+        .map(|p| normalize_param_object_type(&p.ty))?;
+    let target_value_ty = normalize_param_object_type(
+        &d.params
+            .iter()
+            .find(|p| p.name == value_param)?
+            .ty,
+    );
+    let mut best: Option<(usize, &FnDecl, String)> = None;
+    for f in module_fns.values() {
+        if f.fn_name == d.fn_name || f.is_test_only || !(f.is_public || f.is_entry) {
+            continue;
+        }
+        let obj_param_in_seed = f
+            .params
+            .iter()
+            .find(|p| {
+                let t = p.ty.trim();
+                t.starts_with("&mut")
+                    && normalize_param_object_type(t) == target_obj_ty
+                    && !t.contains("TxContext")
+            })
+            .map(|p| p.name.clone());
+        let Some(obj_param_in_seed) = obj_param_in_seed else {
+            continue;
+        };
+        let value_param_in_seed = f
+            .params
+            .iter()
+            .find(|p| {
+                !p.ty.trim().starts_with('&')
+                    && normalize_param_object_type(&p.ty) == target_value_ty
+            })
+            .map(|p| p.name.clone());
+        let Some(value_param_in_seed) = value_param_in_seed else {
+            continue;
+        };
+        let mut matches_push = false;
+        let needle = format!(
+            "push_back(&mut{}.{},{})",
+            obj_param_in_seed, field, value_param_in_seed
+        );
+        for line in &f.body_lines {
+            let stmt = remove_whitespace(line.split("//").next().unwrap_or("").trim());
+            if stmt.contains(&needle) {
+                matches_push = true;
+                break;
+            }
+        }
+        if !matches_push {
+            continue;
+        }
+        let score = f.params.len();
+        if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
+            best = Some((score, f, value_param_in_seed));
+        }
+    }
+    best.map(|(_, f, seed_value)| (f, seed_value))
+}
+
+fn synthesize_auto_prestate_calls(
+    d: &FnDecl,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    object_vars_by_type: &std::collections::HashMap<String, String>,
+    coin_vars_for_calls: &[String],
+    requires_extra_coin_slots: &mut std::collections::HashMap<usize, String>,
+    pre_coin_counter: &mut usize,
+    requires_cleanup_coin_vars: &mut Vec<String>,
+    requires_cleanup_clock_vars: &mut Vec<String>,
+    requires_consumed_coin_vars: &mut std::collections::HashSet<String>,
+    param_arg_values: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let Some((object_param, field, value_param)) = detect_index_of_guard_pattern(d) else {
+        return Vec::new();
+    };
+    let Some(module_fns) = fn_lookup.get(&d.module_name) else {
+        return Vec::new();
+    };
+    let Some((seed_decl, seed_value_param)) = find_seed_function_for_index_of_pattern(
+        d,
+        module_fns,
+        &object_param,
+        &field,
+        &value_param,
+    ) else {
+        return Vec::new();
+    };
+    let mut pre_lines: Vec<String> = Vec::new();
+    let mut seed_args: Vec<String> = Vec::new();
+    for p in &seed_decl.params {
+        let t = p.ty.trim();
+        if t.contains("TxContext") {
+            seed_args.push("test_scenario::ctx(&mut scenario)".to_string());
+            continue;
+        }
+        if is_clock_type(t) {
+            let var = format!("prestate_clock_{}", sanitize_ident(&p.name));
+            if t.starts_with("&mut") {
+                pre_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                pre_lines.push(format!("sui::clock::set_for_testing(&mut {}, 1000000);", var));
+                seed_args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                pre_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                pre_lines.push(format!("sui::clock::set_for_testing(&mut {}, 1000000);", var));
+                seed_args.push(format!("&{}", var));
+            } else {
+                pre_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                pre_lines.push(format!("sui::clock::set_for_testing(&mut {}, 1000000);", var));
+                seed_args.push(var.clone());
+            }
+            requires_cleanup_clock_vars.push(var);
+            continue;
+        }
+        if p.name == seed_value_param {
+            if let Some(seed_value_expr) = param_arg_values.get(&value_param) {
+                seed_args.push(seed_value_expr.clone());
+            } else if t == "u64" {
+                seed_args.push(choose_u64_arg_for_param_in_fn(&p.name, &seed_decl.body_lines));
+            } else if is_numeric_type(t) {
+                seed_args.push("1".to_string());
+            } else {
+                return Vec::new();
+            }
+            continue;
+        }
+        if t.starts_with('&') && !is_coin_type(t) {
+            let key = type_key_from_type_name(&normalize_param_object_type(t));
+            let Some(var) = object_vars_by_type.get(&key) else {
+                return Vec::new();
+            };
+            if t.starts_with("&mut") {
+                seed_args.push(format!("&mut {}", var));
+            } else {
+                seed_args.push(format!("&{}", var));
+            }
+            continue;
+        }
+        if is_coin_type(t) {
+            let _ = (
+                coin_vars_for_calls,
+                requires_extra_coin_slots,
+                pre_coin_counter,
+                requires_cleanup_coin_vars,
+                requires_consumed_coin_vars,
+            );
+            return Vec::new();
+        }
+        if t == "u64" {
+            seed_args.push(choose_u64_arg_for_param_in_fn(&p.name, &seed_decl.body_lines));
+        } else if is_numeric_type(t) {
+            seed_args.push("1".to_string());
+        } else if t == "bool" {
+            seed_args.push("false".to_string());
+        } else if t == "address" {
+            seed_args.push("SUPER_USER".to_string());
+        } else if is_id_type(t) {
+            seed_args.push(default_id_arg_expr());
+        } else if is_option_type(t) {
+            seed_args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            seed_args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            let Some(expr) = synthesize_value_expr_for_type(
+                t,
+                &d.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", d.module_name, seed_decl.fn_name)),
+                0,
+            ) else {
+                return Vec::new();
+            };
+            seed_args.push(expr);
+        }
+    }
+    let mut out = pre_lines;
+    out.push(format!(
+        "{}::{}({});",
+        d.module_name,
+        seed_decl.fn_name,
+        seed_args.join(", ")
+    ));
+    out
 }
 
 fn synthesize_requires_call_args(
@@ -341,7 +627,7 @@ fn synthesize_requires_call_args(
                 coin_slot_idx += 1;
             }
         } else if t == "u64" {
-            args.push(default_u64_arg_for_param(&p.name));
+            args.push(choose_u64_arg_for_param_in_fn(&p.name, &d.body_lines));
         } else if is_numeric_type(t) {
             args.push("1".to_string());
         } else if t == "bool" {
@@ -385,7 +671,7 @@ fn synthesize_factory_args(
         } else if is_vector_type(t) && !t.starts_with('&') {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
-            args.push(default_u64_arg_for_param(&p.name));
+            args.push(choose_u64_arg_for_param_in_fn(&p.name, &factory.body_lines));
         } else if is_numeric_type(t) {
             args.push("1".to_string());
         } else if t == "bool" {
@@ -507,7 +793,7 @@ fn synthesize_factory_args_with_refs(
         if is_vector_type(t) {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
-            args.push(default_u64_arg_for_param(&p.name));
+            args.push(choose_u64_arg_for_param_in_fn(&p.name, &factory.body_lines));
         } else if is_numeric_type(t) {
             args.push("1".to_string());
         } else if t == "bool" {
@@ -537,13 +823,156 @@ fn synthesize_factory_args_with_refs(
     })
 }
 
+fn synthesize_owned_factory_call_plan(
+    d: &FnDecl,
+    factory: &FnDecl,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+    module_bootstrap: &ModuleBootstrapCatalog,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<FactoryCallPlan> {
+    let mut args = Vec::new();
+    let mut prep_lines = Vec::new();
+    let mut cleanup_lines = Vec::new();
+    let mut shared_ref_deps: Vec<(String, bool)> = Vec::new();
+    for (idx, p) in factory.params.iter().enumerate() {
+        let t = p.ty.trim();
+        if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+            continue;
+        }
+        if is_clock_type(t) {
+            let var = format!("factory_clock_{}_{}", idx, sanitize_ident(&p.name));
+            if t.starts_with("&mut") {
+                prep_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&{}", var));
+            } else {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(var.clone());
+            }
+            cleanup_lines.push(format!("sui::clock::destroy_for_testing({});", var));
+            continue;
+        }
+        if is_coin_type(t) {
+            let var = format!("factory_coin_{}_{}", idx, sanitize_ident(&p.name));
+            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            prep_lines.push(format!(
+                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var
+            ));
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                args.push(format!("&{}", var));
+            } else {
+                args.push(var.clone());
+            }
+            if t.starts_with('&') {
+                cleanup_lines.push(format!("transfer::public_transfer({}, SUPER_USER);", var));
+            }
+            continue;
+        }
+        if t.starts_with('&') {
+            let inner_ty = normalize_param_object_type(t);
+            if is_known_key_struct(&inner_ty, &d.module_name, key_structs_by_module) {
+                let type_key = type_key_from_type_name(&inner_ty);
+                let has_shared_helper = module_fns
+                    .contains_key(&format!("create_and_share_{}_for_testing", type_key));
+                let from_witness_init =
+                    module_bootstrap.one_time_witness_init
+                        && module_bootstrap.init_shared_types.contains(&type_key);
+                if !has_shared_helper && !from_witness_init {
+                    return None;
+                }
+                let token = format!("__TW_OBJ_BY_TYPE_{}__", sanitize_ident(&type_key));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", token));
+                    shared_ref_deps.push((inner_ty, true));
+                } else {
+                    args.push(format!("&{}", token));
+                    shared_ref_deps.push((inner_ty, false));
+                }
+            } else {
+                let expr = synthesize_value_expr_for_type(
+                    &inner_ty,
+                    &factory.module_name,
+                    fn_lookup,
+                    Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                    0,
+                )?;
+                let var = format!("factory_ref_{}_{}", idx, sanitize_ident(&p.name));
+                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                prep_lines.push(format!("let {}{} = {};", maybe_mut, var, expr));
+                if t.starts_with("&mut") {
+                    args.push(format!("&mut {}", var));
+                } else {
+                    args.push(format!("&{}", var));
+                }
+            }
+            continue;
+        }
+        if is_vector_type(t) {
+            args.push(vector_literal_expr_for_type(t)?);
+        } else if t == "u64" {
+            args.push(choose_u64_arg_for_param_in_fn(&p.name, &factory.body_lines));
+        } else if is_numeric_type(t) {
+            args.push("1".to_string());
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("SUPER_USER".to_string());
+        } else if is_id_type(t) {
+            args.push(default_id_arg_expr());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            args.push(synthesize_value_expr_for_type(
+                t,
+                &factory.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                0,
+            )?);
+        }
+    }
+    let type_args = if has_unbound_type_params(factory) {
+        default_type_args_for_params(&factory.type_params)
+    } else {
+        Vec::new()
+    };
+    Some(FactoryCallPlan {
+        fn_name: factory.fn_name.clone(),
+        type_args,
+        args,
+        prep_lines,
+        cleanup_lines,
+        shared_ref_deps,
+    })
+}
+
 fn pick_factory_call_for_type(
     d: &FnDecl,
     type_key: &str,
     module_fns: &std::collections::HashMap<String, FnDecl>,
+    module_bootstrap: &ModuleBootstrapCatalog,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
-) -> Option<(String, Vec<String>)> {
-    let mut best: Option<(usize, String, Vec<String>)> = None;
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<FactoryCallPlan> {
+    let mut best: Option<(usize, FactoryCallPlan)> = None;
     for f in module_fns.values() {
         if f.is_test_only {
             continue;
@@ -561,16 +990,23 @@ fn pick_factory_call_for_type(
         if type_key_from_type_name(ret) != type_key {
             continue;
         }
-        let Some(args) = synthesize_factory_args(f, fn_lookup) else {
+        let Some(plan) = synthesize_owned_factory_call_plan(
+            d,
+            f,
+            module_fns,
+            module_bootstrap,
+            fn_lookup,
+            key_structs_by_module,
+        ) else {
             continue;
         };
         let score = f.params.len();
-        let candidate = (score, f.fn_name.clone(), args);
+        let candidate = (score, plan);
         if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
             best = Some(candidate);
         }
     }
-    best.map(|(_, name, args)| (name, args))
+    best.map(|(_, plan)| plan)
 }
 
 fn pick_owned_test_helper_for_type(
@@ -737,6 +1173,27 @@ fn pick_shared_creator_plan(
     Some(best)
 }
 
+fn upsert_object_need(
+    object_needs: &mut Vec<ObjectNeed>,
+    type_name: String,
+    is_mut: bool,
+    is_ref: bool,
+) {
+    let type_key = type_key_from_type_name(&type_name);
+    if let Some(existing) = object_needs.iter_mut().find(|o| o.type_key == type_key) {
+        existing.is_mut |= is_mut;
+        existing.is_ref |= is_ref;
+        return;
+    }
+    object_needs.push(ObjectNeed {
+        type_name,
+        type_key: type_key.clone(),
+        var_name: format!("obj_dep_{}", sanitize_ident(&type_key)),
+        is_mut,
+        is_ref,
+    });
+}
+
 pub(super) fn render_best_effort_test(
     d: &FnDecl,
     inputs: &RenderInputs<'_>,
@@ -855,7 +1312,7 @@ pub(super) fn render_best_effort_test(
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if t == "u64" {
-            let v = default_u64_arg_for_param(&param.name);
+            let v = choose_u64_arg_for_param_in_fn(&param.name, &d.body_lines);
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if is_numeric_type(t) {
@@ -961,26 +1418,28 @@ pub(super) fn render_best_effort_test(
         std::collections::HashMap::new();
     let mut shared_helper_calls: std::collections::HashMap<String, HelperCallPlan> =
         std::collections::HashMap::new();
-    let mut factory_calls: std::collections::HashMap<String, (String, Vec<String>)> =
+    let mut factory_calls: std::collections::HashMap<String, FactoryCallPlan> =
         std::collections::HashMap::new();
     let mut shared_creator_plan: Option<SharedCreatorPlan> = None;
     let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    let needs_shared_non_cap_object = object_needs
-        .iter()
-        .any(|o| o.is_ref && !is_cap_type(&o.type_name));
-    let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
-        .iter()
-        .filter(|o| o.is_ref && is_cap_type(&o.type_name))
-        .map(|o| o.type_key.clone())
-        .collect();
     if !object_needs.is_empty() {
         let empty_bootstrap = ModuleBootstrapCatalog::default();
         let module_bootstrap = bootstrap_catalog
             .get(&d.module_name)
             .unwrap_or(&empty_bootstrap);
         let module_fns = fn_lookup.get(&d.module_name);
-        for obj in &object_needs {
+        let mut idx = 0usize;
+        while idx < object_needs.len() {
+            let obj = object_needs[idx].clone();
+            let needs_shared_non_cap_object = object_needs
+                .iter()
+                .any(|o| o.is_ref && !is_cap_type(&o.type_name));
+            let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
+                .iter()
+                .filter(|o| o.is_ref && is_cap_type(&o.type_name))
+                .map(|o| o.type_key.clone())
+                .collect();
             let shared_helper_plan = module_fns.and_then(|fns| {
                 if obj.is_ref {
                     pick_shared_test_helper_for_type(d, &obj.type_key, fns, fn_lookup)
@@ -1047,13 +1506,23 @@ pub(super) fn render_best_effort_test(
                     } else {
                         return None;
                     }
-                } else if let Some((factory_fn, factory_args)) = module_fns
-                    .and_then(|fns| pick_factory_call_for_type(d, &obj.type_key, fns, fn_lookup))
-                {
+                } else if let Some(plan) = module_fns.and_then(|fns| {
+                    pick_factory_call_for_type(
+                        d,
+                        &obj.type_key,
+                        fns,
+                        module_bootstrap,
+                        fn_lookup,
+                        key_structs_by_module,
+                    )
+                }) {
+                    for (dep_ty, dep_mut) in &plan.shared_ref_deps {
+                        upsert_object_need(&mut object_needs, dep_ty.clone(), *dep_mut, true);
+                    }
                     owned_objects.push(obj.clone());
                     object_sources
                         .insert(obj.var_name.clone(), ObjectProvisionSource::OwnedFactory);
-                    factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
+                    factory_calls.insert(obj.var_name.clone(), plan);
                 } else {
                     if shared_creator_plan.is_none() {
                         shared_creator_plan = module_fns.and_then(|fns| {
@@ -1089,6 +1558,7 @@ pub(super) fn render_best_effort_test(
                     }
                 }
             }
+            idx += 1;
         }
     }
     let needs_init_bootstrap = object_sources.values().any(|src| {
@@ -1344,6 +1814,14 @@ pub(super) fn render_best_effort_test(
             coin.var_name
         ));
     }
+    for obj in &shared_objects {
+        let maybe_mut = if obj.is_mut { "mut " } else { "" };
+        let obj_ty = qualify_type_for_module(&d.module_name, &obj.type_name);
+        lines.push(format!(
+            "        let {}{} = scenario.take_shared<{}>();",
+            maybe_mut, obj.var_name, obj_ty
+        ));
+    }
     for obj in &owned_objects {
         let maybe_mut = if obj.is_mut { "mut " } else { "" };
         match object_sources.get(&obj.var_name) {
@@ -1376,15 +1854,44 @@ pub(super) fn render_best_effort_test(
                 ));
             }
             Some(ObjectProvisionSource::OwnedFactory) => {
-                let (factory_fn, factory_args) = factory_calls.get(&obj.var_name)?;
+                let plan = factory_calls.get(&obj.var_name)?;
+                for l in &plan.prep_lines {
+                    lines.push(format!("        {}", l));
+                }
+                let mut resolved_args: Vec<String> = Vec::new();
+                for arg in &plan.args {
+                    let mut resolved = arg.clone();
+                    for (dep_ty, _) in &plan.shared_ref_deps {
+                        let dep_key = type_key_from_type_name(dep_ty);
+                        let token =
+                            format!("__TW_OBJ_BY_TYPE_{}__", sanitize_ident(&dep_key));
+                        if resolved.contains(&token) {
+                            let dep_var = object_vars_by_type.get(&dep_key)?;
+                            resolved = resolved.replace(&token, dep_var);
+                        }
+                    }
+                    resolved_args.push(resolved);
+                }
+                let call_path = if plan.type_args.is_empty() {
+                    format!("{}::{}", d.module_name, plan.fn_name)
+                } else {
+                    format!(
+                        "{}::{}<{}>",
+                        d.module_name,
+                        plan.fn_name,
+                        plan.type_args.join(", ")
+                    )
+                };
                 lines.push(format!(
-                    "        let {}{} = {}::{}({});",
+                    "        let {}{} = {}({});",
                     maybe_mut,
                     obj.var_name,
-                    d.module_name,
-                    factory_fn,
-                    factory_args.join(", ")
+                    call_path,
+                    resolved_args.join(", ")
                 ));
+                for l in &plan.cleanup_lines {
+                    lines.push(format!("        {}", l));
+                }
             }
             Some(ObjectProvisionSource::OwnedCreatorSender) => {
                 lines.push(format!(
@@ -1401,14 +1908,6 @@ pub(super) fn render_best_effort_test(
                 ));
             }
         }
-    }
-    for obj in &shared_objects {
-        let maybe_mut = if obj.is_mut { "mut " } else { "" };
-        let obj_ty = qualify_type_for_module(&d.module_name, &obj.type_name);
-        lines.push(format!(
-            "        let {}{} = scenario.take_shared<{}>();",
-            maybe_mut, obj.var_name, obj_ty
-        ));
     }
     for l in &arg_setup_lines {
         lines.push(format!("        {}", l));
@@ -1438,6 +1937,21 @@ pub(super) fn render_best_effort_test(
                 req_args.join(", ")
             ));
         }
+    }
+    let auto_prestate_lines = synthesize_auto_prestate_calls(
+        d,
+        fn_lookup,
+        &object_vars_by_type,
+        &coin_vars_for_calls,
+        &mut requires_extra_coin_slots,
+        &mut pre_coin_counter,
+        &mut requires_cleanup_coin_vars,
+        &mut requires_cleanup_clock_vars,
+        &mut requires_consumed_coin_vars,
+        &param_arg_values,
+    );
+    for l in auto_prestate_lines {
+        lines.push(format!("        {}", l));
     }
     for l in snapshot_before_lines {
         lines.push(format!("        {}", l));

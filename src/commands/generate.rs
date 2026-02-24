@@ -657,15 +657,6 @@ fn default_id_arg_expr() -> String {
     "sui::object::id_from_address(OTHER)".to_string()
 }
 
-fn default_u64_arg_for_param(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("ratio") {
-        "101".to_string()
-    } else {
-        "1".to_string()
-    }
-}
-
 fn normalize_helper_key(key: &str) -> String {
     key.chars()
         .filter(|c| *c != '_')

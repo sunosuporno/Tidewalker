@@ -49,6 +49,214 @@ fn has_branch_or_loop(body_lines: &[String]) -> bool {
     false
 }
 
+fn parse_unsigned_literal_u64(raw: &str) -> Option<u64> {
+    let mut lit = raw.trim();
+    while lit.starts_with('(') && lit.ends_with(')') && lit.len() >= 2 {
+        lit = &lit[1..lit.len() - 1];
+        lit = lit.trim();
+    }
+    let lit = lit
+        .strip_suffix("u64")
+        .or_else(|| lit.strip_suffix("u128"))
+        .or_else(|| lit.strip_suffix("u32"))
+        .unwrap_or(lit)
+        .trim();
+    if lit.is_empty() {
+        return None;
+    }
+    if !lit.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
+    }
+    let normalized = lit.replace('_', "");
+    normalized.parse::<u64>().ok()
+}
+
+fn extract_assert_condition_for_render(stmt: &str) -> Option<String> {
+    let idx = stmt.find("assert!(")?;
+    let start = idx + "assert!(".len();
+    let mut depth = 1i32;
+    let mut end: Option<usize> = None;
+    for (offset, ch) in stmt[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end_idx = end?;
+    let inside = &stmt[start..end_idx];
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for (i, ch) in inside.char_indices() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            ',' if paren == 0 && bracket == 0 && brace == 0 => {
+                return Some(inside[..i].trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    Some(inside.trim().to_string())
+}
+
+fn choose_u64_arg_for_param_in_fn(name: &str, body_lines: &[String]) -> String {
+    let param = remove_whitespace(name);
+    let lower = name.to_ascii_lowercase();
+    let mut min_inclusive: Option<u64> = None;
+    let mut min_exclusive: Option<u64> = None;
+    let mut max_inclusive: Option<u64> = None;
+    let mut max_exclusive: Option<u64> = None;
+    let mut equals: Option<u64> = None;
+    let mut not_equals: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if !stmt.contains("assert!(") {
+            continue;
+        }
+        let Some(cond) = extract_assert_condition_for_render(stmt) else {
+            continue;
+        };
+        let norm = remove_whitespace(&cond);
+        if !norm.contains(&param) {
+            continue;
+        }
+        if norm.contains("||") {
+            continue;
+        }
+        for clause in norm.split("&&") {
+            if clause.is_empty() || !clause.contains(&param) {
+                continue;
+            }
+            let apply_side = |lhs: &str,
+                              rhs: &str,
+                              op: &str,
+                              rev: bool,
+                              min_inclusive: &mut Option<u64>,
+                              min_exclusive: &mut Option<u64>,
+                              max_inclusive: &mut Option<u64>,
+                              max_exclusive: &mut Option<u64>,
+                              equals: &mut Option<u64>,
+                              not_equals: &mut std::collections::BTreeSet<u64>| {
+                if lhs != param {
+                    return;
+                }
+                let Some(v) = parse_unsigned_literal_u64(rhs) else {
+                    return;
+                };
+                match (op, rev) {
+                    (">=", false) | ("<=", true) => {
+                        *min_inclusive = Some(min_inclusive.map_or(v, |x| x.max(v)));
+                    }
+                    (">", false) | ("<", true) => {
+                        *min_exclusive = Some(min_exclusive.map_or(v, |x| x.max(v)));
+                    }
+                    ("<=", false) | (">=", true) => {
+                        *max_inclusive = Some(max_inclusive.map_or(v, |x| x.min(v)));
+                    }
+                    ("<", false) | (">", true) => {
+                        *max_exclusive = Some(max_exclusive.map_or(v, |x| x.min(v)));
+                    }
+                    ("==", _) => {
+                        *equals = Some(v);
+                    }
+                    ("!=", _) => {
+                        not_equals.insert(v);
+                    }
+                    _ => {}
+                }
+            };
+
+            for op in [">=", "<=", "==", "!=", ">", "<"] {
+                if let Some((lhs, rhs)) = clause.split_once(op) {
+                    apply_side(
+                        lhs,
+                        rhs,
+                        op,
+                        false,
+                        &mut min_inclusive,
+                        &mut min_exclusive,
+                        &mut max_inclusive,
+                        &mut max_exclusive,
+                        &mut equals,
+                        &mut not_equals,
+                    );
+                    apply_side(
+                        rhs,
+                        lhs,
+                        op,
+                        true,
+                        &mut min_inclusive,
+                        &mut min_exclusive,
+                        &mut max_inclusive,
+                        &mut max_exclusive,
+                        &mut equals,
+                        &mut not_equals,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    let base = if lower.contains("ratio") { 50 } else { 1 };
+    let mut candidate = equals.unwrap_or(base);
+
+    if let Some(v) = min_inclusive {
+        candidate = candidate.max(v);
+    }
+    if let Some(v) = min_exclusive {
+        candidate = candidate.max(v.saturating_add(1));
+    }
+    if let Some(v) = max_inclusive {
+        candidate = candidate.min(v);
+    }
+    if let Some(v) = max_exclusive {
+        candidate = candidate.min(v.saturating_sub(1));
+    }
+
+    while not_equals.contains(&candidate) {
+        candidate = candidate.saturating_add(1);
+    }
+    if let Some(v) = max_inclusive {
+        if candidate > v {
+            candidate = v;
+        }
+    }
+    if let Some(v) = max_exclusive {
+        if candidate >= v {
+            candidate = v.saturating_sub(1);
+        }
+    }
+    if let Some(v) = min_inclusive {
+        if candidate < v {
+            candidate = v;
+        }
+    }
+    if let Some(v) = min_exclusive {
+        if candidate <= v {
+            candidate = v.saturating_add(1);
+        }
+    }
+    while not_equals.contains(&candidate) {
+        candidate = candidate.saturating_add(1);
+    }
+
+    candidate.to_string()
+}
+
 pub(super) struct RenderInputs<'a> {
     pub(super) accessor_map: &'a std::collections::HashMap<String, Vec<AccessorSig>>,
     pub(super) option_accessor_map: &'a std::collections::HashMap<String, Vec<OptionAccessorSig>>,
