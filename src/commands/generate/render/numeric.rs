@@ -8,17 +8,17 @@ fn resolve_read_expr(
     let param = d.params.iter().find(|p| p.name == eff.base_var)?;
     let param_obj_ty = normalize_param_object_type(&param.ty);
     let module_accessors = accessor_map.get(&d.module_name)?;
-    let has_accessor = module_accessors
+    let getter_name = module_accessors
         .iter()
-        .any(|a| a.param_ty == param_obj_ty && a.fn_name == eff.field);
-    if has_accessor {
-        Some(format!(
-            "{}::{}(&{})",
-            d.module_name, eff.field, runtime_var
-        ))
-    } else {
-        None
-    }
+        .find(|a| {
+            a.param_ty == param_obj_ty
+                && (a.fn_name == eff.field || a.fn_name == format!("get_{}", eff.field))
+        })
+        .map(|a| a.fn_name.clone())?;
+    Some(format!(
+        "{}::{}(&{})",
+        d.module_name, getter_name, runtime_var
+    ))
 }
 
 pub(super) fn overflow_may_affect_target(

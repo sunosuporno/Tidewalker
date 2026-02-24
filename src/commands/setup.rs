@@ -687,56 +687,237 @@ fn parse_init_body(
 ) {
     let mut var_to_type: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for line in &body {
-        let t = line.trim();
-        if t.starts_with("let ") {
-            if let Some(rest) = t.strip_prefix("let ") {
-                let lhs = rest.split('=').next().unwrap_or("").trim();
-                let mut lhs_tokens = lhs.split_whitespace();
-                let first = lhs_tokens.next().unwrap_or("");
-                let mut name = if first == "mut" {
-                    lhs_tokens.next().unwrap_or("").to_string()
-                } else {
-                    first.to_string()
-                };
-                if name.ends_with(',') {
-                    name.pop();
-                }
-                if let Some(eq) = rest.find('=') {
-                    let rhs = rest[eq + 1..].trim();
-                    let type_name = if rhs.contains(" {") {
-                        rhs.split_whitespace().next().unwrap_or("").to_string()
-                    } else {
-                        String::new()
-                    };
-                    if !name.is_empty() && !type_name.is_empty() {
-                        var_to_type.insert(name, type_name);
-                    }
-                }
-            }
+    let statements = collect_body_statements(&body);
+    for stmt in &statements {
+        if let Some((name, type_name)) = parse_let_struct_binding(stmt) {
+            var_to_type.insert(name, type_name);
         }
     }
     let struct_field_values_by_var = parse_struct_literal_fields_from_body(&body);
     let mut shared = Vec::new();
     let mut caps = Vec::new();
-    for line in &body {
-        let t = line.trim();
-        if t.contains("share_object(") {
-            if let Some(arg) = extract_first_arg(t, "share_object(") {
-                if let Some(ty) = var_to_type.get(&arg) {
-                    shared.push((arg.clone(), ty.clone()));
+    for stmt in &statements {
+        if let Some(args) = extract_call_args_for_prefixes(
+            stmt,
+            &[
+                "transfer::share_object",
+                "transfer::public_share_object",
+                "share_object",
+                "public_share_object",
+            ],
+        ) {
+            if let Some(first) = args.first() {
+                let obj = strip_wrappers(first);
+                if let Some(ty) = resolve_obj_type(&obj, &var_to_type) {
+                    shared.push((obj, ty));
                 }
             }
+            continue;
         }
-        if t.contains("transfer(") && (t.contains("sender(") || t.contains("tx_context::sender")) {
-            if let Some(arg) = extract_first_arg(t, "transfer(") {
-                if let Some(ty) = var_to_type.get(&arg) {
-                    caps.push((arg.clone(), ty.clone()));
-                }
+        if let Some(args) = extract_call_args_for_prefixes(
+            stmt,
+            &[
+                "transfer::transfer",
+                "transfer::public_transfer",
+                "transfer",
+                "public_transfer",
+            ],
+        ) {
+            if args.len() < 2 {
+                continue;
+            }
+            let recipient = strip_wrappers(&args[1]);
+            if !(recipient.contains("sender(")
+                || recipient.contains("tx_context::sender")
+                || recipient.contains("ctx.sender("))
+            {
+                continue;
+            }
+            let obj = strip_wrappers(&args[0]);
+            if let Some(ty) = resolve_obj_type(&obj, &var_to_type) {
+                caps.push((obj, ty));
             }
         }
     }
     (shared, caps, struct_field_values_by_var)
+}
+
+fn collect_body_statements(body: &[&str]) -> Vec<String> {
+    let joined = body
+        .iter()
+        .map(|line| strip_line_comment(line).trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn parse_let_struct_binding(stmt: &str) -> Option<(String, String)> {
+    let t = stmt.trim();
+    let rest = t.strip_prefix("let ")?;
+    let (lhs, rhs) = rest.split_once('=')?;
+    let mut lhs_tokens = lhs.trim().split_whitespace();
+    let first = lhs_tokens.next().unwrap_or("");
+    let mut name = if first == "mut" {
+        lhs_tokens.next().unwrap_or("").to_string()
+    } else {
+        first.to_string()
+    };
+    if name.ends_with(',') {
+        name.pop();
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let type_name = extract_struct_literal_type(rhs)?;
+    Some((name, type_name))
+}
+
+fn resolve_obj_type(
+    obj_expr: &str,
+    var_to_type: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(ty) = var_to_type.get(obj_expr) {
+        return Some(ty.clone());
+    }
+    extract_struct_literal_type(obj_expr)
+}
+
+fn strip_wrappers(raw: &str) -> String {
+    let mut t = raw.trim();
+    loop {
+        let trimmed = t.trim();
+        if let Some(rest) = trimmed.strip_prefix('&') {
+            t = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("mut ") {
+            t = rest.trim_start();
+            continue;
+        }
+        if trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 2 {
+            t = &trimmed[1..trimmed.len() - 1];
+            continue;
+        }
+        return trimmed.to_string();
+    }
+}
+
+fn extract_struct_literal_type(expr: &str) -> Option<String> {
+    let raw = strip_wrappers(expr);
+    let before_brace = raw.split('{').next()?.trim();
+    if before_brace.is_empty() {
+        return None;
+    }
+    if !before_brace
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return None;
+    }
+    Some(before_brace.to_string())
+}
+
+fn extract_call_args_for_prefixes(stmt: &str, prefixes: &[&str]) -> Option<Vec<String>> {
+    for prefix in prefixes {
+        if let Some(args) = extract_call_args(stmt, prefix) {
+            return Some(args);
+        }
+    }
+    None
+}
+
+fn extract_call_args(stmt: &str, call_name: &str) -> Option<Vec<String>> {
+    let idx = stmt.find(call_name)?;
+    let mut i = idx + call_name.len();
+    let chars: Vec<char> = stmt.chars().collect();
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] != '(' {
+        return None;
+    }
+    i += 1;
+    let mut depth: i32 = 1;
+    let mut end: Option<usize> = None;
+    for j in i..chars.len() {
+        let ch = chars[j];
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(j);
+                break;
+            }
+        }
+    }
+    let end_idx = end?;
+    let args_raw: String = chars[i..end_idx].iter().collect();
+    Some(split_top_level_args(&args_raw))
+}
+
+fn split_top_level_args(args_raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut paren = 0i32;
+    let mut angle = 0i32;
+    let mut brace = 0i32;
+    let mut bracket = 0i32;
+    for ch in args_raw.chars() {
+        match ch {
+            '(' => {
+                paren += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                paren -= 1;
+                cur.push(ch);
+            }
+            '<' => {
+                angle += 1;
+                cur.push(ch);
+            }
+            '>' => {
+                angle -= 1;
+                cur.push(ch);
+            }
+            '{' => {
+                brace += 1;
+                cur.push(ch);
+            }
+            '}' => {
+                brace -= 1;
+                cur.push(ch);
+            }
+            '[' => {
+                bracket += 1;
+                cur.push(ch);
+            }
+            ']' => {
+                bracket -= 1;
+                cur.push(ch);
+            }
+            ',' if paren == 0 && angle == 0 && brace == 0 && bracket == 0 => {
+                let t = cur.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
 }
 
 fn parse_struct_literal_fields_from_body(
@@ -840,22 +1021,6 @@ fn is_safe_helper_initializer_expr(expr: &str) -> bool {
         return true;
     }
     e.contains("::")
-}
-
-fn extract_first_arg(line: &str, prefix: &str) -> Option<String> {
-    let t = line.trim();
-    let after = t.find(prefix).map(|i| &t[i + prefix.len()..])?;
-    let arg = after
-        .trim_start()
-        .split([',', ')'])
-        .next()?
-        .trim()
-        .trim_end_matches(')');
-    if arg.is_empty() {
-        None
-    } else {
-        Some(arg.to_string())
-    }
 }
 
 fn parse_struct_field_line(line: &str) -> Option<(String, String)> {
@@ -1179,6 +1344,39 @@ fn find_tidewalker_block(lines: &[String]) -> Option<(usize, usize)> {
     None
 }
 
+fn find_module_close_index(lines: &[String]) -> (Option<usize>, bool) {
+    let mut saw_module = false;
+    let mut saw_open_brace = false;
+    let mut depth = 0i32;
+    for (idx, line) in lines.iter().enumerate() {
+        let code = strip_line_comment(line);
+        let trimmed = code.trim_start();
+        if !saw_module {
+            if trimmed.starts_with("module ") {
+                saw_module = true;
+            } else {
+                continue;
+            }
+        }
+        for ch in code.chars() {
+            if ch == '{' {
+                depth += 1;
+                saw_open_brace = true;
+            } else if ch == '}' && depth > 0 {
+                depth -= 1;
+                if saw_open_brace && depth == 0 {
+                    return (Some(idx), false);
+                }
+            }
+        }
+    }
+    if saw_module && saw_open_brace && depth > 0 {
+        (None, true)
+    } else {
+        (None, false)
+    }
+}
+
 /// Inject or replace Tidewalker-generated test_only helpers at the end of the protocol source file.
 ///
 /// Rule: We only remove/replace the block delimited by our Tidewalker box or sentinels. Any other
@@ -1206,9 +1404,9 @@ fn inject_test_only_helpers(
             lines.pop();
         }
     }
-    let has_existing_bootstrap = lines
-        .iter()
-        .any(|l| l.contains("fun bootstrap_init_for_testing("));
+    let has_existing_bootstrap = lines.iter().any(|l| {
+        l.contains("fun bootstrap_init_for_testing(") || l.contains("fun init_for_testing(")
+    });
     let snippet = generate_in_module_test_only_snippet(
         mod_name,
         shared,
@@ -1219,11 +1417,36 @@ fn inject_test_only_helpers(
         has_existing_bootstrap,
     );
 
-    // Always place our block at the end of the file.
-    if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
-        lines.push("".to_string());
+    // Place our block before the module's closing brace so helper functions remain inside the module.
+    if !snippet.is_empty() {
+        let (module_close_idx, module_unclosed) = find_module_close_index(&lines);
+        if let Some(module_close_idx) = module_close_idx {
+            let mut insertion = Vec::new();
+            if module_close_idx > 0 && !lines[module_close_idx - 1].trim().is_empty() {
+                insertion.push("".to_string());
+            }
+            insertion.extend(snippet);
+            if insertion
+                .last()
+                .map(|l| !l.trim().is_empty())
+                .unwrap_or(false)
+            {
+                insertion.push("".to_string());
+            }
+            lines.splice(module_close_idx..module_close_idx, insertion);
+        } else {
+            if !lines.is_empty() && !lines.last().map(|l| l.is_empty()).unwrap_or(true) {
+                lines.push("".to_string());
+            }
+            lines.extend(snippet);
+            if module_unclosed {
+                if !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+                    lines.push("".to_string());
+                }
+                lines.push("}".to_string());
+            }
+        }
     }
-    lines.extend(snippet);
     fs::write(source_path, lines.join("\n"))?;
     Ok(())
 }

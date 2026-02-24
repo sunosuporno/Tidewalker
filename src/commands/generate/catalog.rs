@@ -273,23 +273,19 @@ fn parse_module_bootstrap_info(content: &str) -> ModuleBootstrapCatalog {
         return out;
     };
     out.one_time_witness_init = init_uses_one_time_witness(&header);
+    let statements = collect_init_statements(&body_lines);
 
     let mut var_to_type: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for line in &body_lines {
-        let t = line.split("//").next().unwrap_or("").trim();
-        if let Some((var, ty)) = parse_init_struct_binding(t) {
+    for stmt in &statements {
+        if let Some((var, ty)) = parse_init_struct_binding(stmt) {
             var_to_type.insert(var, ty);
         }
     }
 
-    for line in &body_lines {
-        let t = line.split("//").next().unwrap_or("").trim();
-        if t.is_empty() {
-            continue;
-        }
+    for stmt in &statements {
         if let Some(var) = extract_first_arg_for_prefixes(
-            t,
+            stmt,
             &[
                 "transfer::share_object",
                 "transfer::public_share_object",
@@ -297,19 +293,19 @@ fn parse_module_bootstrap_info(content: &str) -> ModuleBootstrapCatalog {
                 "public_share_object",
             ],
         ) {
-            if let Some(ty) = var_to_type.get(&var) {
-                out.init_shared_types.insert(type_key_from_type_name(ty));
+            if let Some(ty) = resolve_init_obj_type(&var, &var_to_type) {
+                out.init_shared_types.insert(type_key_from_type_name(&ty));
             }
             continue;
         }
 
-        if let Some((obj_var, recipient)) = parse_transfer_call(t) {
+        if let Some((obj_expr, recipient)) = parse_transfer_call(stmt) {
             if recipient.contains("sender(")
                 || recipient.contains("tx_context::sender(")
                 || recipient.contains("ctx.sender(")
             {
-                if let Some(ty) = var_to_type.get(&obj_var) {
-                    out.init_owned_types.insert(type_key_from_type_name(ty));
+                if let Some(ty) = resolve_init_obj_type(&obj_expr, &var_to_type) {
+                    out.init_owned_types.insert(type_key_from_type_name(&ty));
                 }
             }
         }
@@ -390,7 +386,7 @@ fn init_uses_one_time_witness(header: &str) -> bool {
 }
 
 fn parse_init_struct_binding(stmt: &str) -> Option<(String, String)> {
-    if !stmt.starts_with("let ") || !stmt.contains('=') || !stmt.contains('{') {
+    if !stmt.starts_with("let ") || !stmt.contains('=') {
         return None;
     }
     let after_let = stmt.strip_prefix("let ")?;
@@ -399,15 +395,7 @@ fn parse_init_struct_binding(stmt: &str) -> Option<(String, String)> {
     if !is_ident(var) {
         return None;
     }
-    let ty = rhs
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('{')
-        .trim();
-    if ty.is_empty() {
-        return None;
-    }
+    let ty = extract_struct_literal_type_from_expr(rhs)?;
     Some((var.to_string(), ty.to_string()))
 }
 
@@ -415,10 +403,7 @@ fn extract_first_arg_for_prefixes(stmt: &str, prefixes: &[&str]) -> Option<Strin
     for prefix in prefixes {
         if let Some(args) = extract_namespace_args_flexible(stmt, prefix) {
             if let Some(first) = args.first() {
-                let raw = strip_ref_and_parens_text(first);
-                if is_ident(raw) {
-                    return Some(raw.to_string());
-                }
+                return Some(strip_ref_and_parens_text(first).to_string());
             }
         }
     }
@@ -435,8 +420,50 @@ fn parse_transfer_call(stmt: &str) -> Option<(String, String)> {
     }
     let obj = strip_ref_and_parens_text(args[0].as_str()).to_string();
     let recipient = strip_ref_and_parens_text(args[1].as_str()).to_string();
-    if !is_ident(&obj) {
+    Some((obj, recipient))
+}
+
+fn collect_init_statements(body_lines: &[String]) -> Vec<String> {
+    let joined = body_lines
+        .iter()
+        .map(|line| strip_catalog_line_comment(line).trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn strip_catalog_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or("")
+}
+
+fn resolve_init_obj_type(
+    obj_expr: &str,
+    var_to_type: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let token = strip_ref_and_parens_text(obj_expr).trim();
+    if let Some(ty) = var_to_type.get(token) {
+        return Some(ty.clone());
+    }
+    extract_struct_literal_type_from_expr(token)
+}
+
+fn extract_struct_literal_type_from_expr(expr: &str) -> Option<String> {
+    let token = strip_ref_and_parens_text(expr).trim();
+    let before_brace = token.split('{').next()?.trim();
+    if before_brace.is_empty() {
         return None;
     }
-    Some((obj, recipient))
+    if !before_brace
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return None;
+    }
+    Some(before_brace.to_string())
 }

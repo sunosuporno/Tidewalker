@@ -86,6 +86,23 @@ pub(super) fn build_deep_chain_summary(
     summary
 }
 
+pub(super) fn build_mut_param_fallback_summary(
+    d: &FnDecl,
+    existing_summary: &StateChangeSummary,
+) -> StateChangeSummary {
+    let mut summary = StateChangeSummary::default();
+    if !existing_summary.asserted.is_empty() {
+        return summary;
+    }
+    for p in &d.params {
+        let ty = p.ty.trim();
+        if ty.starts_with("&mut") && !ty.contains("TxContext") {
+            summary.add_potential(p.name.clone());
+        }
+    }
+    summary
+}
+
 pub(super) fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String> {
     let asserted = simplified_targets(&summary.asserted);
     let mut potential = simplified_targets(&summary.potential);

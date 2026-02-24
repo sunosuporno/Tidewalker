@@ -417,6 +417,14 @@ pub(super) fn extract_numeric_effects_from_body(body_lines: &[String]) -> Vec<Nu
                 aliases.remove(&name);
             }
         }
+        if let Some((base_var, field, op)) = parse_balance_numeric_effect(stmt, &aliases) {
+            effects.push(NumericEffect {
+                base_var,
+                field,
+                op,
+            });
+            continue;
+        }
         let (lhs, rhs) = match stmt.split_once('=') {
             Some((l, r)) => (l.trim(), r.trim()),
             None => continue,
@@ -1642,6 +1650,37 @@ pub(super) fn parse_container_namespace_target(
 ) -> Option<(String, String)> {
     let args = extract_namespace_args_flexible(line, call_name)?;
     parse_container_target_expr(args.get(target_idx)?.as_str(), aliases)
+}
+
+fn parse_balance_numeric_effect(
+    line: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> Option<(String, String, NumericOp)> {
+    if let Some(args) = extract_namespace_args(line, "balance::split(") {
+        let (base_var, field) = parse_container_target_expr(args.first()?.as_str(), aliases)?;
+        let amount_token = normalize_container_key_expr(args.get(1)?.as_str())?;
+        let op = if let Some(v) = parse_numeric_literal(&amount_token) {
+            NumericOp::Sub(v)
+        } else if is_ident(&amount_token) {
+            NumericOp::Sub(amount_token)
+        } else {
+            NumericOp::Changed
+        };
+        return Some((base_var, field, op));
+    }
+    if let Some(args) = extract_namespace_args(line, "balance::join(") {
+        let (base_var, field) = parse_container_target_expr(args.first()?.as_str(), aliases)?;
+        let rhs_token = normalize_container_key_expr(args.get(1)?.as_str())?;
+        let op = if let Some(v) = parse_numeric_literal(&rhs_token) {
+            NumericOp::Add(v)
+        } else if is_ident(&rhs_token) {
+            NumericOp::Add(rhs_token)
+        } else {
+            NumericOp::Changed
+        };
+        return Some((base_var, field, op));
+    }
+    None
 }
 
 pub(super) fn parse_container_target_expr(

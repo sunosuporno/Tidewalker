@@ -18,6 +18,8 @@ struct SharedCreatorPlan {
     args: Vec<String>,
     type_args: Vec<String>,
     return_ty: Option<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +29,37 @@ struct HelperCallPlan {
     type_args: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct FactoryArgPlan {
+    args: Vec<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
+}
+
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
+}
+
+fn cleanup_stmt_for_type(
+    default_module: &str,
+    ty: &str,
+    var: &str,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> String {
+    if is_known_key_struct(ty, default_module, key_structs_by_module) {
+        let (decl_module, _) = split_type_module_and_base(ty, default_module);
+        let destroy_name = format!("destroy_{}_for_testing", type_key_from_type_name(ty));
+        if fn_lookup
+            .get(decl_module)
+            .and_then(|fns| fns.get(&destroy_name))
+            .map(|f| f.is_test_only)
+            .unwrap_or(false)
+        {
+            return format!("{}::{}({});", decl_module, destroy_name, var);
+        }
+    }
+    format!("transfer::public_transfer({}, SUPER_USER);", var)
 }
 
 fn requires_chain_uses_coin_slot_later(
@@ -51,6 +82,108 @@ fn requires_chain_uses_coin_slot_later(
                 }
                 slot_idx += 1;
             }
+        }
+    }
+    false
+}
+
+fn extract_assert_condition_local(stmt: &str) -> Option<String> {
+    let idx = stmt.find("assert!(")?;
+    let start = idx + "assert!(".len();
+    let mut depth = 1i32;
+    let mut end: Option<usize> = None;
+    for (offset, ch) in stmt[start..].char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(start + offset);
+                break;
+            }
+        }
+    }
+    let end_idx = end?;
+    let inside = &stmt[start..end_idx];
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    for (i, ch) in inside.char_indices() {
+        match ch {
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' => brace += 1,
+            '}' => brace -= 1,
+            ',' if paren == 0 && bracket == 0 && brace == 0 => {
+                return Some(inside[..i].trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    Some(inside.trim().to_string())
+}
+
+fn extract_mut_local_names(body_lines: &[String]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if let Some(rest) = stmt.strip_prefix("let mut ") {
+            let name = rest
+                .split(|c: char| c.is_whitespace() || c == ':' || c == '=' || c == ',' || c == ';')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if is_ident(name) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn has_assert_on_mut_local(body_lines: &[String], params: &[ParamDecl]) -> bool {
+    let mut_locals = extract_mut_local_names(body_lines);
+    if mut_locals.is_empty() {
+        return false;
+    }
+    let param_names = params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if !stmt.contains("assert!(") {
+            continue;
+        }
+        let Some(cond) = extract_assert_condition_local(stmt) else {
+            continue;
+        };
+        for token in cond.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token.is_empty() || param_names.contains(token) {
+                continue;
+            }
+            if mut_locals.contains(token) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_clock_ge_guard(body_lines: &[String]) -> bool {
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if !stmt.contains("assert!(") {
+            continue;
+        }
+        let Some(cond) = extract_assert_condition_local(stmt) else {
+            continue;
+        };
+        let norm = remove_whitespace(&cond);
+        if norm.contains("timestamp_ms(") && (norm.contains(">=") || norm.contains("<=")) {
+            return true;
         }
     }
     false
@@ -281,6 +414,129 @@ fn synthesize_factory_args(
     Some(args)
 }
 
+fn synthesize_factory_args_with_refs(
+    factory: &FnDecl,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<FactoryArgPlan> {
+    let mut args = Vec::new();
+    let mut prep_lines = Vec::new();
+    let mut cleanup_lines = Vec::new();
+    for (idx, p) in factory.params.iter().enumerate() {
+        let t = p.ty.trim();
+        if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+            continue;
+        }
+        if is_clock_type(t) {
+            let var = format!("factory_clock_{}_{}", idx, sanitize_ident(&p.name));
+            if t.starts_with("&mut") {
+                prep_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&{}", var));
+            } else {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(var.clone());
+            }
+            cleanup_lines.push(format!("sui::clock::destroy_for_testing({});", var));
+            continue;
+        }
+        if is_coin_type(t) {
+            let var = format!("factory_coin_{}_{}", idx, sanitize_ident(&p.name));
+            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            prep_lines.push(format!(
+                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var
+            ));
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                args.push(format!("&{}", var));
+            } else {
+                args.push(var.clone());
+            }
+            if t.starts_with('&') {
+                cleanup_lines.push(format!("transfer::public_transfer({}, SUPER_USER);", var));
+            }
+            continue;
+        }
+        if t.starts_with('&') {
+            let inner_ty = normalize_param_object_type(t);
+            let expr = synthesize_value_expr_for_type(
+                &inner_ty,
+                &factory.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                0,
+            )?;
+            let var = format!("factory_ref_{}_{}", idx, sanitize_ident(&p.name));
+            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            prep_lines.push(format!("let {}{} = {};", maybe_mut, var, expr));
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else {
+                args.push(format!("&{}", var));
+            }
+            if should_transfer_call_return_with_keys(
+                &inner_ty,
+                &factory.module_name,
+                key_structs_by_module,
+            ) {
+                cleanup_lines.push(cleanup_stmt_for_type(
+                    &factory.module_name,
+                    &inner_ty,
+                    &var,
+                    fn_lookup,
+                    key_structs_by_module,
+                ));
+            }
+            continue;
+        }
+
+        if is_vector_type(t) {
+            args.push(vector_literal_expr_for_type(t)?);
+        } else if t == "u64" {
+            args.push(default_u64_arg_for_param(&p.name));
+        } else if is_numeric_type(t) {
+            args.push("1".to_string());
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("SUPER_USER".to_string());
+        } else if is_id_type(t) {
+            args.push(default_id_arg_expr());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            args.push(synthesize_value_expr_for_type(
+                t,
+                &factory.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                0,
+            )?);
+        }
+    }
+    Some(FactoryArgPlan {
+        args,
+        prep_lines,
+        cleanup_lines,
+    })
+}
+
 fn pick_factory_call_for_type(
     d: &FnDecl,
     type_key: &str,
@@ -455,7 +711,8 @@ fn pick_shared_creator_plan(
                 continue;
             }
         }
-        let Some(args) = synthesize_factory_args(f, fn_lookup) else {
+        let Some(arg_plan) = synthesize_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        else {
             continue;
         };
         let type_args = if has_unbound_type_params(f) {
@@ -465,9 +722,11 @@ fn pick_shared_creator_plan(
         };
         let plan = SharedCreatorPlan {
             fn_name: f.fn_name.clone(),
-            args,
+            args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
+            prep_lines: arg_plan.prep_lines,
+            cleanup_lines: arg_plan.cleanup_lines,
         };
         let score = f.params.len();
         if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
@@ -503,6 +762,9 @@ pub(super) fn render_best_effort_test(
     {
         return None;
     }
+    if has_assert_on_mut_local(&d.body_lines, &d.params) {
+        return None;
+    }
     if requires_table_key_prestate(&d.body_lines) {
         return None;
     }
@@ -530,6 +792,7 @@ pub(super) fn render_best_effort_test(
     let mut arg_setup_lines: Vec<String> = Vec::new();
     let mut clock_cleanup_vars: Vec<String> = Vec::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
+    let prefer_advanced_clock = has_clock_ge_guard(&d.body_lines);
 
     for param in &d.params {
         let resolved_ty = concretize_type_params(&param.ty, &d.type_params, &default_type_args);
@@ -543,20 +806,48 @@ pub(super) fn render_best_effort_test(
                     "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
                     var_name
                 ));
+                if prefer_advanced_clock {
+                    arg_setup_lines.push(format!(
+                        "sui::clock::set_for_testing(&mut {}, 1000000);",
+                        var_name
+                    ));
+                }
                 args.push(format!("&mut {}", var_name));
                 clock_cleanup_vars.push(var_name);
             } else if t.starts_with('&') {
-                arg_setup_lines.push(format!(
-                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
-                    var_name
-                ));
+                if prefer_advanced_clock {
+                    arg_setup_lines.push(format!(
+                        "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                        var_name
+                    ));
+                    arg_setup_lines.push(format!(
+                        "sui::clock::set_for_testing(&mut {}, 1000000);",
+                        var_name
+                    ));
+                } else {
+                    arg_setup_lines.push(format!(
+                        "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                        var_name
+                    ));
+                }
                 args.push(format!("&{}", var_name));
                 clock_cleanup_vars.push(var_name);
             } else {
-                arg_setup_lines.push(format!(
-                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
-                    var_name
-                ));
+                if prefer_advanced_clock {
+                    arg_setup_lines.push(format!(
+                        "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                        var_name
+                    ));
+                    arg_setup_lines.push(format!(
+                        "sui::clock::set_for_testing(&mut {}, 1000000);",
+                        var_name
+                    ));
+                } else {
+                    arg_setup_lines.push(format!(
+                        "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                        var_name
+                    ));
+                }
                 args.push(var_name);
             }
         } else if t == "address" {
@@ -806,11 +1097,10 @@ pub(super) fn render_best_effort_test(
             ObjectProvisionSource::SharedInit | ObjectProvisionSource::OwnedInit
         )
     });
-    let has_init_bootstrap_helper = fn_lookup
+    let init_bootstrap_helper_name = fn_lookup
         .get(&d.module_name)
-        .map(|fns| fns.contains_key("bootstrap_init_for_testing"))
-        .unwrap_or(false);
-    if needs_init_bootstrap && !has_init_bootstrap_helper {
+        .and_then(pick_init_bootstrap_helper_name);
+    if needs_init_bootstrap && init_bootstrap_helper_name.is_none() {
         return None;
     }
 
@@ -857,6 +1147,9 @@ pub(super) fn render_best_effort_test(
     }) {
         if let Some(plan) = &shared_creator_plan {
             lines.push("    {".to_string());
+            for prep in &plan.prep_lines {
+                lines.push(format!("        {}", prep));
+            }
             let call_path = if plan.type_args.is_empty() {
                 format!("{}::{}", d.module_name, plan.fn_name)
             } else {
@@ -875,14 +1168,22 @@ pub(super) fn render_best_effort_test(
                     key_structs_by_module,
                 ) {
                     lines.push(format!("        let seed_ret_obj = {};", call_expr));
-                    lines.push(
-                        "        transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                    let seed_cleanup = cleanup_stmt_for_type(
+                        &d.module_name,
+                        ret_ty,
+                        "seed_ret_obj",
+                        fn_lookup,
+                        key_structs_by_module,
                     );
+                    lines.push(format!("        {}", seed_cleanup));
                 } else {
                     lines.push(format!("        {};", call_expr));
                 }
             } else {
                 lines.push(format!("        {};", call_expr));
+            }
+            for cleanup in &plan.cleanup_lines {
+                lines.push(format!("        {}", cleanup));
             }
             lines.push("    };".to_string());
             needs_next_tx_before_use = true;
@@ -890,9 +1191,10 @@ pub(super) fn render_best_effort_test(
     }
     if needs_init_bootstrap {
         lines.push("    {".to_string());
+        let bootstrap_name = init_bootstrap_helper_name?;
         lines.push(format!(
-            "        {}::bootstrap_init_for_testing(test_scenario::ctx(&mut scenario));",
-            d.module_name
+            "        {}::{}(test_scenario::ctx(&mut scenario));",
+            d.module_name, bootstrap_name
         ));
         lines.push("    };".to_string());
         needs_next_tx_before_use = true;
@@ -986,6 +1288,7 @@ pub(super) fn render_best_effort_test(
     state_summary.merge(container_summary);
     state_summary.merge(string_summary);
     state_summary.merge(build_deep_chain_summary(deep_overflow_paths));
+    state_summary.merge(build_mut_param_fallback_summary(d, &state_summary));
     let summary_lines = render_state_change_summary_lines(&state_summary);
 
     lines.push("    {".to_string());
@@ -1131,7 +1434,14 @@ pub(super) fn render_best_effort_test(
     if let Some(ret_ty) = d.return_ty.as_ref() {
         if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module) {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
-            lines.push("        transfer::public_transfer(tw_ret_obj, SUPER_USER);".to_string());
+            let ret_cleanup = cleanup_stmt_for_type(
+                &d.module_name,
+                ret_ty,
+                "tw_ret_obj",
+                fn_lookup,
+                key_structs_by_module,
+            );
+            lines.push(format!("        {}", ret_cleanup));
         } else {
             lines.push(format!("        {};", call_expr));
         }
@@ -1193,10 +1503,14 @@ pub(super) fn render_best_effort_test(
             || is_treasury_cap_type(&obj.type_name)
             || is_known_key_struct(&obj.type_name, &d.module_name, key_structs_by_module)
         {
-            lines.push(format!(
-                "        transfer::public_transfer({}, SUPER_USER);",
-                obj.var_name
-            ));
+            let cleanup_stmt = cleanup_stmt_for_type(
+                &d.module_name,
+                &obj.type_name,
+                &obj.var_name,
+                fn_lookup,
+                key_structs_by_module,
+            );
+            lines.push(format!("        {}", cleanup_stmt));
         }
     }
     for coin in &coin_needs {

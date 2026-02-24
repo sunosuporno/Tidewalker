@@ -40,6 +40,23 @@ enum GuardKind {
         op: String,
         rhs_literal: String,
     },
+    CoinValueObjectField {
+        coin_param: String,
+        object_param: String,
+        field_name: String,
+        op: String,
+    },
+    ParamClockTimestamp {
+        param_name: String,
+        clock_param: String,
+        op: String,
+    },
+    ObjectFieldClockTimestamp {
+        param_name: String,
+        field_name: String,
+        clock_param: String,
+        op: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +89,8 @@ struct GuardSharedCreatorPlan {
     args: Vec<String>,
     type_args: Vec<String>,
     return_ty: Option<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +98,13 @@ struct GuardHelperCallPlan {
     fn_name: String,
     args: Vec<String>,
     type_args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GuardFactoryArgPlan {
+    args: Vec<String>,
+    prep_lines: Vec<String>,
+    cleanup_lines: Vec<String>,
 }
 
 type GuardCallPlan = (
@@ -98,6 +124,28 @@ struct GuardEnv<'a> {
 
 fn module_fn_label(d: &FnDecl) -> String {
     format!("{}::{}", d.module_name, d.fn_name)
+}
+
+fn cleanup_stmt_for_type(
+    default_module: &str,
+    ty: &str,
+    var: &str,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> String {
+    if is_known_key_struct(ty, default_module, key_structs_by_module) {
+        let (decl_module, _) = split_type_module_and_base(ty, default_module);
+        let destroy_name = format!("destroy_{}_for_testing", type_key_from_type_name(ty));
+        if fn_lookup
+            .get(decl_module)
+            .and_then(|fns| fns.get(&destroy_name))
+            .map(|f| f.is_test_only)
+            .unwrap_or(false)
+        {
+            return format!("{}::{}({});", decl_module, destroy_name, var);
+        }
+    }
+    format!("transfer::public_transfer({}, SUPER_USER);", var)
 }
 
 fn reverse_comparison_op(op: &str) -> String {
@@ -201,6 +249,27 @@ fn parse_object_field_led_comparison(
     None
 }
 
+fn parse_direct_object_field_side(
+    expr: &str,
+    param_names: &[String],
+) -> Option<(String, String)> {
+    let mut norm = remove_whitespace(expr);
+    while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
+        norm = norm[1..norm.len() - 1].to_string();
+    }
+    if norm.contains('(') || norm.contains(')') || norm.matches('.').count() != 1 {
+        return None;
+    }
+    let (base, field) = norm.split_once('.')?;
+    if !is_ident(base) || !is_ident(field) {
+        return None;
+    }
+    if !param_names.iter().any(|p| p == base) {
+        return None;
+    }
+    Some((base.to_string(), field.to_string()))
+}
+
 fn parse_coin_value_side(
     expr: &str,
     param_names: &[String],
@@ -243,6 +312,45 @@ fn parse_coin_value_side(
             }
         }
     }
+    None
+}
+
+fn parse_clock_timestamp_side(expr: &str, d: &FnDecl) -> Option<String> {
+    let mut norm = remove_whitespace(expr);
+    while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
+        norm = norm[1..norm.len() - 1].to_string();
+    }
+    let clock_params = d
+        .params
+        .iter()
+        .filter(|p| is_clock_type(&p.ty))
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>();
+    if clock_params.is_empty() {
+        return None;
+    }
+
+    if let Some(base) = norm.strip_suffix(".timestamp_ms()") {
+        let base_clean = strip_ref_and_parens_text(base).trim();
+        if clock_params.iter().any(|p| *p == base_clean) {
+            return Some(base_clean.to_string());
+        }
+    }
+
+    for prefix in ["clock::timestamp_ms(", "sui::clock::timestamp_ms("] {
+        if let Some(rest) = norm.strip_prefix(prefix) {
+            if !rest.ends_with(')') {
+                continue;
+            }
+            let inner = strip_ref_and_parens_text(&rest[..rest.len() - 1])
+                .trim()
+                .to_string();
+            if clock_params.iter().any(|p| *p == inner) {
+                return Some(inner);
+            }
+        }
+    }
+
     None
 }
 
@@ -538,6 +646,41 @@ fn parse_assert_guard_cases(
                 });
                 continue;
             }
+            if let Some((coin_param, coin_op_raw, coin_other_side, coin_flipped)) =
+                parse_coin_value_side(&resolved_cond, &param_names)
+            {
+                if let Some((coin_object_param, coin_field_name)) =
+                    parse_direct_object_field_side(&coin_other_side, &param_names)
+                {
+                    let coin_op = if coin_flipped {
+                        reverse_comparison_op(&coin_op_raw)
+                    } else {
+                        coin_op_raw
+                    };
+                    out.push(GuardCase {
+                        kind: GuardKind::CoinValueObjectField {
+                            coin_param,
+                            object_param: coin_object_param,
+                            field_name: coin_field_name,
+                            op: coin_op,
+                        },
+                        source: format!("{}: {}", fq, cond),
+                    });
+                    continue;
+                }
+            }
+            if let Some(clock_param) = parse_clock_timestamp_side(&other_side, d) {
+                out.push(GuardCase {
+                    kind: GuardKind::ObjectFieldClockTimestamp {
+                        param_name: object_param,
+                        field_name,
+                        clock_param,
+                        op,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
             notes.push(format!(
                 "{}: unresolved object-field assert side '{}'",
                 fq, other_side
@@ -558,6 +701,20 @@ fn parse_assert_guard_cases(
                         coin_param,
                         op,
                         rhs_literal: lit,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+            if let Some((object_param, field_name)) =
+                parse_direct_object_field_side(&other_side, &param_names)
+            {
+                out.push(GuardCase {
+                    kind: GuardKind::CoinValueObjectField {
+                        coin_param,
+                        object_param,
+                        field_name,
+                        op,
                     },
                     source: format!("{}: {}", fq, cond),
                 });
@@ -591,6 +748,17 @@ fn parse_assert_guard_cases(
                     op,
                     getter_fn,
                     getter_param,
+                },
+                source: format!("{}: {}", fq, cond),
+            });
+            continue;
+        }
+        if let Some(clock_param) = parse_clock_timestamp_side(&other_side, d) {
+            out.push(GuardCase {
+                kind: GuardKind::ParamClockTimestamp {
+                    param_name: param_side,
+                    clock_param,
+                    op,
                 },
                 source: format!("{}: {}", fq, cond),
             });
@@ -759,6 +927,129 @@ fn synthesize_guard_factory_args(
     Some(args)
 }
 
+fn synthesize_guard_factory_args_with_refs(
+    factory: &FnDecl,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<GuardFactoryArgPlan> {
+    let mut args = Vec::new();
+    let mut prep_lines = Vec::new();
+    let mut cleanup_lines = Vec::new();
+    for (idx, p) in factory.params.iter().enumerate() {
+        let t = p.ty.trim();
+        if t.contains("TxContext") {
+            args.push("test_scenario::ctx(&mut scenario)".to_string());
+            continue;
+        }
+        if is_clock_type(t) {
+            let var = format!("guard_factory_clock_{}_{}", idx, sanitize_ident(&p.name));
+            if t.starts_with("&mut") {
+                prep_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&{}", var));
+            } else {
+                prep_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(var.clone());
+            }
+            cleanup_lines.push(format!("sui::clock::destroy_for_testing({});", var));
+            continue;
+        }
+        if is_coin_type(t) {
+            let var = format!("guard_factory_coin_{}_{}", idx, sanitize_ident(&p.name));
+            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            prep_lines.push(format!(
+                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var
+            ));
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else if t.starts_with('&') {
+                args.push(format!("&{}", var));
+            } else {
+                args.push(var.clone());
+            }
+            if t.starts_with('&') {
+                cleanup_lines.push(format!("transfer::public_transfer({}, SUPER_USER);", var));
+            }
+            continue;
+        }
+        if t.starts_with('&') {
+            let inner_ty = normalize_param_object_type(t);
+            let expr = synthesize_value_expr_for_type(
+                &inner_ty,
+                &factory.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                0,
+            )?;
+            let var = format!("guard_factory_ref_{}_{}", idx, sanitize_ident(&p.name));
+            let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            prep_lines.push(format!("let {}{} = {};", maybe_mut, var, expr));
+            if t.starts_with("&mut") {
+                args.push(format!("&mut {}", var));
+            } else {
+                args.push(format!("&{}", var));
+            }
+            if should_transfer_call_return_with_keys(
+                &inner_ty,
+                &factory.module_name,
+                key_structs_by_module,
+            ) {
+                cleanup_lines.push(cleanup_stmt_for_type(
+                    &factory.module_name,
+                    &inner_ty,
+                    &var,
+                    fn_lookup,
+                    key_structs_by_module,
+                ));
+            }
+            continue;
+        }
+
+        if is_vector_type(t) {
+            args.push(vector_literal_expr_for_type(t)?);
+        } else if t == "u64" {
+            args.push(default_u64_arg_for_param(&p.name));
+        } else if is_numeric_type(t) {
+            args.push("1".to_string());
+        } else if t == "bool" {
+            args.push("false".to_string());
+        } else if t == "address" {
+            args.push("SUPER_USER".to_string());
+        } else if is_id_type(t) {
+            args.push("sui::object::id_from_address(OTHER)".to_string());
+        } else if is_option_type(t) {
+            args.push(option_none_expr_for_type(t));
+        } else if is_string_type(t) {
+            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+        } else {
+            args.push(synthesize_value_expr_for_type(
+                t,
+                &factory.module_name,
+                fn_lookup,
+                Some(&format!("{}::{}", factory.module_name, factory.fn_name)),
+                0,
+            )?);
+        }
+    }
+    Some(GuardFactoryArgPlan {
+        args,
+        prep_lines,
+        cleanup_lines,
+    })
+}
+
 fn pick_guard_factory_call_for_type(
     d: &FnDecl,
     type_key: &str,
@@ -830,7 +1121,9 @@ fn pick_guard_shared_creator_plan(
                 continue;
             }
         }
-        let Some(args) = synthesize_guard_factory_args(f, fn_lookup) else {
+        let Some(arg_plan) =
+            synthesize_guard_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        else {
             continue;
         };
         let type_args = if has_unbound_type_params(f) {
@@ -840,9 +1133,11 @@ fn pick_guard_shared_creator_plan(
         };
         let plan = GuardSharedCreatorPlan {
             fn_name: f.fn_name.clone(),
-            args,
+            args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
+            prep_lines: arg_plan.prep_lines,
+            cleanup_lines: arg_plan.cleanup_lines,
         };
         let score = f.params.len();
         if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
@@ -1202,10 +1497,8 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             GuardObjectProvisionSource::SharedInit | GuardObjectProvisionSource::OwnedInit
         )
     });
-    let has_init_bootstrap_helper = module_fns
-        .map(|fns| fns.contains_key("bootstrap_init_for_testing"))
-        .unwrap_or(false);
-    if needs_init_bootstrap && !has_init_bootstrap_helper {
+    let init_bootstrap_helper_name = module_fns.and_then(pick_init_bootstrap_helper_name);
+    if needs_init_bootstrap && init_bootstrap_helper_name.is_none() {
         return None;
     }
 
@@ -1241,6 +1534,9 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
     }) {
         if let Some(plan) = &shared_creator_plan {
             lines_before_tx.push("{".to_string());
+            for prep in &plan.prep_lines {
+                lines_before_tx.push(format!("    {}", prep));
+            }
             let call_path = if plan.type_args.is_empty() {
                 format!("{}::{}", d.module_name, plan.fn_name)
             } else {
@@ -1259,24 +1555,33 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                     env.key_structs_by_module,
                 ) {
                     lines_before_tx.push(format!("    let seed_ret_obj = {};", call_expr));
-                    lines_before_tx.push(
-                        "    transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                    let seed_cleanup = cleanup_stmt_for_type(
+                        &d.module_name,
+                        ret_ty,
+                        "seed_ret_obj",
+                        env.fn_lookup,
+                        env.key_structs_by_module,
                     );
+                    lines_before_tx.push(format!("    {}", seed_cleanup));
                 } else {
                     lines_before_tx.push(format!("    {};", call_expr));
                 }
             } else {
                 lines_before_tx.push(format!("    {};", call_expr));
             }
+            for cleanup in &plan.cleanup_lines {
+                lines_before_tx.push(format!("    {}", cleanup));
+            }
             lines_before_tx.push("};".to_string());
             needs_next_tx_before_use = true;
         }
     }
     if needs_init_bootstrap {
+        let bootstrap_name = init_bootstrap_helper_name?;
         lines_before_tx.push("{".to_string());
         lines_before_tx.push(format!(
-            "    {}::bootstrap_init_for_testing(test_scenario::ctx(&mut scenario));",
-            d.module_name
+            "    {}::{}(test_scenario::ctx(&mut scenario));",
+            d.module_name, bootstrap_name
         ));
         lines_before_tx.push("};".to_string());
         needs_next_tx_before_use = true;
@@ -1372,10 +1677,14 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
         if moved_object_vars_on_call.contains(&obj.var_name) {
             continue;
         }
-        cleanup.push(format!(
-            "transfer::public_transfer({}, SUPER_USER);",
-            obj.var_name
-        ));
+        let cleanup_stmt = cleanup_stmt_for_type(
+            &d.module_name,
+            &obj.type_name,
+            &obj.var_name,
+            env.fn_lookup,
+            env.key_structs_by_module,
+        );
+        cleanup.push(cleanup_stmt);
     }
     for coin in &coin_needs {
         if !coin.moved_on_call {
@@ -1419,16 +1728,15 @@ fn render_cap_role_guard_test(
     let module_bootstrap = bootstrap_catalog
         .get(&d.module_name)
         .unwrap_or(&empty_bootstrap);
-    let has_bootstrap_helper = fn_lookup
+    let init_bootstrap_helper_name = fn_lookup
         .get(&d.module_name)
-        .map(|fns| fns.contains_key("bootstrap_init_for_testing"))
-        .unwrap_or(false);
+        .and_then(pick_init_bootstrap_helper_name);
     let cap_type_key = type_key_from_type_name(cap_type);
     let use_helper_path = module_helpers.owned_types.contains(&cap_type_key)
         || module_helpers.shared_types.contains(&cap_type_key);
     let use_bootstrap_path = module_bootstrap.one_time_witness_init
         && module_bootstrap.init_owned_types.contains(&cap_type_key)
-        && has_bootstrap_helper;
+        && init_bootstrap_helper_name.is_some();
     let creator_plan = if !use_helper_path && !use_bootstrap_path {
         module_fns.and_then(|fns| {
             let required_cap_type_keys = std::collections::BTreeSet::from([cap_type_key.clone()]);
@@ -1468,14 +1776,18 @@ fn render_cap_role_guard_test(
         lines.push("        transfer::public_transfer(cap_obj, SUPER_USER);".to_string());
         lines.push("    };".to_string());
     } else if use_bootstrap_path {
+        let bootstrap_name = init_bootstrap_helper_name?;
         lines.push("    {".to_string());
         lines.push(format!(
-            "        {}::bootstrap_init_for_testing(test_scenario::ctx(&mut scenario));",
-            d.module_name
+            "        {}::{}(test_scenario::ctx(&mut scenario));",
+            d.module_name, bootstrap_name
         ));
         lines.push("    };".to_string());
     } else if let Some(plan) = creator_plan {
         lines.push("    {".to_string());
+        for prep in &plan.prep_lines {
+            lines.push(format!("        {}", prep));
+        }
         let call_path = if plan.type_args.is_empty() {
             format!("{}::{}", d.module_name, plan.fn_name)
         } else {
@@ -1491,14 +1803,22 @@ fn render_cap_role_guard_test(
             if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
             {
                 lines.push(format!("        let seed_ret_obj = {};", call_expr));
-                lines.push(
-                    "        transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                let seed_cleanup = cleanup_stmt_for_type(
+                    &d.module_name,
+                    ret_ty,
+                    "seed_ret_obj",
+                    fn_lookup,
+                    key_structs_by_module,
                 );
+                lines.push(format!("        {}", seed_cleanup));
             } else {
                 lines.push(format!("        {};", call_expr));
             }
         } else {
             lines.push(format!("        {};", call_expr));
+        }
+        for cleanup in &plan.cleanup_lines {
+            lines.push(format!("        {}", cleanup));
         }
         lines.push("    };".to_string());
     }
@@ -1637,7 +1957,14 @@ fn render_guard_call_test(
         if should_transfer_call_return_with_keys(ret_ty, &d.module_name, env.key_structs_by_module)
         {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
-            lines.push("        transfer::public_transfer(tw_ret_obj, SUPER_USER);".to_string());
+            let ret_cleanup = cleanup_stmt_for_type(
+                &d.module_name,
+                ret_ty,
+                "tw_ret_obj",
+                env.fn_lookup,
+                env.key_structs_by_module,
+            );
+            lines.push(format!("        {}", ret_cleanup));
         } else {
             lines.push(format!("        {};", call_expr));
         }
@@ -1863,6 +2190,145 @@ fn render_param_object_field_guard_test(
     render_param_guard_test(d, env, case_idx, param_name, &prep, &bad_expr)
 }
 
+fn set_clock_for_guard(
+    setup_lines: &mut Vec<String>,
+    clock_param: &str,
+    timestamp_expr: &str,
+) -> bool {
+    let clock_var = format!("clock_{}", sanitize_ident(clock_param));
+    let mut matched_idx: Option<usize> = None;
+    for (idx, line) in setup_lines.iter().enumerate() {
+        if line.contains(&format!("{} = sui::clock::create_for_testing(", clock_var)) {
+            matched_idx = Some(idx);
+            break;
+        }
+    }
+    let Some(idx) = matched_idx else {
+        return false;
+    };
+    if setup_lines[idx].contains(&format!("let {} = ", clock_var)) {
+        setup_lines[idx] = setup_lines[idx].replacen("let ", "let mut ", 1);
+    }
+    setup_lines.insert(
+        idx + 1,
+        format!(
+            "sui::clock::set_for_testing(&mut {}, {});",
+            clock_var, timestamp_expr
+        ),
+    );
+    true
+}
+
+fn render_param_clock_guard_test(
+    d: &FnDecl,
+    env: &GuardEnv<'_>,
+    case_idx: usize,
+    param_name: &str,
+    clock_param: &str,
+    op: &str,
+) -> Option<Vec<String>> {
+    let (mut setup_lines, mut call_args, cleanup, _param_runtime, _param_arg_values) =
+        build_common_call_plan(d, env)?;
+    if !set_clock_for_guard(&mut setup_lines, clock_param, "1000000") {
+        return None;
+    }
+    let bad_expr = violating_getter_arg(op, "1000000")?;
+    let param_idx = d.params.iter().position(|p| p.name == param_name)?;
+    call_args[param_idx] = bad_expr;
+    render_guard_call_test(d, env, case_idx, &setup_lines, &[], &call_args, &cleanup)
+}
+
+fn render_object_field_clock_guard_test(
+    d: &FnDecl,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    env: &GuardEnv<'_>,
+    case_idx: usize,
+    param_name: &str,
+    field_name: &str,
+    clock_param: &str,
+    op: &str,
+) -> Option<Vec<String>> {
+    let (mut setup_lines, call_args, cleanup, param_runtime, _param_arg_values) =
+        build_common_call_plan(d, env)?;
+    let runtime_obj = param_runtime.get(param_name)?;
+    let getter_fn = pick_numeric_accessor_for_object_field(d, accessor_map, param_name, field_name)?;
+    let bound_var = format!("guard_obj_clock_bound_{}", case_idx);
+    let prep = vec![format!(
+        "let {} = {}::{}(&{});",
+        bound_var, d.module_name, getter_fn, runtime_obj
+    )];
+    let timestamp_expr = match op {
+        ">" | "<" | "!=" => bound_var.clone(),
+        "==" | ">=" => format!("({} + 1)", bound_var),
+        // Without proving bound_var > 0, synthesizing "<=" safely is not deterministic.
+        "<=" => return None,
+        _ => return None,
+    };
+    if !set_clock_for_guard(&mut setup_lines, clock_param, &timestamp_expr) {
+        return None;
+    }
+    render_guard_call_test(d, env, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+}
+
+fn render_coin_value_object_field_guard_test(
+    d: &FnDecl,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    env: &GuardEnv<'_>,
+    case_idx: usize,
+    coin_param: &str,
+    object_param: &str,
+    field_name: &str,
+    op: &str,
+) -> Option<Vec<String>> {
+    let (mut setup_lines, mut call_args, mut cleanup, param_runtime, _param_arg_values) =
+        build_common_call_plan(d, env)?;
+    let param_idx = d.params.iter().position(|p| p.name == coin_param)?;
+    let param_ty = d.params.get(param_idx)?.ty.trim();
+    if !is_coin_type(param_ty) {
+        return None;
+    }
+    let runtime_obj = param_runtime.get(object_param)?;
+    let getter_fn =
+        pick_numeric_accessor_for_object_field(d, accessor_map, object_param, field_name)?;
+    let bound_var = format!("guard_coin_bound_{}", case_idx);
+
+    let default_coin_var = format!("coin_{}", sanitize_ident(coin_param));
+    setup_lines
+        .retain(|l| !(l.contains("coin::mint_for_testing") && l.contains(&default_coin_var)));
+    cleanup.retain(|l| !l.contains(&format!("{}{}", default_coin_var, ",")));
+
+    let bad_coin_var = format!("guard_bad_coin_{}", case_idx);
+    let bad_amount = violating_getter_arg(op, &bound_var)?;
+    let mut prep = Vec::new();
+    prep.push(format!(
+        "let {} = {}::{}(&{});",
+        bound_var, d.module_name, getter_fn, runtime_obj
+    ));
+    let maybe_mut = if param_ty.starts_with("&mut") {
+        "mut "
+    } else {
+        ""
+    };
+    prep.push(format!(
+        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>({}, test_scenario::ctx(&mut scenario));",
+        maybe_mut, bad_coin_var, bad_amount
+    ));
+    call_args[param_idx] = if param_ty.starts_with("&mut") {
+        format!("&mut {}", bad_coin_var)
+    } else if param_ty.starts_with('&') {
+        format!("&{}", bad_coin_var)
+    } else {
+        bad_coin_var.clone()
+    };
+    if param_ty.starts_with('&') {
+        cleanup.push(format!(
+            "transfer::public_transfer({}, SUPER_USER);",
+            bad_coin_var
+        ));
+    }
+    render_guard_call_test(d, env, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+}
+
 pub(super) fn render_guard_tests_for_function(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
@@ -2061,6 +2527,73 @@ pub(super) fn render_guard_tests_for_function(
                 } else {
                     notes.push(format!(
                         "{}: could not synthesize coin-value failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::CoinValueObjectField {
+                coin_param,
+                object_param,
+                field_name,
+                op,
+            } => {
+                if let Some(lines) = render_coin_value_object_field_guard_test(
+                    d,
+                    accessor_map,
+                    &env,
+                    idx,
+                    coin_param,
+                    object_param,
+                    field_name,
+                    op,
+                ) {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize coin-value/object-field failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::ParamClockTimestamp {
+                param_name,
+                clock_param,
+                op,
+            } => {
+                if let Some(lines) =
+                    render_param_clock_guard_test(d, &env, idx, param_name, clock_param, op)
+                {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize param-vs-clock failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::ObjectFieldClockTimestamp {
+                param_name,
+                field_name,
+                clock_param,
+                op,
+            } => {
+                if let Some(lines) = render_object_field_clock_guard_test(
+                    d,
+                    accessor_map,
+                    &env,
+                    idx,
+                    param_name,
+                    field_name,
+                    clock_param,
+                    op,
+                ) {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize object-field/clock failure test ({})",
                         module_fn_label(d),
                         case.source
                     ));

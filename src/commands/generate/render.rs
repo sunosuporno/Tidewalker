@@ -426,6 +426,13 @@ fn build_deep_chain_summary(
     summary::build_deep_chain_summary(deep_overflow_paths)
 }
 
+fn build_mut_param_fallback_summary(
+    d: &FnDecl,
+    existing_summary: &StateChangeSummary,
+) -> StateChangeSummary {
+    summary::build_mut_param_fallback_summary(d, existing_summary)
+}
+
 fn render_state_change_summary_lines(summary: &StateChangeSummary) -> Vec<String> {
     summary::render_state_change_summary_lines(summary)
 }
