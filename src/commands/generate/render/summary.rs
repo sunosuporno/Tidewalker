@@ -100,11 +100,7 @@ pub(super) fn render_state_change_summary_lines(summary: &StateChangeSummary) ->
     } else {
         out.push(format!(
             "// asserted: {}",
-            asserted
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+            asserted.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
     if potential.is_empty() {
@@ -112,11 +108,7 @@ pub(super) fn render_state_change_summary_lines(summary: &StateChangeSummary) ->
     } else {
         out.push(format!(
             "// potential_change: {}",
-            potential
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+            potential.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
     out

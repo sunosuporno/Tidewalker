@@ -44,28 +44,30 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
         }
         let (is_fn_decl, is_public, is_entry, name, type_params) =
             if t.starts_with("public entry fun ") {
-            let after = &t["public entry fun ".len()..];
-            let (name, type_params) = extract_fn_name_and_type_params(after);
-            (true, true, true, name, type_params)
-        } else if t.starts_with("entry fun ") {
-            let after = &t["entry fun ".len()..];
-            let (name, type_params) = extract_fn_name_and_type_params(after);
-            (true, false, true, name, type_params)
-        } else if t.starts_with("public fun ") {
-            let after = &t["public fun ".len()..];
-            let (name, type_params) = extract_fn_name_and_type_params(after);
-            (true, true, false, name, type_params)
-        } else if t.starts_with("public(package) fun ") {
-            let after = &t["public(package) fun ".len()..];
-            let (name, type_params) = extract_fn_name_and_type_params(after);
-            (true, true, false, name, type_params)
-        } else if t.starts_with("fun ") {
-            let after = &t["fun ".len()..];
-            let (name, type_params) = extract_fn_name_and_type_params(after);
-            (true, false, false, name, type_params)
-        } else {
-            (false, false, false, String::new(), Vec::new())
-        };
+                let after = &t["public entry fun ".len()..];
+                let (name, type_params) = extract_fn_name_and_type_params(after);
+                (true, true, true, name, type_params)
+            } else if t.starts_with("entry fun ") {
+                let after = &t["entry fun ".len()..];
+                let (name, type_params) = extract_fn_name_and_type_params(after);
+                (true, false, true, name, type_params)
+            } else if t.starts_with("public fun ") {
+                let after = &t["public fun ".len()..];
+                let (name, type_params) = extract_fn_name_and_type_params(after);
+                (true, true, false, name, type_params)
+            } else if t.starts_with("public(package) fun ") {
+                let after = &t["public(package) fun ".len()..];
+                let (name, type_params) = extract_fn_name_and_type_params(after);
+                // Treat package-visibility functions as internal helpers for Tidewalker test-target
+                // selection. We still parse them for call-chain analysis.
+                (true, false, false, name, type_params)
+            } else if t.starts_with("fun ") {
+                let after = &t["fun ".len()..];
+                let (name, type_params) = extract_fn_name_and_type_params(after);
+                (true, false, false, name, type_params)
+            } else {
+                (false, false, false, String::new(), Vec::new())
+            };
         if !is_fn_decl || name.is_empty() {
             // Keep #[test_only] pending across blank lines and comments (docs often sit between
             // the attribute and the function). Clear only on non-comment, non-empty content.

@@ -463,7 +463,10 @@ fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error
         let Some(fields) = info.struct_field_types.get(&struct_ty) else {
             continue;
         };
-        if fields.iter().any(|(_, field_ty)| is_container_field_type(field_ty)) {
+        if fields
+            .iter()
+            .any(|(_, field_ty)| is_container_field_type(field_ty))
+        {
             info.shared_types
                 .push((info.module_name.clone(), struct_ty));
         }
@@ -1083,8 +1086,7 @@ fn generate_in_module_test_only_snippet(
         ));
         body.push(format!(
             "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
-            helper_key,
-            type_name
+            helper_key, type_name
         ));
         if is_treasury_cap_type(type_name) {
             if let Some(inner_ty) = extract_treasury_cap_inner_type(type_name) {

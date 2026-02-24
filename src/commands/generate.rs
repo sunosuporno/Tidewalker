@@ -269,6 +269,10 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let mut decls: Vec<FnDecl> = Vec::new();
     let mut module_sources: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut key_structs_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for file in &move_files {
         let content = fs::read_to_string(file)?;
         decls.extend(extract_public_fns(&content));
@@ -282,6 +286,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
                 None
             }
         }) {
+            key_structs_by_module.insert(module_name.clone(), extract_key_struct_types(&content));
             module_sources.insert(module_name, content);
         }
     }
@@ -381,6 +386,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             &helper_catalog,
             &bootstrap_catalog,
             &fn_lookup,
+            &key_structs_by_module,
             &resolved_effects,
             &resolved_vector_effects,
             &resolved_coin_effects,
@@ -455,16 +461,19 @@ struct ObjectNeed {
     type_key: String,
     var_name: String,
     is_mut: bool,
+    is_ref: bool,
 }
 
 impl ObjectNeed {
     fn from_resolved(param: &ParamDecl, type_name: String) -> Self {
+        let raw_ty = param.ty.trim();
         let type_key = type_key_from_type_name(&type_name);
         Self {
             type_name,
             type_key,
             var_name: format!("obj_{}", sanitize_ident(&param.name)),
-            is_mut: param.ty.trim().starts_with("&mut"),
+            is_mut: raw_ty.starts_with("&mut"),
+            is_ref: raw_ty.starts_with('&'),
         }
     }
 }
@@ -548,6 +557,11 @@ fn is_cap_type(ty: &str) -> bool {
 fn is_option_type(ty: &str) -> bool {
     let norm = ty.trim().replace(' ', "");
     norm.starts_with("Option<") || norm.contains("::option::Option<")
+}
+
+fn is_id_type(ty: &str) -> bool {
+    let norm = normalize_param_object_type(ty).replace(' ', "");
+    norm == "ID" || norm.ends_with("::ID")
 }
 
 fn is_vector_type(ty: &str) -> bool {
@@ -707,11 +721,7 @@ fn default_type_args_for_params(type_params: &[String]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-fn concretize_type_params(
-    ty: &str,
-    type_params: &[String],
-    concrete_args: &[String],
-) -> String {
+fn concretize_type_params(ty: &str, type_params: &[String], concrete_args: &[String]) -> String {
     if type_params.is_empty() || concrete_args.is_empty() {
         return ty.to_string();
     }
@@ -752,4 +762,260 @@ fn qualify_type_for_module(module_name: &str, type_name: &str) -> String {
     } else {
         format!("{}::{}", module_name, clean)
     }
+}
+
+fn is_constructor_candidate_name(name: &str) -> bool {
+    name.starts_with("new")
+        || name.starts_with("create")
+        || name.starts_with("from_")
+        || name == "from_u64"
+}
+
+fn constructor_name_score(name: &str) -> usize {
+    if name == "new" || name.starts_with("new_") {
+        0
+    } else if name == "from_u64" || name.starts_with("from_") {
+        1
+    } else if name == "create" || name.starts_with("create_") {
+        2
+    } else {
+        3
+    }
+}
+
+fn is_type_return_match(target_ty: &str, ret_ty: &str, current_module: &str) -> bool {
+    let target = normalize_param_object_type(target_ty).replace(' ', "");
+    let ret = normalize_param_object_type(ret_ty).replace(' ', "");
+    if target.is_empty() || ret.is_empty() {
+        return false;
+    }
+    if target == ret {
+        return true;
+    }
+    let target_base = target
+        .split('<')
+        .next()
+        .unwrap_or(&target)
+        .rsplit("::")
+        .next()
+        .unwrap_or(&target);
+    let ret_base = ret
+        .split('<')
+        .next()
+        .unwrap_or(&ret)
+        .rsplit("::")
+        .next()
+        .unwrap_or(&ret);
+    if target_base != ret_base {
+        return false;
+    }
+    if !target.contains("::") {
+        return ret == format!("{}::{}", current_module, target) || ret_base == target;
+    }
+    let Some((target_mod, _)) = target.rsplit_once("::") else {
+        return false;
+    };
+    let Some((ret_mod, _)) = ret.rsplit_once("::") else {
+        return false;
+    };
+    if target_mod == ret_mod {
+        return true;
+    }
+    if !target_mod.contains("::") && ret_mod.ends_with(&format!("::{}", target_mod)) {
+        return true;
+    }
+    false
+}
+
+fn constructor_candidate_modules(
+    target_ty: &str,
+    current_module: &str,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let target = normalize_param_object_type(target_ty).replace(' ', "");
+    if target.contains("::") {
+        if let Some((mod_hint, _)) = target.rsplit_once("::") {
+            if fn_lookup.contains_key(mod_hint) {
+                out.push(mod_hint.to_string());
+            } else if !mod_hint.contains("::") {
+                for module_name in fn_lookup.keys() {
+                    if module_name == mod_hint || module_name.ends_with(&format!("::{}", mod_hint))
+                    {
+                        out.push(module_name.clone());
+                    }
+                }
+            }
+        }
+    } else if fn_lookup.contains_key(current_module) {
+        out.push(current_module.to_string());
+    }
+    if out.is_empty() {
+        out.extend(fn_lookup.keys().cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn synthesize_value_expr_for_type(
+    target_ty: &str,
+    current_module: &str,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    skip_fq: Option<&str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 3 {
+        return None;
+    }
+    let t = normalize_param_object_type(target_ty).trim().to_string();
+    if t.is_empty() {
+        return None;
+    }
+    if t == "u64" || is_numeric_type(&t) {
+        return Some("1".to_string());
+    }
+    if t == "bool" {
+        return Some("false".to_string());
+    }
+    if t == "address" {
+        return Some("SUPER_USER".to_string());
+    }
+    if is_id_type(&t) {
+        return Some("sui::object::id_from_address(OTHER)".to_string());
+    }
+    if is_option_type(&t) {
+        return Some(option_none_expr_for_type(&t));
+    }
+    if is_string_type(&t) {
+        return Some("std::string::utf8(b\"tidewalker\")".to_string());
+    }
+    if is_vector_type(&t) {
+        return vector_literal_expr_for_type(&t);
+    }
+    if is_coin_type(&t) {
+        return Some(
+            "coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario))"
+                .to_string(),
+        );
+    }
+
+    let candidate_modules = constructor_candidate_modules(&t, current_module, fn_lookup);
+    let mut best: Option<(usize, usize, String)> = None;
+    for module_name in candidate_modules {
+        let Some(module_fns) = fn_lookup.get(&module_name) else {
+            continue;
+        };
+        for f in module_fns.values() {
+            if f.fn_name == "init" {
+                continue;
+            }
+            if let Some(skip) = skip_fq {
+                let fq = format!("{}::{}", f.module_name, f.fn_name);
+                if fq == skip {
+                    continue;
+                }
+            }
+            if !(f.is_public || f.is_entry || f.is_test_only) {
+                continue;
+            }
+            if !is_constructor_candidate_name(&f.fn_name) {
+                continue;
+            }
+            let ret = match &f.return_ty {
+                Some(v) => v,
+                None => continue,
+            };
+            if !is_type_return_match(&t, ret, current_module) {
+                continue;
+            }
+
+            let mut args = Vec::new();
+            let mut ok = true;
+            for p in &f.params {
+                let pty = p.ty.trim();
+                if pty.contains("TxContext") {
+                    args.push("test_scenario::ctx(&mut scenario)".to_string());
+                    continue;
+                }
+                if pty.starts_with('&') {
+                    ok = false;
+                    break;
+                }
+                let arg_expr = match synthesize_value_expr_for_type(
+                    pty,
+                    &f.module_name,
+                    fn_lookup,
+                    Some(&format!("{}::{}", f.module_name, f.fn_name)),
+                    depth + 1,
+                ) {
+                    Some(v) => v,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                };
+                args.push(arg_expr);
+            }
+            if !ok {
+                continue;
+            }
+            let type_args = if has_unbound_type_params(f) {
+                default_type_args_for_params(&f.type_params)
+            } else {
+                Vec::new()
+            };
+            let call_path = if type_args.is_empty() {
+                format!("{}::{}", f.module_name, f.fn_name)
+            } else {
+                format!("{}::{}<{}>", f.module_name, f.fn_name, type_args.join(", "))
+            };
+            let expr = format!("{}({})", call_path, args.join(", "));
+            let score = (f.params.len(), constructor_name_score(&f.fn_name));
+            if best.as_ref().map(|b| score < (b.0, b.1)).unwrap_or(true) {
+                best = Some((score.0, score.1, expr));
+            }
+        }
+    }
+    best.map(|(_, _, expr)| expr)
+}
+
+fn extract_key_struct_types(content: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in content.lines() {
+        let t = line.trim();
+        let after = if let Some(rest) = t.strip_prefix("public struct ") {
+            rest
+        } else if let Some(rest) = t.strip_prefix("struct ") {
+            rest
+        } else {
+            continue;
+        };
+        let Some((name_part, ability_part_raw)) = after.split_once(" has ") else {
+            continue;
+        };
+        let name = name_part
+            .trim()
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let ability_part = ability_part_raw
+            .split('{')
+            .next()
+            .unwrap_or(ability_part_raw)
+            .trim();
+        let has_key = ability_part
+            .split(',')
+            .map(|a| a.trim())
+            .any(|a| a == "key");
+        if has_key {
+            out.insert(name);
+        }
+    }
+    out
 }
