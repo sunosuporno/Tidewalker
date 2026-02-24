@@ -458,11 +458,6 @@ struct ObjectNeed {
 }
 
 impl ObjectNeed {
-    fn new(param: &ParamDecl) -> Self {
-        let type_name = normalize_param_object_type(&param.ty);
-        Self::from_resolved(param, type_name)
-    }
-
     fn from_resolved(param: &ParamDecl, type_name: String) -> Self {
         let type_key = type_key_from_type_name(&type_name);
         Self {

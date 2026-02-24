@@ -30,6 +30,11 @@ enum GuardKind {
         field_name: String,
         op: String,
     },
+    CoinValueConst {
+        coin_param: String,
+        op: String,
+        rhs_literal: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -49,9 +54,18 @@ struct GuardCoinNeed {
 enum GuardObjectProvisionSource {
     SharedHelper,
     SharedInit,
+    SharedCreator,
     OwnedHelper,
     OwnedInit,
     OwnedFactory,
+    OwnedCreatorSender,
+}
+
+#[derive(Debug, Clone)]
+struct GuardSharedCreatorPlan {
+    fn_name: String,
+    args: Vec<String>,
+    type_args: Vec<String>,
 }
 
 fn default_u64_arg_for_param(name: &str) -> String {
@@ -182,6 +196,72 @@ fn parse_object_field_led_comparison(
                         true,
                     ));
                 }
+            }
+        }
+    }
+    None
+}
+
+fn parse_coin_value_side(
+    expr: &str,
+    param_names: &[String],
+) -> Option<(String, String, String, bool)> {
+    let mut norm = remove_whitespace(expr);
+    while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
+        norm = norm[1..norm.len() - 1].to_string();
+    }
+    if norm.contains("&&") || norm.contains("||") {
+        return None;
+    }
+
+    let mut names = param_names.to_vec();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+
+    let mut coin_call_forms = Vec::new();
+    for p in &names {
+        coin_call_forms.push(format!("coin::value(&{})", p));
+        coin_call_forms.push(format!("sui::coin::value(&{})", p));
+        coin_call_forms.push(format!("coin::value({})", p));
+        coin_call_forms.push(format!("sui::coin::value({})", p));
+    }
+
+    for (idx, call_expr) in coin_call_forms.iter().enumerate() {
+        let param = names.get(idx / 4)?.clone();
+        for op in [">=", "<=", "==", "!=", ">", "<"] {
+            let left_prefix = format!("{}{}", call_expr, op);
+            if norm.starts_with(&left_prefix) {
+                let rhs = norm[left_prefix.len()..].trim();
+                if !rhs.is_empty() {
+                    return Some((param, op.to_string(), rhs.to_string(), false));
+                }
+            }
+            let right_suffix = format!("{}{}", op, call_expr);
+            if norm.ends_with(&right_suffix) {
+                let lhs = norm[..norm.len() - right_suffix.len()].trim();
+                if !lhs.is_empty() {
+                    return Some((param, op.to_string(), lhs.to_string(), true));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_object_id_side(expr: &str, param_names: &[String]) -> Option<String> {
+    let mut norm = remove_whitespace(expr);
+    while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
+        norm = norm[1..norm.len() - 1].to_string();
+    }
+    let prefixes = ["object::id(", "sui::object::id("];
+    for prefix in prefixes {
+        if let Some(rest) = norm.strip_prefix(prefix) {
+            if !rest.ends_with(')') {
+                continue;
+            }
+            let inner = &rest[..rest.len() - 1];
+            let stripped = strip_ref_and_parens_text(inner).trim().to_string();
+            if param_names.iter().any(|p| p == &stripped) {
+                return Some(stripped);
             }
         }
     }
@@ -355,8 +435,37 @@ fn parse_assert_guard_cases(
                 });
                 continue;
             }
+            if parse_object_id_side(&other_side, &param_names).is_some() {
+                // Simple object-id equality guards are covered by cap-role style mismatch tests.
+                continue;
+            }
             notes.push(format!(
                 "{}: unresolved object-field assert side '{}'",
+                fq, other_side
+            ));
+            continue;
+        }
+        if let Some((coin_param, op_raw, other_side, flipped)) =
+            parse_coin_value_side(&cond, &param_names)
+        {
+            let op = if flipped {
+                reverse_comparison_op(&op_raw)
+            } else {
+                op_raw
+            };
+            if let Some(lit) = parse_numeric_literal(&other_side) {
+                out.push(GuardCase {
+                    kind: GuardKind::CoinValueConst {
+                        coin_param,
+                        op,
+                        rhs_literal: lit,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+            notes.push(format!(
+                "{}: unresolved non-literal assert side '{}'",
                 fq, other_side
             ));
             continue;
@@ -566,6 +675,35 @@ fn pick_guard_factory_call_for_type(
     best.map(|(_, name, args)| (name, args))
 }
 
+fn pick_guard_shared_creator_plan(
+    d: &FnDecl,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Option<GuardSharedCreatorPlan> {
+    let mut candidates = module_fns
+        .values()
+        .filter(|f| {
+            !f.is_test_only
+                && (f.is_public || f.is_entry)
+                && f.fn_name != d.fn_name
+                && f.fn_name.starts_with("create_shared_")
+                && f.params.iter().any(|p| p.ty.contains("TxContext"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|f| f.params.len());
+    let best = candidates.first()?;
+    let args = synthesize_guard_factory_args(best)?;
+    let type_args = if has_unbound_type_params(best) {
+        default_type_args_for_params(&best.type_params)
+    } else {
+        Vec::new()
+    };
+    Some(GuardSharedCreatorPlan {
+        fn_name: best.fn_name.clone(),
+        args,
+        type_args,
+    })
+}
+
 fn build_common_call_plan(
     d: &FnDecl,
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
@@ -589,9 +727,11 @@ fn build_common_call_plan(
 
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
     let mut coin_needs: Vec<GuardCoinNeed> = Vec::new();
+    let default_type_args = default_type_args_for_params(&d.type_params);
 
     for param in &d.params {
-        let t = param.ty.trim();
+        let resolved_ty = concretize_type_params(&param.ty, &d.type_params, &default_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             call_args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if t == "address" {
@@ -639,7 +779,7 @@ fn build_common_call_plan(
                 needs_mut_binding: t.starts_with("&mut"),
             });
         } else if t.starts_with('&') {
-            let obj = ObjectNeed::new(param);
+            let obj = ObjectNeed::from_resolved(param, normalize_param_object_type(t));
             if obj.is_mut {
                 call_args.push(format!("&mut {}", obj.var_name));
             } else {
@@ -660,6 +800,9 @@ fn build_common_call_plan(
         std::collections::HashMap::new();
     let mut factory_calls: std::collections::HashMap<String, (String, Vec<String>)> =
         std::collections::HashMap::new();
+    let mut shared_creator_plan: Option<GuardSharedCreatorPlan> = None;
+    let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     let empty_bootstrap = ModuleBootstrapCatalog::default();
     let module_bootstrap = bootstrap_catalog
         .get(&d.module_name)
@@ -698,7 +841,31 @@ fn build_common_call_plan(
             );
             factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
         } else {
-            return None;
+            if shared_creator_plan.is_none() {
+                shared_creator_plan =
+                    module_fns.and_then(|fns| pick_guard_shared_creator_plan(d, fns));
+            }
+            if shared_creator_plan.is_some() {
+                if obj.type_key.contains("cap") {
+                    owned_objects.push(obj.clone());
+                    object_sources.insert(
+                        obj.var_name.clone(),
+                        GuardObjectProvisionSource::OwnedCreatorSender,
+                    );
+                } else {
+                    creator_non_cap_type_keys.insert(obj.type_key.clone());
+                    if creator_non_cap_type_keys.len() > 1 {
+                        return None;
+                    }
+                    shared_objects.push(obj.clone());
+                    object_sources.insert(
+                        obj.var_name.clone(),
+                        GuardObjectProvisionSource::SharedCreator,
+                    );
+                }
+            } else {
+                return None;
+            }
         }
     }
 
@@ -734,6 +901,30 @@ fn build_common_call_plan(
                     d.module_name, obj.type_key
                 ));
             }
+            lines_before_tx.push("};".to_string());
+            needs_next_tx_before_use = true;
+        }
+    }
+    if object_sources.values().any(|src| {
+        matches!(
+            src,
+            GuardObjectProvisionSource::SharedCreator
+                | GuardObjectProvisionSource::OwnedCreatorSender
+        )
+    }) {
+        if let Some(plan) = &shared_creator_plan {
+            lines_before_tx.push("{".to_string());
+            let call_path = if plan.type_args.is_empty() {
+                format!("{}::{}", d.module_name, plan.fn_name)
+            } else {
+                format!(
+                    "{}::{}<{}>",
+                    d.module_name,
+                    plan.fn_name,
+                    plan.type_args.join(", ")
+                )
+            };
+            lines_before_tx.push(format!("    {}({});", call_path, plan.args.join(", ")));
             lines_before_tx.push("};".to_string());
             needs_next_tx_before_use = true;
         }
@@ -784,6 +975,14 @@ fn build_common_call_plan(
                     d.module_name,
                     factory_fn,
                     factory_args.join(", ")
+                ));
+            }
+            Some(GuardObjectProvisionSource::OwnedCreatorSender) => {
+                lines_before_tx.push(format!(
+                    "let {}{} = test_scenario::take_from_sender<{}>(&scenario);",
+                    maybe_mut,
+                    obj.var_name,
+                    qualify_type_for_module(&d.module_name, &obj.type_name)
                 ));
             }
             _ => {
@@ -839,6 +1038,7 @@ fn render_cap_role_guard_test(
     cap_param: &str,
     cap_type: &str,
 ) -> Option<Vec<String>> {
+    let module_fns = fn_lookup.get(&d.module_name);
     let empty_helpers = ModuleHelperCatalog::default();
     let module_helpers = helper_catalog.get(&d.module_name).unwrap_or(&empty_helpers);
     let empty_bootstrap = ModuleBootstrapCatalog::default();
@@ -855,7 +1055,12 @@ fn render_cap_role_guard_test(
     let use_bootstrap_path = module_bootstrap.one_time_witness_init
         && module_bootstrap.init_owned_types.contains(&cap_type_key)
         && has_bootstrap_helper;
-    if !use_helper_path && !use_bootstrap_path {
+    let creator_plan = if !use_helper_path && !use_bootstrap_path {
+        module_fns.and_then(|fns| pick_guard_shared_creator_plan(d, fns))
+    } else {
+        None
+    };
+    if !use_helper_path && !use_bootstrap_path && creator_plan.is_none() {
         return None;
     }
 
@@ -879,12 +1084,26 @@ fn render_cap_role_guard_test(
         ));
         lines.push("        transfer::public_transfer(cap_obj, SUPER_USER);".to_string());
         lines.push("    };".to_string());
-    } else {
+    } else if use_bootstrap_path {
         lines.push("    {".to_string());
         lines.push(format!(
             "        {}::bootstrap_init_for_testing(test_scenario::ctx(&mut scenario));",
             d.module_name
         ));
+        lines.push("    };".to_string());
+    } else if let Some(plan) = creator_plan {
+        lines.push("    {".to_string());
+        let call_path = if plan.type_args.is_empty() {
+            format!("{}::{}", d.module_name, plan.fn_name)
+        } else {
+            format!(
+                "{}::{}<{}>",
+                d.module_name,
+                plan.fn_name,
+                plan.type_args.join(", ")
+            )
+        };
+        lines.push(format!("        {}({});", call_path, plan.args.join(", ")));
         lines.push("    };".to_string());
     }
     lines.push("    test_scenario::next_tx(&mut scenario, OTHER);".to_string());
@@ -924,6 +1143,52 @@ fn render_param_guard_test(
     render_guard_call_test(d, case_idx, &setup_lines, prep_lines, &call_args, &cleanup)
 }
 
+fn render_coin_value_guard_test(
+    d: &FnDecl,
+    helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
+    bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    case_idx: usize,
+    coin_param: &str,
+    op: &str,
+    rhs_literal: &str,
+) -> Option<Vec<String>> {
+    let bad_amount = violating_const_arg(op, rhs_literal)?;
+    let _ = parse_numeric_literal(&bad_amount)?;
+    let (mut setup_lines, mut call_args, mut cleanup, _param_runtime, _param_arg_values) =
+        build_common_call_plan(d, helper_catalog, bootstrap_catalog, fn_lookup)?;
+    let param_idx = d.params.iter().position(|p| p.name == coin_param)?;
+    let param_ty = d.params.get(param_idx)?.ty.trim();
+    if !is_coin_type(param_ty) {
+        return None;
+    }
+    let default_coin_var = format!("coin_{}", sanitize_ident(coin_param));
+    setup_lines.retain(|l| !(l.contains("coin::mint_for_testing") && l.contains(&default_coin_var)));
+    cleanup.retain(|l| !l.contains(&format!("{}{}", default_coin_var, ",")));
+
+    let bad_coin_var = format!("guard_bad_coin_{}", case_idx);
+    let mut prep = Vec::new();
+    let maybe_mut = if param_ty.starts_with("&mut") { "mut " } else { "" };
+    prep.push(format!(
+        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>({}, test_scenario::ctx(&mut scenario));",
+        maybe_mut, bad_coin_var, bad_amount
+    ));
+    call_args[param_idx] = if param_ty.starts_with("&mut") {
+        format!("&mut {}", bad_coin_var)
+    } else if param_ty.starts_with('&') {
+        format!("&{}", bad_coin_var)
+    } else {
+        bad_coin_var.clone()
+    };
+    if param_ty.starts_with('&') {
+        cleanup.push(format!(
+            "transfer::public_transfer({}, SUPER_USER);",
+            bad_coin_var
+        ));
+    }
+    render_guard_call_test(d, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+}
+
 fn render_guard_call_test(
     d: &FnDecl,
     case_idx: usize,
@@ -953,7 +1218,17 @@ fn render_guard_call_test(
     for l in prep_lines {
         lines.push(format!("        {}", l));
     }
-    let call_expr = format!("{}({})", fq, call_args.join(", "));
+    let default_type_args = default_type_args_for_params(&d.type_params);
+    let call_target = if has_unbound_type_params(d) {
+        if default_type_args.is_empty() {
+            fq.clone()
+        } else {
+            format!("{}<{}>", fq, default_type_args.join(", "))
+        }
+    } else {
+        fq.clone()
+    };
+    let call_expr = format!("{}({})", call_target, call_args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
         if should_transfer_call_return(ret_ty, &d.module_name) {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
@@ -1290,6 +1565,30 @@ pub(super) fn render_guard_tests_for_function(
                 } else {
                     notes.push(format!(
                         "{}: could not synthesize param-vs-object-field failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::CoinValueConst {
+                coin_param,
+                op,
+                rhs_literal,
+            } => {
+                if let Some(lines) = render_coin_value_guard_test(
+                    d,
+                    helper_catalog,
+                    bootstrap_catalog,
+                    fn_lookup,
+                    idx,
+                    coin_param,
+                    op,
+                    rhs_literal,
+                ) {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize coin-value failure test ({})",
                         module_fn_label(d),
                         case.source
                     ));
