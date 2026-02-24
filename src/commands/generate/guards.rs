@@ -1,4 +1,5 @@
 use super::catalog::{ModuleBootstrapCatalog, ModuleHelperCatalog};
+use super::expr_ast::{self, BinOp, Expr};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -158,10 +159,38 @@ fn reverse_comparison_op(op: &str) -> String {
     }
 }
 
+fn parse_ast_comparison(expr: &str) -> Option<(Expr, BinOp, Expr)> {
+    let parsed = expr_ast::parse_expr(expr)?;
+    expr_ast::as_comparison(&parsed)
+}
+
 fn parse_param_led_comparison(
     expr: &str,
     param_names: &[String],
 ) -> Option<(String, String, String, bool)> {
+    if let Some((lhs, op, rhs)) = parse_ast_comparison(expr) {
+        if let Some(param) = expr_ast::as_ident(&lhs) {
+            if param_names.iter().any(|p| p == &param) {
+                return Some((
+                    param,
+                    op.as_str().to_string(),
+                    expr_ast::render_expr(&rhs),
+                    false,
+                ));
+            }
+        }
+        if let Some(param) = expr_ast::as_ident(&rhs) {
+            if param_names.iter().any(|p| p == &param) {
+                return Some((
+                    param,
+                    op.as_str().to_string(),
+                    expr_ast::render_expr(&lhs),
+                    true,
+                ));
+            }
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -198,6 +227,31 @@ fn parse_object_field_led_comparison(
     expr: &str,
     param_names: &[String],
 ) -> Option<(String, String, String, String, bool)> {
+    if let Some((lhs, op, rhs)) = parse_ast_comparison(expr) {
+        if let Some((base, field)) = expr_ast::as_field_ident(&lhs) {
+            if param_names.iter().any(|p| p == &base) {
+                return Some((
+                    base,
+                    field,
+                    op.as_str().to_string(),
+                    expr_ast::render_expr(&rhs),
+                    false,
+                ));
+            }
+        }
+        if let Some((base, field)) = expr_ast::as_field_ident(&rhs) {
+            if param_names.iter().any(|p| p == &base) {
+                return Some((
+                    base,
+                    field,
+                    op.as_str().to_string(),
+                    expr_ast::render_expr(&lhs),
+                    true,
+                ));
+            }
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -249,10 +303,15 @@ fn parse_object_field_led_comparison(
     None
 }
 
-fn parse_direct_object_field_side(
-    expr: &str,
-    param_names: &[String],
-) -> Option<(String, String)> {
+fn parse_direct_object_field_side(expr: &str, param_names: &[String]) -> Option<(String, String)> {
+    if let Some(parsed) = expr_ast::parse_expr(expr) {
+        if let Some((base, field)) = expr_ast::as_field_ident(&parsed) {
+            if param_names.iter().any(|p| p == &base) {
+                return Some((base, field));
+            }
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -274,6 +333,38 @@ fn parse_coin_value_side(
     expr: &str,
     param_names: &[String],
 ) -> Option<(String, String, String, bool)> {
+    let coin_value_param_from_expr = |e: &Expr| -> Option<String> {
+        let (func, args) = expr_ast::as_call(e)?;
+        let is_coin_value = matches!(func.as_str(), "coin::value" | "sui::coin::value" | "value");
+        if !is_coin_value || args.len() != 1 {
+            return None;
+        }
+        let coin_param = expr_ast::as_ident(&args[0])?;
+        if param_names.iter().any(|p| p == &coin_param) {
+            Some(coin_param)
+        } else {
+            None
+        }
+    };
+    if let Some((lhs, op, rhs)) = parse_ast_comparison(expr) {
+        if let Some(param) = coin_value_param_from_expr(&lhs) {
+            return Some((
+                param,
+                op.as_str().to_string(),
+                expr_ast::render_expr(&rhs),
+                false,
+            ));
+        }
+        if let Some(param) = coin_value_param_from_expr(&rhs) {
+            return Some((
+                param,
+                op.as_str().to_string(),
+                expr_ast::render_expr(&lhs),
+                true,
+            ));
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -316,6 +407,33 @@ fn parse_coin_value_side(
 }
 
 fn parse_clock_timestamp_side(expr: &str, d: &FnDecl) -> Option<String> {
+    let is_clock_param = |name: &str| -> bool {
+        d.params
+            .iter()
+            .any(|p| p.name == name && is_clock_type(&p.ty))
+    };
+    let clock_param_from_expr = |e: &Expr| -> Option<String> {
+        let (func, args) = expr_ast::as_call(e)?;
+        let is_ts = matches!(
+            func.as_str(),
+            "timestamp_ms" | "clock::timestamp_ms" | "sui::clock::timestamp_ms"
+        );
+        if !is_ts || args.len() != 1 {
+            return None;
+        }
+        let arg = expr_ast::as_ident(&args[0])?;
+        if is_clock_param(&arg) {
+            Some(arg)
+        } else {
+            None
+        }
+    };
+    if let Some(parsed) = expr_ast::parse_expr(expr) {
+        if let Some(param) = clock_param_from_expr(&parsed) {
+            return Some(param);
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -355,6 +473,18 @@ fn parse_clock_timestamp_side(expr: &str, d: &FnDecl) -> Option<String> {
 }
 
 fn parse_object_id_side(expr: &str, param_names: &[String]) -> Option<String> {
+    if let Some(parsed) = expr_ast::parse_expr(expr) {
+        if let Some((func, args)) = expr_ast::as_call(&parsed) {
+            if matches!(func.as_str(), "object::id" | "sui::object::id") && args.len() == 1 {
+                if let Some(arg) = expr_ast::as_ident(&args[0]) {
+                    if param_names.iter().any(|p| p == &arg) {
+                        return Some(arg);
+                    }
+                }
+            }
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -376,6 +506,23 @@ fn parse_object_id_side(expr: &str, param_names: &[String]) -> Option<String> {
 }
 
 fn parse_sender_side(expr: &str, d: &FnDecl) -> bool {
+    if let Some(parsed) = expr_ast::parse_expr(expr) {
+        if let Some((func, args)) = expr_ast::as_call(&parsed) {
+            if matches!(
+                func.as_str(),
+                "sender" | "tx_context::sender" | "sui::tx_context::sender"
+            ) && args.len() == 1
+            {
+                if let Some(inner) = expr_ast::as_ident(&args[0]) {
+                    return d
+                        .params
+                        .iter()
+                        .any(|p| p.name == inner && p.ty.contains("TxContext"));
+                }
+            }
+        }
+    }
+
     let mut norm = remove_whitespace(expr);
     while norm.starts_with('(') && norm.ends_with(')') && norm.len() > 2 {
         norm = norm[1..norm.len() - 1].to_string();
@@ -447,6 +594,38 @@ fn parse_getter_side(
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
     expr: &str,
 ) -> Option<(String, String)> {
+    if let Some(parsed) = expr_ast::parse_expr(expr) {
+        if let Some((func, args)) = expr_ast::as_call(&parsed) {
+            if args.len() == 1 {
+                if let Some(arg) = expr_ast::as_ident(&args[0]) {
+                    let getter_fn = if func.contains("::") {
+                        if !func.starts_with(&format!("{}::", d.module_name)) {
+                            String::new()
+                        } else {
+                            func.split("::").last().unwrap_or("").to_string()
+                        }
+                    } else {
+                        func
+                    };
+                    if !getter_fn.is_empty() {
+                        let param = d.params.iter().find(|p| p.name == arg)?;
+                        if !param.ty.trim().starts_with('&') {
+                            return None;
+                        }
+                        let param_obj_ty = normalize_param_object_type(&param.ty);
+                        let module_accessors = accessor_map.get(&d.module_name)?;
+                        if module_accessors
+                            .iter()
+                            .any(|a| a.fn_name == getter_fn && a.param_ty == param_obj_ty)
+                        {
+                            return Some((getter_fn, arg));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let open = expr.find('(')?;
     let close = expr.rfind(')')?;
     if close <= open {
@@ -483,6 +662,40 @@ fn parse_getter_side(
         return None;
     }
     Some((getter_fn, arg.to_string()))
+}
+
+fn parse_getter_side_expr(
+    d: &FnDecl,
+    accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
+    expr: &Expr,
+) -> Option<(String, String)> {
+    let (func, args) = expr_ast::as_call(expr)?;
+    if args.len() != 1 {
+        return None;
+    }
+    let arg = expr_ast::as_ident(&args[0])?;
+    let getter_fn = if func.contains("::") {
+        if !func.starts_with(&format!("{}::", d.module_name)) {
+            return None;
+        }
+        func.split("::").last()?.to_string()
+    } else {
+        func.to_string()
+    };
+
+    let param = d.params.iter().find(|p| p.name == arg)?;
+    if !param.ty.trim().starts_with('&') {
+        return None;
+    }
+    let param_obj_ty = normalize_param_object_type(&param.ty);
+    let module_accessors = accessor_map.get(&d.module_name)?;
+    if !module_accessors
+        .iter()
+        .any(|a| a.fn_name == getter_fn && a.param_ty == param_obj_ty)
+    {
+        return None;
+    }
+    Some((getter_fn, arg))
 }
 
 fn parse_simple_let_alias(stmt: &str) -> Option<(String, String)> {
@@ -578,6 +791,44 @@ fn parse_assert_guard_cases(
             None => continue,
         };
         let resolved_cond = resolve_condition_aliases(&cond, &local_aliases);
+        if let Some((lhs, op_raw, rhs)) = parse_ast_comparison(&resolved_cond) {
+            let lhs_param = expr_ast::as_ident(&lhs).filter(|name| {
+                d.params
+                    .iter()
+                    .any(|p| p.name == *name && !p.ty.trim().starts_with('&'))
+            });
+            let rhs_param = expr_ast::as_ident(&rhs).filter(|name| {
+                d.params
+                    .iter()
+                    .any(|p| p.name == *name && !p.ty.trim().starts_with('&'))
+            });
+            let lhs_getter = parse_getter_side_expr(d, accessor_map, &lhs);
+            let rhs_getter = parse_getter_side_expr(d, accessor_map, &rhs);
+            if let (Some(param_name), Some((getter_fn, getter_param))) = (lhs_param, rhs_getter) {
+                out.push(GuardCase {
+                    kind: GuardKind::ParamGetter {
+                        param_name,
+                        op: op_raw.as_str().to_string(),
+                        getter_fn,
+                        getter_param,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+            if let (Some(param_name), Some((getter_fn, getter_param))) = (rhs_param, lhs_getter) {
+                out.push(GuardCase {
+                    kind: GuardKind::ParamGetter {
+                        param_name,
+                        op: reverse_comparison_op(op_raw.as_str()),
+                        getter_fn,
+                        getter_param,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+        }
         if let Some((object_param, field_name, op_raw, other_side, flipped)) =
             parse_object_field_led_comparison(&resolved_cond, &param_names)
         {
@@ -2251,7 +2502,8 @@ fn render_object_field_clock_guard_test(
     let (mut setup_lines, call_args, cleanup, param_runtime, _param_arg_values) =
         build_common_call_plan(d, env)?;
     let runtime_obj = param_runtime.get(param_name)?;
-    let getter_fn = pick_numeric_accessor_for_object_field(d, accessor_map, param_name, field_name)?;
+    let getter_fn =
+        pick_numeric_accessor_for_object_field(d, accessor_map, param_name, field_name)?;
     let bound_var = format!("guard_obj_clock_bound_{}", case_idx);
     let prep = vec![format!(
         "let {} = {}::{}(&{});",

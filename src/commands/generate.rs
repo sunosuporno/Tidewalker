@@ -6,6 +6,7 @@ use std::process::Command;
 
 mod catalog;
 mod chain;
+mod expr_ast;
 mod guards;
 mod parser;
 mod render;
