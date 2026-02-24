@@ -685,6 +685,13 @@ fn split_type_module_and_base<'a>(ty: &'a str, default_module: &'a str) -> (&'a 
     }
 }
 
+fn fn_body_shares_object(body_lines: &[String]) -> bool {
+    body_lines.iter().any(|line| {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        stmt.contains("::share_object(") || stmt.contains("::public_share_object(")
+    })
+}
+
 fn is_known_key_struct(
     ty: &str,
     default_module: &str,
@@ -695,6 +702,12 @@ fn is_known_key_struct(
         .get(module)
         .map(|types| types.contains(base))
         .unwrap_or(false)
+}
+
+fn is_clock_type(ty: &str) -> bool {
+    let clean = normalize_param_object_type(ty);
+    let no_generics = clean.split('<').next().unwrap_or(&clean).trim();
+    no_generics == "Clock" || no_generics.ends_with("::Clock")
 }
 
 fn should_transfer_call_return_basic(ret_ty: &str, _module_name: &str) -> bool {
@@ -712,6 +725,64 @@ fn should_transfer_call_return_basic(ret_ty: &str, _module_name: &str) -> bool {
         return false;
     }
     is_coin_type(t) || is_treasury_cap_type(t)
+}
+
+fn parse_table_call_pair(stmt: &str, call_name: &str) -> Option<(String, String)> {
+    let marker = format!("table::{}(", call_name);
+    let start = stmt.find(&marker)?;
+    let args_start = start + marker.len();
+    let mut depth: i32 = 1;
+    let mut args_end: Option<usize> = None;
+    for (off, ch) in stmt[args_start..].char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                args_end = Some(args_start + off);
+                break;
+            }
+        }
+    }
+    let end = args_end?;
+    let args = split_args(&stmt[args_start..end]);
+    if args.len() < 2 {
+        return None;
+    }
+    let table_arg = strip_ref_and_parens_text(&args[0]).trim().to_string();
+    let key_arg = strip_ref_and_parens_text(&args[1]).trim().to_string();
+    if table_arg.is_empty() || key_arg.is_empty() {
+        return None;
+    }
+    Some((table_arg, key_arg))
+}
+
+fn requires_table_key_prestate(body_lines: &[String]) -> bool {
+    let mut contains_pairs: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some(pair) = parse_table_call_pair(stmt, "contains") {
+            contains_pairs.insert(pair);
+        }
+    }
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let borrow_pair = parse_table_call_pair(stmt, "borrow")
+            .or_else(|| parse_table_call_pair(stmt, "borrow_mut"));
+        if let Some(pair) = borrow_pair {
+            if !contains_pairs.contains(&pair) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn should_transfer_call_return_with_keys(

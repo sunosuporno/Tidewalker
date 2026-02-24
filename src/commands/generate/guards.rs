@@ -71,6 +71,7 @@ struct GuardSharedCreatorPlan {
     fn_name: String,
     args: Vec<String>,
     type_args: Vec<String>,
+    return_ty: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +377,58 @@ fn parse_getter_side(
     Some((getter_fn, arg.to_string()))
 }
 
+fn parse_simple_let_alias(stmt: &str) -> Option<(String, String)> {
+    let trimmed = stmt.trim().trim_end_matches(';').trim();
+    let mut rest = trimmed.strip_prefix("let ")?;
+    if let Some(after_mut) = rest.strip_prefix("mut ") {
+        rest = after_mut;
+    }
+    let (lhs_raw, rhs_raw) = rest.split_once('=')?;
+    let lhs = lhs_raw.split(':').next()?.trim();
+    if !is_ident(lhs) {
+        return None;
+    }
+    let rhs = rhs_raw.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some((lhs.to_string(), rhs.to_string()))
+}
+
+fn resolve_alias_value(
+    expr: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    depth: usize,
+) -> String {
+    if depth > 8 {
+        return expr.trim().to_string();
+    }
+    let stripped = strip_ref_and_parens_text(expr).trim().to_string();
+    if !is_ident(&stripped) {
+        return expr.trim().to_string();
+    }
+    let Some(next) = aliases.get(&stripped) else {
+        return expr.trim().to_string();
+    };
+    resolve_alias_value(next, aliases, depth + 1)
+}
+
+fn resolve_condition_aliases(
+    cond: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    for op in [">=", "<=", "==", "!=", ">", "<"] {
+        if let Some(idx) = cond.find(op) {
+            let lhs = cond[..idx].trim();
+            let rhs = cond[idx + op.len()..].trim();
+            let resolved_lhs = resolve_alias_value(lhs, aliases, 0);
+            let resolved_rhs = resolve_alias_value(rhs, aliases, 0);
+            return format!("{} {} {}", resolved_lhs, op, resolved_rhs);
+        }
+    }
+    cond.to_string()
+}
+
 fn parse_assert_guard_cases(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
@@ -398,18 +451,27 @@ fn parse_assert_guard_cases(
     }
 
     let param_names = d.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+    let mut local_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for line in &d.body_lines {
         let stmt = line.split("//").next().unwrap_or("").trim();
-        if stmt.is_empty() || !stmt.contains("assert!(") {
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some((lhs, rhs)) = parse_simple_let_alias(stmt) {
+            local_aliases.insert(lhs, rhs);
+        }
+        if !stmt.contains("assert!(") {
             continue;
         }
         let cond = match extract_assert_condition(stmt) {
             Some(v) => v,
             None => continue,
         };
+        let resolved_cond = resolve_condition_aliases(&cond, &local_aliases);
         if let Some((object_param, field_name, op_raw, other_side, flipped)) =
-            parse_object_field_led_comparison(&cond, &param_names)
+            parse_object_field_led_comparison(&resolved_cond, &param_names)
         {
             if d.params
                 .iter()
@@ -483,7 +545,7 @@ fn parse_assert_guard_cases(
             continue;
         }
         if let Some((coin_param, op_raw, other_side, flipped)) =
-            parse_coin_value_side(&cond, &param_names)
+            parse_coin_value_side(&resolved_cond, &param_names)
         {
             let op = if flipped {
                 reverse_comparison_op(&op_raw)
@@ -508,7 +570,7 @@ fn parse_assert_guard_cases(
             continue;
         }
         let (param_side, op, other_side, flipped) =
-            match parse_param_led_comparison(&cond, &param_names) {
+            match parse_param_led_comparison(&resolved_cond, &param_names) {
                 Some(v) => v,
                 None => {
                     notes.push(format!("{}: unsupported assert condition '{}'", fq, cond));
@@ -737,6 +799,8 @@ fn pick_guard_shared_creator_plan(
     d: &FnDecl,
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    required_cap_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<GuardSharedCreatorPlan> {
     let mut candidates = module_fns
         .values()
@@ -744,23 +808,48 @@ fn pick_guard_shared_creator_plan(
             !f.is_test_only
                 && (f.is_public || f.is_entry)
                 && f.fn_name != d.fn_name
-                && f.fn_name.starts_with("create_shared_")
                 && f.params.iter().any(|p| p.ty.contains("TxContext"))
+                && fn_body_shares_object(&f.body_lines)
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|f| f.params.len());
-    let best = candidates.first()?;
-    let args = synthesize_guard_factory_args(best, fn_lookup)?;
-    let type_args = if has_unbound_type_params(best) {
-        default_type_args_for_params(&best.type_params)
-    } else {
-        Vec::new()
-    };
-    Some(GuardSharedCreatorPlan {
-        fn_name: best.fn_name.clone(),
-        args,
-        type_args,
-    })
+    let mut best: Option<(usize, GuardSharedCreatorPlan)> = None;
+    for f in candidates {
+        if !required_cap_type_keys.is_empty() {
+            let Some(ret_ty) = f.return_ty.as_ref() else {
+                continue;
+            };
+            let ret_key = type_key_from_type_name(ret_ty);
+            if !required_cap_type_keys.contains(&ret_key) {
+                continue;
+            }
+        }
+        if let Some(ret_ty) = f.return_ty.as_ref() {
+            if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
+            {
+                continue;
+            }
+        }
+        let Some(args) = synthesize_guard_factory_args(f, fn_lookup) else {
+            continue;
+        };
+        let type_args = if has_unbound_type_params(f) {
+            default_type_args_for_params(&f.type_params)
+        } else {
+            Vec::new()
+        };
+        let plan = GuardSharedCreatorPlan {
+            fn_name: f.fn_name.clone(),
+            args,
+            type_args,
+            return_ty: f.return_ty.clone(),
+        };
+        let score = f.params.len();
+        if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
+            best = Some((score, plan));
+        }
+    }
+    best.map(|(_, plan)| plan)
 }
 
 fn pick_guard_owned_test_helper_for_type(
@@ -828,6 +917,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
 
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
     let mut coin_needs: Vec<GuardCoinNeed> = Vec::new();
+    let mut clock_cleanup_vars: Vec<String> = Vec::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
     let empty_helpers = ModuleHelperCatalog::default();
     let module_helpers = env
@@ -847,6 +937,29 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
         let t = resolved_ty.trim();
         if t.contains("TxContext") {
             call_args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_clock_type(t) {
+            let var_name = format!("clock_{}", sanitize_ident(&param.name));
+            if t.starts_with("&mut") {
+                lines_before_tx.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                call_args.push(format!("&mut {}", var_name));
+                clock_cleanup_vars.push(var_name);
+            } else if t.starts_with('&') {
+                lines_before_tx.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                call_args.push(format!("&{}", var_name));
+                clock_cleanup_vars.push(var_name);
+            } else {
+                lines_before_tx.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                call_args.push(var_name);
+            }
         } else if t == "address" {
             call_args.push("OTHER".to_string());
             param_arg_values.insert(param.name.clone(), "OTHER".to_string());
@@ -975,6 +1088,14 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
     let mut shared_creator_plan: Option<GuardSharedCreatorPlan> = None;
     let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    let needs_shared_non_cap_object = object_needs
+        .iter()
+        .any(|o| o.is_ref && !is_cap_type(&o.type_name));
+    let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
+        .iter()
+        .filter(|o| o.is_ref && is_cap_type(&o.type_name))
+        .map(|o| o.type_key.clone())
+        .collect();
     for obj in &object_needs {
         let owned_helper_plan = module_fns.and_then(|fns| {
             pick_guard_owned_test_helper_for_type(d, &obj.type_key, fns, env.fn_lookup)
@@ -1009,6 +1130,27 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
         {
             owned_objects.push(obj.clone());
             object_sources.insert(obj.var_name.clone(), GuardObjectProvisionSource::OwnedInit);
+        } else if obj.is_ref && is_cap_type(&obj.type_name) && needs_shared_non_cap_object {
+            if shared_creator_plan.is_none() {
+                shared_creator_plan = module_fns.and_then(|fns| {
+                    pick_guard_shared_creator_plan(
+                        d,
+                        fns,
+                        env.fn_lookup,
+                        env.key_structs_by_module,
+                        &required_creator_cap_type_keys,
+                    )
+                });
+            }
+            if shared_creator_plan.is_some() {
+                owned_objects.push(obj.clone());
+                object_sources.insert(
+                    obj.var_name.clone(),
+                    GuardObjectProvisionSource::OwnedCreatorSender,
+                );
+            } else {
+                return None;
+            }
         } else if let Some((factory_fn, factory_args)) = module_fns
             .and_then(|fns| pick_guard_factory_call_for_type(d, &obj.type_key, fns, env.fn_lookup))
         {
@@ -1020,11 +1162,18 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
         } else {
             if shared_creator_plan.is_none() {
-                shared_creator_plan = module_fns
-                    .and_then(|fns| pick_guard_shared_creator_plan(d, fns, env.fn_lookup));
+                shared_creator_plan = module_fns.and_then(|fns| {
+                    pick_guard_shared_creator_plan(
+                        d,
+                        fns,
+                        env.fn_lookup,
+                        env.key_structs_by_module,
+                        &required_creator_cap_type_keys,
+                    )
+                });
             }
             if obj.is_ref && shared_creator_plan.is_some() {
-                if obj.type_key.contains("cap") {
+                if is_cap_type(&obj.type_name) {
                     owned_objects.push(obj.clone());
                     object_sources.insert(
                         obj.var_name.clone(),
@@ -1102,7 +1251,23 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                     plan.type_args.join(", ")
                 )
             };
-            lines_before_tx.push(format!("    {}({});", call_path, plan.args.join(", ")));
+            let call_expr = format!("{}({})", call_path, plan.args.join(", "));
+            if let Some(ret_ty) = plan.return_ty.as_ref() {
+                if should_transfer_call_return_with_keys(
+                    ret_ty,
+                    &d.module_name,
+                    env.key_structs_by_module,
+                ) {
+                    lines_before_tx.push(format!("    let seed_ret_obj = {};", call_expr));
+                    lines_before_tx.push(
+                        "    transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                    );
+                } else {
+                    lines_before_tx.push(format!("    {};", call_expr));
+                }
+            } else {
+                lines_before_tx.push(format!("    {};", call_expr));
+            }
             lines_before_tx.push("};".to_string());
             needs_next_tx_before_use = true;
         }
@@ -1220,6 +1385,13 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             ));
         }
     }
+    let mut seen_clock_cleanup: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for var in &clock_cleanup_vars {
+        if seen_clock_cleanup.insert(var.clone()) {
+            cleanup.push(format!("sui::clock::destroy_for_testing({});", var));
+        }
+    }
 
     Some((
         lines_before_tx,
@@ -1235,6 +1407,7 @@ fn render_cap_role_guard_test(
     helper_catalog: &std::collections::HashMap<String, ModuleHelperCatalog>,
     bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     case_idx: usize,
     cap_param: &str,
     cap_type: &str,
@@ -1257,7 +1430,16 @@ fn render_cap_role_guard_test(
         && module_bootstrap.init_owned_types.contains(&cap_type_key)
         && has_bootstrap_helper;
     let creator_plan = if !use_helper_path && !use_bootstrap_path {
-        module_fns.and_then(|fns| pick_guard_shared_creator_plan(d, fns, fn_lookup))
+        module_fns.and_then(|fns| {
+            let required_cap_type_keys = std::collections::BTreeSet::from([cap_type_key.clone()]);
+            pick_guard_shared_creator_plan(
+                d,
+                fns,
+                fn_lookup,
+                key_structs_by_module,
+                &required_cap_type_keys,
+            )
+        })
     } else {
         None
     };
@@ -1304,7 +1486,20 @@ fn render_cap_role_guard_test(
                 plan.type_args.join(", ")
             )
         };
-        lines.push(format!("        {}({});", call_path, plan.args.join(", ")));
+        let call_expr = format!("{}({})", call_path, plan.args.join(", "));
+        if let Some(ret_ty) = plan.return_ty.as_ref() {
+            if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
+            {
+                lines.push(format!("        let seed_ret_obj = {};", call_expr));
+                lines.push(
+                    "        transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                );
+            } else {
+                lines.push(format!("        {};", call_expr));
+            }
+        } else {
+            lines.push(format!("        {};", call_expr));
+        }
         lines.push("    };".to_string());
     }
     lines.push("    test_scenario::next_tx(&mut scenario, OTHER);".to_string());
@@ -1699,6 +1894,7 @@ pub(super) fn render_guard_tests_for_function(
                     helper_catalog,
                     bootstrap_catalog,
                     fn_lookup,
+                    key_structs_by_module,
                     idx,
                     cap_param,
                     cap_type,

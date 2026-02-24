@@ -17,6 +17,7 @@ struct SharedCreatorPlan {
     fn_name: String,
     args: Vec<String>,
     type_args: Vec<String>,
+    return_ty: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,7 @@ fn synthesize_requires_call_args(
     requires_extra_coin_slots: &mut std::collections::HashMap<usize, String>,
     pre_coin_counter: &mut usize,
     requires_cleanup_coin_vars: &mut Vec<String>,
+    requires_cleanup_clock_vars: &mut Vec<String>,
     requires_consumed_coin_vars: &mut std::collections::HashSet<String>,
 ) -> Option<(Vec<String>, Vec<String>)> {
     let mut args = Vec::new();
@@ -114,6 +116,29 @@ fn synthesize_requires_call_args(
             }
         } else if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_clock_type(t) {
+            let var = format!("pre_req_clock_{}_{}", req_step_idx, sanitize_ident(&p.name));
+            if t.starts_with("&mut") {
+                prep.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&mut {}", var));
+                requires_cleanup_clock_vars.push(var);
+            } else if t.starts_with('&') {
+                prep.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(format!("&{}", var));
+                requires_cleanup_clock_vars.push(var);
+            } else {
+                prep.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var
+                ));
+                args.push(var);
+            }
         } else if is_coin_type(t) {
             if t.starts_with('&') {
                 if let Some(var) = main_coin_vars.get(coin_slot_idx) {
@@ -399,6 +424,8 @@ fn pick_shared_creator_plan(
     d: &FnDecl,
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    required_cap_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<SharedCreatorPlan> {
     let mut candidates = module_fns
         .values()
@@ -406,23 +433,49 @@ fn pick_shared_creator_plan(
             !f.is_test_only
                 && (f.is_public || f.is_entry)
                 && f.fn_name != d.fn_name
-                && f.fn_name.starts_with("create_shared_")
                 && f.params.iter().any(|p| p.ty.contains("TxContext"))
+                && fn_body_shares_object(&f.body_lines)
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|f| f.params.len());
-    let best = candidates.first()?;
-    let args = synthesize_factory_args(best, fn_lookup)?;
-    let type_args = if has_unbound_type_params(best) {
-        default_type_args_for_params(&best.type_params)
-    } else {
-        Vec::new()
-    };
-    Some(SharedCreatorPlan {
-        fn_name: best.fn_name.clone(),
-        args,
-        type_args,
-    })
+    let mut best: Option<(usize, SharedCreatorPlan)> = None;
+    for f in candidates {
+        if !required_cap_type_keys.is_empty() {
+            let Some(ret_ty) = f.return_ty.as_ref() else {
+                continue;
+            };
+            let ret_key = type_key_from_type_name(ret_ty);
+            if !required_cap_type_keys.contains(&ret_key) {
+                continue;
+            }
+        }
+        if let Some(ret_ty) = f.return_ty.as_ref() {
+            if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
+            {
+                continue;
+            }
+        }
+        let Some(args) = synthesize_factory_args(f, fn_lookup) else {
+            continue;
+        };
+        let type_args = if has_unbound_type_params(f) {
+            default_type_args_for_params(&f.type_params)
+        } else {
+            Vec::new()
+        };
+        let plan = SharedCreatorPlan {
+            fn_name: f.fn_name.clone(),
+            args,
+            type_args,
+            return_ty: f.return_ty.clone(),
+        };
+        let score = f.params.len();
+        if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
+            best = Some((score, plan));
+        }
+    }
+    let (_, best) = best?;
+    Some(best)
 }
 
 pub(super) fn render_best_effort_test(
@@ -450,6 +503,9 @@ pub(super) fn render_best_effort_test(
     {
         return None;
     }
+    if requires_table_key_prestate(&d.body_lines) {
+        return None;
+    }
     let fq = format!("{}::{}", d.module_name, d.fn_name);
     let mut lines = Vec::new();
     lines.push("#[test]".to_string());
@@ -472,6 +528,7 @@ pub(super) fn render_best_effort_test(
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
     let mut coin_needs: Vec<CoinNeed> = Vec::new();
     let mut arg_setup_lines: Vec<String> = Vec::new();
+    let mut clock_cleanup_vars: Vec<String> = Vec::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
 
     for param in &d.params {
@@ -479,6 +536,29 @@ pub(super) fn render_best_effort_test(
         let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
+        } else if is_clock_type(t) {
+            let var_name = format!("clock_{}", sanitize_ident(&param.name));
+            if t.starts_with("&mut") {
+                arg_setup_lines.push(format!(
+                    "let mut {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                args.push(format!("&mut {}", var_name));
+                clock_cleanup_vars.push(var_name);
+            } else if t.starts_with('&') {
+                arg_setup_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                args.push(format!("&{}", var_name));
+                clock_cleanup_vars.push(var_name);
+            } else {
+                arg_setup_lines.push(format!(
+                    "let {} = sui::clock::create_for_testing(test_scenario::ctx(&mut scenario));",
+                    var_name
+                ));
+                args.push(var_name);
+            }
         } else if t == "address" {
             let v = "OTHER".to_string();
             args.push(v.clone());
@@ -595,6 +675,14 @@ pub(super) fn render_best_effort_test(
     let mut shared_creator_plan: Option<SharedCreatorPlan> = None;
     let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    let needs_shared_non_cap_object = object_needs
+        .iter()
+        .any(|o| o.is_ref && !is_cap_type(&o.type_name));
+    let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
+        .iter()
+        .filter(|o| o.is_ref && is_cap_type(&o.type_name))
+        .map(|o| o.type_key.clone())
+        .collect();
     if !object_needs.is_empty() {
         let empty_bootstrap = ModuleBootstrapCatalog::default();
         let module_bootstrap = bootstrap_catalog
@@ -647,6 +735,27 @@ pub(super) fn render_best_effort_test(
                 } else if has_owned_helper {
                     owned_objects.push(obj.clone());
                     object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedHelper);
+                } else if obj.is_ref && is_cap_type(&obj.type_name) && needs_shared_non_cap_object {
+                    if shared_creator_plan.is_none() {
+                        shared_creator_plan = module_fns.and_then(|fns| {
+                            pick_shared_creator_plan(
+                                d,
+                                fns,
+                                fn_lookup,
+                                key_structs_by_module,
+                                &required_creator_cap_type_keys,
+                            )
+                        });
+                    }
+                    if shared_creator_plan.is_some() {
+                        owned_objects.push(obj.clone());
+                        object_sources.insert(
+                            obj.var_name.clone(),
+                            ObjectProvisionSource::OwnedCreatorSender,
+                        );
+                    } else {
+                        return None;
+                    }
                 } else if let Some((factory_fn, factory_args)) = module_fns
                     .and_then(|fns| pick_factory_call_for_type(d, &obj.type_key, fns, fn_lookup))
                 {
@@ -656,11 +765,18 @@ pub(super) fn render_best_effort_test(
                     factory_calls.insert(obj.var_name.clone(), (factory_fn, factory_args));
                 } else {
                     if shared_creator_plan.is_none() {
-                        shared_creator_plan =
-                            module_fns.and_then(|fns| pick_shared_creator_plan(d, fns, fn_lookup));
+                        shared_creator_plan = module_fns.and_then(|fns| {
+                            pick_shared_creator_plan(
+                                d,
+                                fns,
+                                fn_lookup,
+                                key_structs_by_module,
+                                &required_creator_cap_type_keys,
+                            )
+                        });
                     }
                     if obj.is_ref && shared_creator_plan.is_some() {
-                        if obj.type_key.contains("cap") {
+                        if is_cap_type(&obj.type_name) {
                             owned_objects.push(obj.clone());
                             object_sources.insert(
                                 obj.var_name.clone(),
@@ -751,7 +867,23 @@ pub(super) fn render_best_effort_test(
                     plan.type_args.join(", ")
                 )
             };
-            lines.push(format!("        {}({});", call_path, plan.args.join(", ")));
+            let call_expr = format!("{}({})", call_path, plan.args.join(", "));
+            if let Some(ret_ty) = plan.return_ty.as_ref() {
+                if should_transfer_call_return_with_keys(
+                    ret_ty,
+                    &d.module_name,
+                    key_structs_by_module,
+                ) {
+                    lines.push(format!("        let seed_ret_obj = {};", call_expr));
+                    lines.push(
+                        "        transfer::public_transfer(seed_ret_obj, SUPER_USER);".to_string(),
+                    );
+                } else {
+                    lines.push(format!("        {};", call_expr));
+                }
+            } else {
+                lines.push(format!("        {};", call_expr));
+            }
             lines.push("    };".to_string());
             needs_next_tx_before_use = true;
         }
@@ -779,6 +911,7 @@ pub(super) fn render_best_effort_test(
     let coin_vars_for_calls = coin_var_names(&coin_needs);
     let mut pre_coin_counter = 0usize;
     let mut requires_cleanup_coin_vars: Vec<String> = Vec::new();
+    let mut requires_cleanup_clock_vars: Vec<String> = Vec::new();
     let mut requires_consumed_coin_vars: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut requires_extra_coin_slots: std::collections::HashMap<usize, String> =
@@ -953,6 +1086,7 @@ pub(super) fn render_best_effort_test(
             &mut requires_extra_coin_slots,
             &mut pre_coin_counter,
             &mut requires_cleanup_coin_vars,
+            &mut requires_cleanup_clock_vars,
             &mut requires_consumed_coin_vars,
         ) {
             for l in pre_lines {
@@ -1044,6 +1178,13 @@ pub(super) fn render_best_effort_test(
             ));
         }
     }
+    let mut seen_req_clock_cleanup: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for var in &requires_cleanup_clock_vars {
+        if seen_req_clock_cleanup.insert(var.clone()) {
+            lines.push(format!("        sui::clock::destroy_for_testing({});", var));
+        }
+    }
     for obj in &owned_objects {
         if moved_object_vars_on_main_call.contains(&obj.var_name) {
             continue;
@@ -1064,6 +1205,13 @@ pub(super) fn render_best_effort_test(
                 "        transfer::public_transfer({}, SUPER_USER);",
                 coin.var_name
             ));
+        }
+    }
+    let mut seen_clock_cleanup: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for var in &clock_cleanup_vars {
+        if seen_clock_cleanup.insert(var.clone()) {
+            lines.push(format!("        sui::clock::destroy_for_testing({});", var));
         }
     }
     lines.push("    };".to_string());
