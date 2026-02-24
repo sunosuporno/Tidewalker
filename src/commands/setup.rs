@@ -923,6 +923,7 @@ fn split_top_level_args(args_raw: &str) -> Vec<String> {
 fn parse_struct_literal_fields_from_body(
     body: &[&str],
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    let let_value_by_var = parse_simple_let_value_map(body);
     let mut out: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
         std::collections::HashMap::new();
     let mut i = 0usize;
@@ -964,8 +965,9 @@ fn parse_struct_literal_fields_from_body(
             let line_clean = strip_line_comment(body[i]).trim().to_string();
             if depth == 1 {
                 if let Some((field_name, expr)) = parse_struct_field_value_line(&line_clean) {
-                    if is_safe_helper_initializer_expr(&expr) {
-                        fields.entry(field_name).or_insert(expr);
+                    let resolved = resolve_initializer_expr(&expr, &let_value_by_var);
+                    if is_safe_helper_initializer_expr(&resolved) {
+                        fields.entry(field_name).or_insert(resolved);
                     }
                 }
             }
@@ -985,6 +987,57 @@ fn parse_struct_literal_fields_from_body(
     out
 }
 
+fn parse_simple_let_value_map(body: &[&str]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for raw in body {
+        let t = strip_line_comment(raw).trim();
+        if !t.starts_with("let ") || !t.contains('=') {
+            continue;
+        }
+        let stmt = t.trim_end_matches(';').trim();
+        let Some(rest) = stmt.strip_prefix("let ") else {
+            continue;
+        };
+        let Some((lhs, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        let rhs = rhs.trim();
+        if rhs.is_empty() || rhs.contains('{') {
+            continue;
+        }
+        let mut lhs_tokens = lhs.trim().split_whitespace();
+        let first = lhs_tokens.next().unwrap_or("");
+        let var_name = if first == "mut" {
+            lhs_tokens.next().unwrap_or("")
+        } else {
+            first
+        };
+        if var_name.is_empty() {
+            continue;
+        }
+        out.entry(var_name.to_string())
+            .or_insert_with(|| rhs.to_string());
+    }
+    out
+}
+
+fn resolve_initializer_expr(
+    expr: &str,
+    let_value_by_var: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut current = expr.trim().to_string();
+    for _ in 0..8 {
+        let Some(next) = let_value_by_var.get(current.as_str()) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current = next.clone();
+    }
+    current
+}
+
 fn strip_line_comment(line: &str) -> &str {
     line.split("//").next().unwrap_or("")
 }
@@ -994,13 +1047,19 @@ fn parse_struct_field_value_line(line: &str) -> Option<(String, String)> {
     if t.is_empty() || t.starts_with('}') || t.starts_with('{') {
         return None;
     }
-    let (field_name, expr) = t.split_once(':')?;
-    let field = field_name.trim();
-    let value = expr.trim();
-    if field.is_empty() || value.is_empty() {
-        return None;
+    if let Some((field_name, expr)) = t.split_once(':') {
+        let field = field_name.trim();
+        let value = expr.trim();
+        if field.is_empty() || value.is_empty() {
+            return None;
+        }
+        return Some((field.to_string(), value.to_string()));
     }
-    Some((field.to_string(), value.to_string()))
+    // Support shorthand fields in struct literals, e.g. `admin,`.
+    if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Some((t.to_string(), t.to_string()));
+    }
+    None
 }
 
 fn is_safe_helper_initializer_expr(expr: &str) -> bool {
@@ -1018,6 +1077,9 @@ fn is_safe_helper_initializer_expr(expr: &str) -> bool {
         return true;
     }
     if e.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return true;
+    }
+    if e.ends_with(".sender()") {
         return true;
     }
     e.contains("::")
@@ -1043,10 +1105,19 @@ fn parse_struct_field_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), ty.to_string()))
 }
 
+#[derive(Debug, Clone)]
+struct InitCallNode {
+    func: String,
+    nested: Vec<InitCallNode>,
+}
+
 fn first_disallowed_call_in_body(body: &[&str]) -> Option<String> {
     // Allowlist is checked by suffix match so it works with prefixes like `sui::object::new`.
-    const ALLOWED_SUFFIXES: [&str; 10] = [
+    const ALLOWED_SUFFIXES: [&str; 13] = [
         "object::new",
+        "object::id",
+        "event::emit",
+        "balance::zero",
         "transfer::share_object",
         "transfer::public_share_object",
         "transfer::transfer",
@@ -1059,95 +1130,205 @@ fn first_disallowed_call_in_body(body: &[&str]) -> Option<String> {
     ];
 
     for line in body {
-        // Strip line comments.
-        let t = line.split("//").next().unwrap_or("").trim_end();
+        let t = strip_line_comment(line).trim_end();
         if t.is_empty() {
             continue;
         }
-        let chars: Vec<char> = t.chars().collect();
-        for (idx, ch) in chars.iter().enumerate() {
-            if *ch != '(' || idx == 0 {
-                continue;
-            }
-
-            // Walk back from '(' to find the call "token" (optionally skipping generics).
-            let mut j: isize = (idx as isize) - 1;
-            while j >= 0 && chars[j as usize].is_whitespace() {
-                j -= 1;
-            }
-            if j < 0 {
-                continue;
-            }
-
-            // Skip a single generic parameter block like `<T, U>` immediately before '('.
-            if chars[j as usize] == '>' {
-                let mut depth: i32 = 0;
-                while j >= 0 {
-                    let c = chars[j as usize];
-                    if c == '>' {
-                        depth += 1;
-                    } else if c == '<' {
-                        depth -= 1;
-                        if depth == 0 {
-                            j -= 1;
-                            while j >= 0 && chars[j as usize].is_whitespace() {
-                                j -= 1;
-                            }
-                            break;
-                        }
-                    }
-                    j -= 1;
-                }
-                if j < 0 {
-                    continue;
-                }
-            }
-
-            // Collect token chars: [A-Za-z0-9_:_]
-            let end = j as usize;
-            let mut start = end;
-            while start > 0 {
-                let c = chars[start];
-                if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
-                    start -= 1;
-                } else {
-                    break;
-                }
-            }
-            if !(chars[start].is_ascii_alphanumeric() || chars[start] == '_' || chars[start] == ':')
-            {
-                start += 1;
-            }
-            if start > end {
-                continue;
-            }
-            let token: String = chars[start..=end].iter().collect();
-            if token.is_empty() {
-                continue;
-            }
-            if !token.chars().any(|c| c.is_ascii_alphabetic() || c == '_') {
-                continue;
-            }
-
-            // Ignore method calls like `x.to_inner()` (token is preceded by '.').
-            if start > 0 && chars[start - 1] == '.' {
-                continue;
-            }
-
-            // Qualified call: `foo::bar(` (or deeper). Local call: `helper(`.
-            if token.contains("::") {
-                if ALLOWED_SUFFIXES.iter().any(|a| token.ends_with(a)) {
-                    continue;
-                }
-                return Some(token);
-            } else {
-                // Any local helper call makes init complex in the refined heuristic.
-                return Some(token);
+        for call in collect_init_call_ast(t) {
+            if let Some(disallowed) = first_disallowed_in_call_ast(&call, &ALLOWED_SUFFIXES) {
+                return Some(disallowed.to_string());
             }
         }
     }
-
     None
+}
+
+fn first_disallowed_in_call_ast<'a>(
+    node: &'a InitCallNode,
+    allowed_suffixes: &[&str],
+) -> Option<&'a str> {
+    if !(node.func.contains("::")
+        && allowed_suffixes.iter().any(|suffix| node.func.ends_with(suffix)))
+    {
+        // Any local helper call makes init complex in the refined heuristic.
+        return Some(node.func.as_str());
+    }
+    for child in &node.nested {
+        if let Some(name) = first_disallowed_in_call_ast(child, allowed_suffixes) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn collect_init_call_ast(input: &str) -> Vec<InitCallNode> {
+    collect_init_call_ast_range(&input.chars().collect::<Vec<_>>(), 0, input.chars().count())
+}
+
+fn collect_init_call_ast_range(chars: &[char], start: usize, end: usize) -> Vec<InitCallNode> {
+    const NON_CALL_KEYWORDS: [&str; 4] = ["if", "while", "loop", "match"];
+
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < end {
+        if chars[i] == '"' {
+            i = skip_string_literal(chars, i, end).unwrap_or(i + 1);
+            continue;
+        }
+        if !is_ident_start(chars[i]) {
+            i += 1;
+            continue;
+        }
+
+        let name_start = i;
+        let (func_name, mut j) = match parse_qualified_call_name(chars, i, end) {
+            Some(v) => v,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if NON_CALL_KEYWORDS.contains(&func_name.as_str()) {
+            i += 1;
+            continue;
+        }
+        j = skip_whitespace(chars, j, end);
+        while j < end && chars[j] == '<' {
+            let Some(after_generics) = skip_balanced(chars, j, end, '<', '>') else {
+                break;
+            };
+            j = skip_whitespace(chars, after_generics, end);
+        }
+        if j >= end || chars[j] != '(' {
+            i += 1;
+            continue;
+        }
+        let Some(close_paren) = skip_balanced(chars, j, end, '(', ')') else {
+            i += 1;
+            continue;
+        };
+        let nested = collect_init_call_ast_range(chars, j + 1, close_paren.saturating_sub(1));
+        let is_method_call = prev_non_ws(chars, name_start, start) == Some('.');
+        if is_method_call {
+            out.extend(nested);
+        } else {
+            out.push(InitCallNode {
+                func: func_name,
+                nested,
+            });
+        }
+        i = close_paren;
+    }
+    out
+}
+
+fn parse_qualified_call_name(chars: &[char], start: usize, end: usize) -> Option<(String, usize)> {
+    let mut i = start;
+    if i >= end || !is_ident_start(chars[i]) {
+        return None;
+    }
+    let mut out = String::new();
+    let (seg, next) = parse_ident_segment(chars, i, end)?;
+    out.push_str(&seg);
+    i = next;
+    loop {
+        i = skip_whitespace(chars, i, end);
+        if i + 1 >= end || chars[i] != ':' || chars[i + 1] != ':' {
+            break;
+        }
+        i += 2;
+        i = skip_whitespace(chars, i, end);
+        let (seg, next) = parse_ident_segment(chars, i, end)?;
+        out.push_str("::");
+        out.push_str(&seg);
+        i = next;
+    }
+    Some((out, i))
+}
+
+fn parse_ident_segment(chars: &[char], start: usize, end: usize) -> Option<(String, usize)> {
+    if start >= end || !is_ident_start(chars[start]) {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < end && is_ident_continue(chars[i]) {
+        i += 1;
+    }
+    Some((chars[start..i].iter().collect(), i))
+}
+
+fn skip_whitespace(chars: &[char], mut i: usize, end: usize) -> usize {
+    while i < end && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn prev_non_ws(chars: &[char], idx: usize, floor: usize) -> Option<char> {
+    if idx == 0 || idx <= floor {
+        return None;
+    }
+    let mut j = idx - 1;
+    loop {
+        if !chars[j].is_whitespace() {
+            return Some(chars[j]);
+        }
+        if j == floor {
+            return None;
+        }
+        j -= 1;
+    }
+}
+
+fn skip_string_literal(chars: &[char], start: usize, end: usize) -> Option<usize> {
+    if start >= end || chars[start] != '"' {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < end {
+        if chars[i] == '\\' {
+            i = i.saturating_add(2);
+            continue;
+        }
+        if chars[i] == '"' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_balanced(chars: &[char], start: usize, end: usize, open: char, close: char) -> Option<usize> {
+    if start >= end || chars[start] != open {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < end {
+        let ch = chars[i];
+        if ch == '"' {
+            i = skip_string_literal(chars, i, end).unwrap_or(i + 1);
+            continue;
+        }
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 /// Inner width of the ASCII box (space between the two slashes).
@@ -1233,7 +1414,7 @@ fn generate_in_module_test_only_snippet(
             body.push("        id: sui::object::new(ctx),".to_string());
         }
         body.push("    };".to_string());
-        body.push("    transfer::public_share_object(obj);".to_string());
+        body.push("    transfer::share_object(obj);".to_string());
         body.push("}".to_string());
         body.push("".to_string());
     }

@@ -1218,6 +1218,50 @@ pub(super) fn render_best_effort_test(
         std::collections::HashSet::new();
     let mut requires_extra_coin_slots: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
+    let mut requires_chain: Vec<&FnDecl> = Vec::new();
+    if let Some(module_fns) = fn_lookup.get(&d.module_name) {
+        for req in &d.requires {
+            if let Some(req_decl) = module_fns.get(req) {
+                requires_chain.push(req_decl);
+            }
+        }
+    }
+    if !requires_chain.is_empty() {
+        let mut requires_mut_type_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for req_decl in &requires_chain {
+            for p in &req_decl.params {
+                let t = p.ty.trim();
+                if !t.starts_with("&mut")
+                    || t.contains("TxContext")
+                    || is_clock_type(t)
+                    || is_vector_type(t)
+                    || is_coin_type(t)
+                {
+                    continue;
+                }
+                let key = type_key_from_type_name(&normalize_param_object_type(t));
+                requires_mut_type_keys.insert(key);
+            }
+        }
+        if !requires_mut_type_keys.is_empty() {
+            for obj in &mut object_needs {
+                if requires_mut_type_keys.contains(&obj.type_key) {
+                    obj.is_mut = true;
+                }
+            }
+            for obj in &mut shared_objects {
+                if requires_mut_type_keys.contains(&obj.type_key) {
+                    obj.is_mut = true;
+                }
+            }
+            for obj in &mut owned_objects {
+                if requires_mut_type_keys.contains(&obj.type_key) {
+                    obj.is_mut = true;
+                }
+            }
+        }
+    }
 
     let (snapshot_before_lines, snapshot_after_lines, mut numeric_summary) =
         build_numeric_assertion_lines(
@@ -1370,14 +1414,6 @@ pub(super) fn render_best_effort_test(
         lines.push(format!("        {}", l));
     }
 
-    let mut requires_chain: Vec<&FnDecl> = Vec::new();
-    if let Some(module_fns) = fn_lookup.get(&d.module_name) {
-        for req in &d.requires {
-            if let Some(req_decl) = module_fns.get(req) {
-                requires_chain.push(req_decl);
-            }
-        }
-    }
     for (req_idx, req_decl) in requires_chain.iter().enumerate() {
         if let Some((req_args, pre_lines)) = synthesize_requires_call_args(
             req_decl,
