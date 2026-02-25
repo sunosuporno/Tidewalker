@@ -28,6 +28,21 @@ fn is_treasury_cap_type(ty: &str) -> bool {
     ty.trim().replace(' ', "").contains("TreasuryCap<")
 }
 
+fn is_simple_generic_type_placeholder(ty: &str) -> bool {
+    let t = ty.trim();
+    if t.is_empty() || t.contains("::") || t.contains('<') || t.contains('>') {
+        return false;
+    }
+    let mut chars = t.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn type_key_from_type_name(type_name: &str) -> String {
     let clean = type_name.trim();
     let no_generics = clean.split('<').next().unwrap_or(clean).trim();
@@ -1439,20 +1454,35 @@ fn generate_in_module_test_only_snippet(
             "/// Create {} for testing (caller receives it).",
             type_name
         ));
-        body.push(format!(
-            "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
-            helper_key, type_name
-        ));
         if is_treasury_cap_type(type_name) {
             if let Some(inner_ty) = extract_treasury_cap_inner_type(type_name) {
+                if is_simple_generic_type_placeholder(&inner_ty) {
+                    body.push(format!(
+                        "public fun create_{}_for_testing<{}>(ctx: &mut sui::tx_context::TxContext): {} {{",
+                        helper_key, inner_ty, type_name
+                    ));
+                } else {
+                    body.push(format!(
+                        "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
+                        helper_key, type_name
+                    ));
+                }
                 body.push(format!(
                     "    sui::coin::create_treasury_cap_for_testing<{}>(ctx)",
                     inner_ty
                 ));
             } else {
+                body.push(format!(
+                    "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
+                    helper_key, type_name
+                ));
                 body.push("    abort 100001; // malformed TreasuryCap helper type".to_string());
             }
         } else {
+            body.push(format!(
+                "public fun create_{}_for_testing(ctx: &mut sui::tx_context::TxContext): {} {{",
+                helper_key, type_name
+            ));
             body.push(format!("    {} {{", type_name));
             if let Some(fields) = struct_fields.get(type_name) {
                 for (field_name, field_ty) in fields {

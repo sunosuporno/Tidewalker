@@ -506,6 +506,58 @@ fn parse_coin_value_side(
     None
 }
 
+fn parse_coin_mod_zero_object_field(
+    expr: &str,
+    param_names: &[String],
+) -> Option<(String, String, String)> {
+    let coin_value_param_from_expr = |e: &Expr| -> Option<String> {
+        let (func, args) = expr_ast::as_call(e)?;
+        let is_coin_value = matches!(func.as_str(), "coin::value" | "sui::coin::value" | "value");
+        if !is_coin_value || args.len() != 1 {
+            return None;
+        }
+        let coin_param = expr_ast::as_ident(&args[0])?;
+        if param_names.iter().any(|p| p == &coin_param) {
+            Some(coin_param)
+        } else {
+            None
+        }
+    };
+    let is_zero = |e: &Expr| -> bool {
+        matches!(expr_ast::strip_wrappers(e), Expr::Number(n) if n.replace('_', "") == "0")
+    };
+
+    let (lhs_cmp, op_cmp, rhs_cmp) = parse_ast_comparison(expr)?;
+    if op_cmp != BinOp::Eq {
+        return None;
+    }
+    let mod_expr = if is_zero(&lhs_cmp) {
+        rhs_cmp
+    } else if is_zero(&rhs_cmp) {
+        lhs_cmp
+    } else {
+        return None;
+    };
+    let Expr::Binary { op, lhs, rhs } = expr_ast::strip_wrappers(&mod_expr) else {
+        return None;
+    };
+    if *op != BinOp::Mod {
+        return None;
+    }
+
+    if let Some(coin_param) = coin_value_param_from_expr(lhs) {
+        if let Some((object_param, field_name)) = expr_ast::as_field_ident(rhs) {
+            return Some((coin_param, object_param, field_name));
+        }
+    }
+    if let Some(coin_param) = coin_value_param_from_expr(rhs) {
+        if let Some((object_param, field_name)) = expr_ast::as_field_ident(lhs) {
+            return Some((coin_param, object_param, field_name));
+        }
+    }
+    None
+}
+
 fn parse_clock_timestamp_side(expr: &str, d: &FnDecl) -> Option<String> {
     let is_clock_param = |name: &str| -> bool {
         d.params
@@ -850,6 +902,62 @@ fn resolve_condition_aliases(
     cond.to_string()
 }
 
+fn expand_aliases_in_expr(
+    expr: &Expr,
+    aliases: &std::collections::HashMap<String, String>,
+    depth: usize,
+) -> Expr {
+    if depth > 6 {
+        return expr.clone();
+    }
+    match expr {
+        Expr::Path(p) if !p.contains("::") => {
+            if let Some(alias_src) = aliases.get(p) {
+                if let Some(parsed_alias) = expr_ast::parse_expr(alias_src) {
+                    return expand_aliases_in_expr(&parsed_alias, aliases, depth + 1);
+                }
+            }
+            expr.clone()
+        }
+        Expr::Ref { mutable, expr } => Expr::Ref {
+            mutable: *mutable,
+            expr: Box::new(expand_aliases_in_expr(expr, aliases, depth)),
+        },
+        Expr::Field { base, field } => Expr::Field {
+            base: Box::new(expand_aliases_in_expr(base, aliases, depth)),
+            field: field.clone(),
+        },
+        Expr::Call { func, args } => Expr::Call {
+            func: func.clone(),
+            args: args
+                .iter()
+                .map(|a| expand_aliases_in_expr(a, aliases, depth))
+                .collect::<Vec<_>>(),
+        },
+        Expr::Cast { expr, ty } => Expr::Cast {
+            expr: Box::new(expand_aliases_in_expr(expr, aliases, depth)),
+            ty: ty.clone(),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(expand_aliases_in_expr(lhs, aliases, depth)),
+            rhs: Box::new(expand_aliases_in_expr(rhs, aliases, depth)),
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn expand_aliases_in_condition(
+    cond: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let Some(parsed) = expr_ast::parse_expr(cond) else {
+        return cond.to_string();
+    };
+    let expanded = expand_aliases_in_expr(&parsed, aliases, 0);
+    expr_ast::render_expr(&expanded)
+}
+
 fn parse_assert_guard_cases(
     d: &FnDecl,
     accessor_map: &std::collections::HashMap<String, Vec<AccessorSig>>,
@@ -891,7 +999,8 @@ fn parse_assert_guard_cases(
             None => continue,
         };
         let resolved_cond = resolve_condition_aliases(&cond, &local_aliases);
-        if let Some((base, field)) = parse_negated_object_field_expr(&resolved_cond, &param_names) {
+        let expanded_cond = expand_aliases_in_condition(&resolved_cond, &local_aliases);
+        if let Some((base, field)) = parse_negated_object_field_expr(&expanded_cond, &param_names) {
             out.push(GuardCase {
                 kind: GuardKind::ObjectFieldConst {
                     param_name: base,
@@ -903,7 +1012,7 @@ fn parse_assert_guard_cases(
             });
             continue;
         }
-        if let Some(param_name) = parse_negated_param_expr(&resolved_cond, &param_names) {
+        if let Some(param_name) = parse_negated_param_expr(&expanded_cond, &param_names) {
             out.push(GuardCase {
                 kind: GuardKind::ParamConst {
                     param_name,
@@ -914,10 +1023,135 @@ fn parse_assert_guard_cases(
             });
             continue;
         }
-        let and_terms = split_top_level_and_terms(&resolved_cond);
-        if and_terms.len() > 1 && !resolved_cond.contains("||") {
+        let and_terms = split_top_level_and_terms(&expanded_cond);
+        if and_terms.len() > 1 && !expanded_cond.contains("||") {
             let mut parsed_all = true;
             for term in &and_terms {
+                if let Some((object_param, field_name, op_raw, other_side, flipped)) =
+                    parse_object_field_led_comparison(term, &param_names)
+                {
+                    if d.params
+                        .iter()
+                        .any(|p| p.name == other_side && !p.ty.trim().starts_with('&'))
+                    {
+                        let op = if flipped {
+                            op_raw.clone()
+                        } else {
+                            reverse_comparison_op(&op_raw)
+                        };
+                        out.push(GuardCase {
+                            kind: GuardKind::ParamObjectField {
+                                param_name: other_side,
+                                object_param,
+                                field_name,
+                                op,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    let op = if flipped {
+                        reverse_comparison_op(&op_raw)
+                    } else {
+                        op_raw
+                    };
+                    if let Some(lit) = parse_numeric_literal(&other_side) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ObjectFieldConst {
+                                param_name: object_param,
+                                field_name,
+                                op,
+                                rhs_literal: lit,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    if is_bool_literal(&other_side) || is_address_literal(&other_side) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ObjectFieldConst {
+                                param_name: object_param,
+                                field_name,
+                                op,
+                                rhs_literal: other_side,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    if parse_sender_side(&other_side, d) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ObjectFieldSender {
+                                param_name: object_param,
+                                field_name,
+                                op,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    if let Some(clock_param) = parse_clock_timestamp_side(&other_side, d) {
+                        out.push(GuardCase {
+                            kind: GuardKind::ObjectFieldClockTimestamp {
+                                param_name: object_param,
+                                field_name,
+                                clock_param,
+                                op,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                }
+                if let Some((coin_param, op_raw, other_side, flipped)) =
+                    parse_coin_value_side(term, &param_names)
+                {
+                    let op = if flipped {
+                        reverse_comparison_op(&op_raw)
+                    } else {
+                        op_raw
+                    };
+                    if let Some(lit) = parse_numeric_literal(&other_side) {
+                        out.push(GuardCase {
+                            kind: GuardKind::CoinValueConst {
+                                coin_param,
+                                op,
+                                rhs_literal: lit,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                    if let Some((object_param, field_name)) =
+                        parse_direct_object_field_side(&other_side, &param_names)
+                    {
+                        out.push(GuardCase {
+                            kind: GuardKind::CoinValueObjectField {
+                                coin_param,
+                                object_param,
+                                field_name,
+                                op,
+                            },
+                            source: format!("{}: {}", fq, term),
+                        });
+                        continue;
+                    }
+                }
+                if let Some((coin_param, object_param, field_name)) =
+                    parse_coin_mod_zero_object_field(term, &param_names)
+                {
+                    out.push(GuardCase {
+                        kind: GuardKind::CoinValueObjectField {
+                            coin_param,
+                            object_param,
+                            field_name,
+                            // Reuse getter-bound synthesis; == yields bound+1, which violates divisibility.
+                            op: "==".to_string(),
+                        },
+                        source: format!("{}: {}", fq, term),
+                    });
+                    continue;
+                }
                 if let Some((param_side, term_op, other_side, flipped)) =
                     parse_param_led_comparison(term, &param_names)
                 {
@@ -956,7 +1190,7 @@ fn parse_assert_guard_cases(
                 continue;
             }
         }
-        if let Some((lhs, op_raw, rhs)) = parse_ast_comparison(&resolved_cond) {
+        if let Some((lhs, op_raw, rhs)) = parse_ast_comparison(&expanded_cond) {
             let lhs_param = expr_ast::as_ident(&lhs).filter(|name| {
                 d.params
                     .iter()
@@ -995,7 +1229,7 @@ fn parse_assert_guard_cases(
             }
         }
         if let Some((object_param, field_name, op_raw, other_side, flipped)) =
-            parse_object_field_led_comparison(&resolved_cond, &param_names)
+            parse_object_field_led_comparison(&expanded_cond, &param_names)
         {
             if d.params
                 .iter()
@@ -1104,7 +1338,7 @@ fn parse_assert_guard_cases(
             continue;
         }
         if let Some((coin_param, op_raw, other_side, flipped)) =
-            parse_coin_value_side(&resolved_cond, &param_names)
+            parse_coin_value_side(&expanded_cond, &param_names)
         {
             let op = if flipped {
                 reverse_comparison_op(&op_raw)
@@ -1142,8 +1376,23 @@ fn parse_assert_guard_cases(
             ));
             continue;
         }
+        if let Some((coin_param, object_param, field_name)) =
+            parse_coin_mod_zero_object_field(&expanded_cond, &param_names)
+        {
+            out.push(GuardCase {
+                kind: GuardKind::CoinValueObjectField {
+                    coin_param,
+                    object_param,
+                    field_name,
+                    // Reuse getter-bound synthesis; == yields bound+1, which violates divisibility.
+                    op: "==".to_string(),
+                },
+                source: format!("{}: {}", fq, cond),
+            });
+            continue;
+        }
         let (param_side, op, other_side, flipped) =
-            match parse_param_led_comparison(&resolved_cond, &param_names) {
+            match parse_param_led_comparison(&expanded_cond, &param_names) {
                 Some(v) => v,
                 None => {
                     notes.push(format!("{}: unsupported assert condition '{}'", fq, cond));
@@ -2852,8 +3101,7 @@ fn render_coin_value_object_field_guard_test(
         return None;
     }
     let runtime_obj = param_runtime.get(object_param)?;
-    let getter_fn =
-        pick_numeric_accessor_for_object_field(d, accessor_map, object_param, field_name)?;
+    let getter_fn = pick_numeric_accessor_for_object_field(d, accessor_map, object_param, field_name);
     let bound_var = format!("guard_coin_bound_{}", case_idx);
 
     let default_coin_var = format!("coin_{}", sanitize_ident(coin_param));
@@ -2862,12 +3110,21 @@ fn render_coin_value_object_field_guard_test(
     cleanup.retain(|l| !l.contains(&format!("{}{}", default_coin_var, ",")));
 
     let bad_coin_var = format!("guard_bad_coin_{}", case_idx);
-    let bad_amount = violating_getter_arg(op, &bound_var)?;
     let mut prep = Vec::new();
-    prep.push(format!(
-        "let {} = {}::{}(&{});",
-        bound_var, d.module_name, getter_fn, runtime_obj
-    ));
+    let bad_amount = if let Some(getter_fn) = getter_fn {
+        prep.push(format!(
+            "let {} = {}::{}(&{});",
+            bound_var, d.module_name, getter_fn, runtime_obj
+        ));
+        violating_getter_arg(op, &bound_var)?
+    } else {
+        let obj_param = d.params.iter().find(|p| p.name == object_param)?;
+        let obj_ty = normalize_param_object_type(&obj_param.ty);
+        let type_key = type_key_from_type_name(&obj_ty);
+        let module_fns = env.fn_lookup.get(&d.module_name)?;
+        let helper_default = lookup_helper_field_literal(module_fns, &type_key, field_name)?;
+        violating_getter_arg(op, &helper_default)?
+    };
     let maybe_mut = if param_ty.starts_with("&mut") {
         "mut "
     } else {

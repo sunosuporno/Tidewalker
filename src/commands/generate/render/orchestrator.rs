@@ -42,11 +42,18 @@ struct FactoryArgPlan {
 struct FactoryCallPlan {
     module_name: String,
     fn_name: String,
+    provision_mode: OwnedFactoryProvision,
     type_args: Vec<String>,
     args: Vec<String>,
     prep_lines: Vec<String>,
     cleanup_lines: Vec<String>,
     shared_ref_deps: Vec<(String, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedFactoryProvision {
+    ReturnValue,
+    SenderTransfer,
 }
 
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
@@ -81,6 +88,167 @@ fn has_overflow_prone_mul(body_lines: &[String]) -> bool {
         let has_u128_cast = norm.contains("asu128");
         has_billion_scale_mul || !has_u128_cast
     })
+}
+
+fn parse_simple_let_binding(stmt: &str) -> Option<(String, String)> {
+    let trimmed = stmt.trim().trim_end_matches(';').trim();
+    let mut rest = trimmed.strip_prefix("let ")?;
+    if let Some(after_mut) = rest.strip_prefix("mut ") {
+        rest = after_mut;
+    }
+    let (lhs_raw, rhs_raw) = rest.split_once('=')?;
+    let lhs = lhs_raw.split(':').next()?.trim();
+    if !is_ident(lhs) {
+        return None;
+    }
+    let rhs = rhs_raw.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some((lhs.to_string(), rhs.to_string()))
+}
+
+fn parse_function_call_name(expr: &str) -> Option<(Option<String>, String)> {
+    let trimmed = expr.trim();
+    let open = trimmed.find('(')?;
+    let token = trimmed[..open].trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some((module, name)) = token.rsplit_once("::") {
+        let name_clean = name
+            .split('<')
+            .next()
+            .unwrap_or(name)
+            .trim()
+            .to_string();
+        if !is_ident(&name_clean) {
+            return None;
+        }
+        return Some((Some(module.trim().to_string()), name_clean));
+    }
+    let name_clean = token
+        .split('<')
+        .next()
+        .unwrap_or(token)
+        .trim()
+        .to_string();
+    if !is_ident(&name_clean) {
+        return None;
+    }
+    Some((None, name_clean))
+}
+
+fn parse_transfer_call(stmt: &str) -> Option<(String, String)> {
+    for prefix in [
+        "transfer::transfer(",
+        "transfer::public_transfer(",
+        "sui::transfer::transfer(",
+        "sui::transfer::public_transfer(",
+    ] {
+        let Some(start) = stmt.find(prefix) else {
+            continue;
+        };
+        let args_start = start + prefix.len();
+        let mut depth = 1i32;
+        let mut args_end: Option<usize> = None;
+        for (off, ch) in stmt[args_start..].char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    args_end = Some(args_start + off);
+                    break;
+                }
+            }
+        }
+        let end = args_end?;
+        let args = split_args(&stmt[args_start..end]);
+        if args.len() < 2 {
+            continue;
+        }
+        return Some((args[0].trim().to_string(), args[1].trim().to_string()));
+    }
+    None
+}
+
+fn infer_expr_type_key_from_module_calls(
+    expr: &str,
+    default_module: &str,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Option<String> {
+    let trimmed = strip_ref_and_parens_text(expr).trim();
+    if let Some((left, _)) = trimmed.split_once('{') {
+        let ty = left.trim();
+        if !ty.is_empty() {
+            return Some(type_key_from_type_name(ty));
+        }
+    }
+    let (module_opt, fn_name) = parse_function_call_name(trimmed)?;
+    if let Some(module) = module_opt {
+        if module != default_module {
+            return None;
+        }
+    }
+    let callee = module_fns.get(&fn_name)?;
+    let ret = callee.return_ty.as_ref()?;
+    Some(type_key_from_type_name(ret))
+}
+
+fn fn_transfers_type_to_sender(
+    f: &FnDecl,
+    target_type_key: &str,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> bool {
+    let mut local_sender_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut local_var_type_keys: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in &f.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some((lhs, rhs)) = parse_simple_let_binding(stmt) {
+            let rhs_clean = remove_whitespace(&rhs);
+            if rhs_clean.contains("sender(") || rhs_clean.contains("tx_context::sender(") {
+                local_sender_aliases.insert(lhs.clone());
+            }
+            if let Some(inferred_ty) =
+                infer_expr_type_key_from_module_calls(&rhs, &f.module_name, module_fns)
+            {
+                local_var_type_keys.insert(lhs, inferred_ty);
+            }
+        }
+    }
+    for line in &f.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let Some((obj_expr, recipient_expr)) = parse_transfer_call(stmt) else {
+            continue;
+        };
+        let recipient_norm = strip_ref_and_parens_text(&recipient_expr).trim().to_string();
+        let recipient_is_sender = remove_whitespace(&recipient_expr).contains("sender(")
+            || local_sender_aliases.contains(&recipient_norm);
+        if !recipient_is_sender {
+            continue;
+        }
+        let obj_norm = strip_ref_and_parens_text(&obj_expr).trim().to_string();
+        if let Some(key) = local_var_type_keys.get(&obj_norm) {
+            if key == target_type_key {
+                return true;
+            }
+        }
+        if let Some(key) = infer_expr_type_key_from_module_calls(&obj_expr, &f.module_name, module_fns)
+        {
+            if key == target_type_key {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn per_call_coin_mint_amount(
@@ -565,12 +733,14 @@ fn synthesize_requires_call_args(
     let mut args = Vec::new();
     let mut prep = Vec::new();
     let mut coin_slot_idx = 0usize;
+    let req_default_type_args = default_type_args_for_params(&d.type_params);
     let req_aliases = req_chain
         .get(req_step_idx)
         .map(|r| &r.module_use_aliases)
         .unwrap_or(&d.module_use_aliases);
     for p in &d.params {
-        let t = p.ty.trim();
+        let resolved_ty = concretize_type_params(&p.ty, &d.type_params, &req_default_type_args);
+        let t = resolved_ty.trim();
         if is_vector_type(t) {
             let vec_expr = vector_literal_expr_for_type(t)?;
             if t.starts_with('&') {
@@ -1054,6 +1224,7 @@ fn synthesize_owned_factory_call_plan(
     Some(FactoryCallPlan {
         module_name: factory.module_name.clone(),
         fn_name: factory.fn_name.clone(),
+        provision_mode: OwnedFactoryProvision::ReturnValue,
         type_args,
         args,
         prep_lines,
@@ -1081,11 +1252,13 @@ fn pick_factory_call_for_type(
         if f.fn_name == d.fn_name || f.fn_name == "init" {
             continue;
         }
-        let ret = match &f.return_ty {
-            Some(v) => v,
-            None => continue,
-        };
-        if type_key_from_type_name(ret) != type_key {
+        let returns_target = f
+            .return_ty
+            .as_ref()
+            .map(|ret| type_key_from_type_name(ret) == type_key)
+            .unwrap_or(false);
+        let transfers_target = fn_transfers_type_to_sender(f, type_key, module_fns);
+        if !returns_target && !transfers_target {
             continue;
         }
         let Some(plan) = synthesize_owned_factory_call_plan(
@@ -1097,6 +1270,10 @@ fn pick_factory_call_for_type(
         ) else {
             continue;
         };
+        let mut plan = plan;
+        if transfers_target && !returns_target {
+            plan.provision_mode = OwnedFactoryProvision::SenderTransfer;
+        }
         let score = f.params.len();
         let candidate = (score, plan);
         if best.as_ref().map(|b| score < b.0).unwrap_or(true) {
@@ -1375,7 +1552,9 @@ pub(super) fn render_best_effort_test(
     let mut object_needs: Vec<ObjectNeed> = Vec::new();
     let mut coin_needs: Vec<CoinNeed> = Vec::new();
     let mut arg_setup_lines: Vec<String> = Vec::new();
+    let mut arg_value_cleanup_lines: Vec<String> = Vec::new();
     let mut clock_cleanup_vars: Vec<String> = Vec::new();
+    let mut deferred_id_params: Vec<(String, String)> = Vec::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
     let prefer_advanced_clock = has_clock_ge_guard(&d.body_lines);
 
@@ -1452,9 +1631,10 @@ pub(super) fn render_best_effort_test(
             args.push(v.clone());
             param_arg_values.insert(param.name.clone(), v);
         } else if is_id_type(t) {
-            let v = default_id_arg_expr();
-            args.push(v.clone());
-            param_arg_values.insert(param.name.clone(), v);
+            let placeholder = format!("__TW_ID_PARAM_{}__", sanitize_ident(&param.name));
+            args.push(placeholder.clone());
+            deferred_id_params.push((param.name.clone(), placeholder.clone()));
+            param_arg_values.insert(param.name.clone(), placeholder);
         } else if is_option_type(t) {
             args.push(option_none_expr_for_type(t));
         } else if is_string_type(t) {
@@ -1500,9 +1680,13 @@ pub(super) fn render_best_effort_test(
         } else {
             let should_try_constructor = {
                 let norm = normalize_param_object_type(t);
+                let is_immut_ref = t.starts_with('&') && !t.starts_with("&mut");
+                let is_key_struct = is_known_key_struct(&norm, &d.module_name, key_structs_by_module);
+                let is_store_struct =
+                    is_known_store_struct(&norm, &d.module_name, store_structs_by_module);
                 let avoid_constructor = is_cap_type(&norm)
                     || is_treasury_cap_type(&norm)
-                    || is_known_key_struct(&norm, &d.module_name, key_structs_by_module);
+                    || (is_key_struct && (!is_immut_ref || !is_store_struct));
                 !avoid_constructor
             };
             if should_try_constructor {
@@ -1516,6 +1700,24 @@ pub(super) fn render_best_effort_test(
                         args.push(format!("&mut {}", var_name));
                     } else {
                         args.push(format!("&{}", var_name));
+                        let norm = normalize_param_object_type(t);
+                        if is_known_key_struct(&norm, &d.module_name, key_structs_by_module) {
+                            if let Some(cleanup_stmt) = cleanup_stmt_for_type(
+                                &d.module_name,
+                                &norm,
+                                &var_name,
+                                fn_lookup,
+                                key_structs_by_module,
+                                store_structs_by_module,
+                            ) {
+                                arg_value_cleanup_lines.push(cleanup_stmt);
+                            } else {
+                                arg_value_cleanup_lines.push(format!(
+                                    "transfer::transfer({}, SUPER_USER);",
+                                    var_name
+                                ));
+                            }
+                        }
                     }
                 } else {
                     args.push(expr);
@@ -1676,8 +1878,15 @@ pub(super) fn render_best_effort_test(
                         upsert_object_need(&mut object_needs, dep_ty.clone(), *dep_mut, true);
                     }
                     owned_objects.push(obj.clone());
-                    object_sources
-                        .insert(obj.var_name.clone(), ObjectProvisionSource::OwnedFactory);
+                    object_sources.insert(
+                        obj.var_name.clone(),
+                        match plan.provision_mode {
+                            OwnedFactoryProvision::ReturnValue => ObjectProvisionSource::OwnedFactory,
+                            OwnedFactoryProvision::SenderTransfer => {
+                                ObjectProvisionSource::OwnedCreatorSender
+                            }
+                        },
+                    );
                     factory_calls.insert(obj.var_name.clone(), plan);
                 } else {
                     if shared_creator_plan.is_none() {
@@ -1874,6 +2083,48 @@ pub(super) fn render_best_effort_test(
         lines.push("    };".to_string());
         needs_next_tx_before_use = true;
     }
+    let mut sender_seeded_owned_vars: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for obj in &owned_objects {
+        if !matches!(
+            object_sources.get(&obj.var_name),
+            Some(ObjectProvisionSource::OwnedCreatorSender)
+        ) {
+            continue;
+        }
+        let Some(plan) = factory_calls.get(&obj.var_name) else {
+            continue;
+        };
+        if !matches!(plan.provision_mode, OwnedFactoryProvision::SenderTransfer) {
+            continue;
+        }
+        // Sender-transfer producers are safest when executed in setup tx and consumed in the
+        // next tx; avoid inline same-tx take_from_sender.
+        if !plan.shared_ref_deps.is_empty() {
+            continue;
+        }
+        lines.push("    {".to_string());
+        for l in &plan.prep_lines {
+            lines.push(format!("        {}", l));
+        }
+        let call_path = if plan.type_args.is_empty() {
+            format!("{}::{}", plan.module_name, plan.fn_name)
+        } else {
+            format!(
+                "{}::{}<{}>",
+                plan.module_name,
+                plan.fn_name,
+                plan.type_args.join(", ")
+            )
+        };
+        lines.push(format!("        {}({});", call_path, plan.args.join(", ")));
+        for l in &plan.cleanup_lines {
+            lines.push(format!("        {}", l));
+        }
+        lines.push("    };".to_string());
+        sender_seeded_owned_vars.insert(obj.var_name.clone());
+        needs_next_tx_before_use = true;
+    }
     if needs_next_tx_before_use {
         lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
     }
@@ -1884,6 +2135,32 @@ pub(super) fn render_best_effort_test(
         object_vars_by_type
             .entry(obj.type_key.clone())
             .or_insert_with(|| obj.var_name.clone());
+    }
+    if !deferred_id_params.is_empty() {
+        let resolve_id_arg = |param_name: &str| -> String {
+            let preferred = param_name.strip_suffix("_id").unwrap_or(param_name);
+            if let Some(obj) = object_needs
+                .iter()
+                .find(|o| o.var_name.contains(preferred) || preferred.contains(&o.var_name))
+            {
+                return format!("sui::object::id(&{})", obj.var_name);
+            }
+            if let Some(obj) = object_needs.first() {
+                return format!("sui::object::id(&{})", obj.var_name);
+            }
+            default_id_arg_expr()
+        };
+        for (param_name, placeholder) in deferred_id_params {
+            let resolved = resolve_id_arg(&param_name);
+            for arg in &mut args {
+                if arg == &placeholder {
+                    *arg = resolved.clone();
+                }
+            }
+            if let Some(v) = param_arg_values.get_mut(&param_name) {
+                *v = resolved;
+            }
+        }
     }
     let coin_vars_for_calls = coin_var_names(&coin_needs);
     let mut pre_coin_counter = 0usize;
@@ -2101,6 +2378,40 @@ pub(super) fn render_best_effort_test(
                 }
             }
             Some(ObjectProvisionSource::OwnedCreatorSender) => {
+                if !sender_seeded_owned_vars.contains(&obj.var_name) {
+                    if let Some(plan) = factory_calls.get(&obj.var_name) {
+                    let mut resolved_args: Vec<String> = Vec::new();
+                    for arg in &plan.args {
+                        let mut resolved = arg.clone();
+                        for (dep_ty, _) in &plan.shared_ref_deps {
+                            let dep_key = type_key_from_type_name(dep_ty);
+                            let token = format!("__TW_OBJ_BY_TYPE_{}__", sanitize_ident(&dep_key));
+                            if resolved.contains(&token) {
+                                let dep_var = object_vars_by_type.get(&dep_key)?;
+                                resolved = resolved.replace(&token, dep_var);
+                            }
+                        }
+                        resolved_args.push(resolved);
+                    }
+                    for l in &plan.prep_lines {
+                        lines.push(format!("        {}", l));
+                    }
+                    let call_path = if plan.type_args.is_empty() {
+                        format!("{}::{}", plan.module_name, plan.fn_name)
+                    } else {
+                        format!(
+                            "{}::{}<{}>",
+                            plan.module_name,
+                            plan.fn_name,
+                            plan.type_args.join(", ")
+                        )
+                    };
+                    lines.push(format!("        {}({});", call_path, resolved_args.join(", ")));
+                    for l in &plan.cleanup_lines {
+                        lines.push(format!("        {}", l));
+                    }
+                }
+                }
                 lines.push(format!(
                     "        let {}{} = test_scenario::take_from_sender<{}>(&scenario);",
                     maybe_mut,
@@ -2138,10 +2449,24 @@ pub(super) fn render_best_effort_test(
             for l in pre_lines {
                 lines.push(format!("        {}", l));
             }
+            let req_call_target = if has_unbound_type_params(req_decl) {
+                let req_type_args = default_type_args_for_params(&req_decl.type_params);
+                if req_type_args.is_empty() {
+                    format!("{}::{}", d.module_name, req_decl.fn_name)
+                } else {
+                    format!(
+                        "{}::{}<{}>",
+                        d.module_name,
+                        req_decl.fn_name,
+                        req_type_args.join(", ")
+                    )
+                }
+            } else {
+                format!("{}::{}", d.module_name, req_decl.fn_name)
+            };
             lines.push(format!(
-                "        {}::{}({});",
-                d.module_name,
-                req_decl.fn_name,
+                "        {}({});",
+                req_call_target,
                 req_args.join(", ")
             ));
         }
@@ -2251,6 +2576,9 @@ pub(super) fn render_best_effort_test(
     }
     for l in summary_lines {
         lines.push(format!("        {}", l));
+    }
+    for cleanup in &arg_value_cleanup_lines {
+        lines.push(format!("        {}", cleanup));
     }
     for obj in &shared_objects {
         lines.push(format!(

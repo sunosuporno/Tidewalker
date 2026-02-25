@@ -235,6 +235,249 @@ struct CallSite {
     arg_exprs: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SkippedFunctionDiagnostic {
+    module_name: String,
+    fn_name: String,
+    reason: String,
+    local_potential_changes: Vec<String>,
+    local_asserts: Vec<String>,
+    callee_diagnostics: Vec<CalleeDiagnostic>,
+}
+
+#[derive(Debug, Clone)]
+struct CalleeDiagnostic {
+    callee_label: String,
+    potential_changes: Vec<String>,
+    asserts: Vec<String>,
+}
+
+fn fn_key(module_name: &str, fn_name: &str) -> String {
+    format!("{}::{}", module_name, fn_name)
+}
+
+fn extract_assert_condition_from_stmt(stmt: &str) -> Option<String> {
+    let idx = stmt.find("assert!(")?;
+    let start = idx + "assert!(".len();
+    let bytes = stmt.as_bytes();
+    let mut depth = 1i32;
+    let mut end: Option<usize> = None;
+    let mut i = start;
+    while i < stmt.len() {
+        let ch = bytes[i] as char;
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+    let end_idx = end?;
+    let inside = &stmt[start..end_idx];
+    let mut level = 0i32;
+    let mut split_idx: Option<usize> = None;
+    for (i, ch) in inside.char_indices() {
+        match ch {
+            '(' | '<' | '[' | '{' => level += 1,
+            ')' | '>' | ']' | '}' => {
+                if level > 0 {
+                    level -= 1;
+                }
+            }
+            ',' if level == 0 => {
+                split_idx = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    match split_idx {
+        Some(i) => Some(inside[..i].trim().to_string()),
+        None => Some(inside.trim().to_string()),
+    }
+}
+
+fn collect_assert_conditions(body_lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = body_lines
+        .iter()
+        .filter_map(|l| extract_assert_condition_from_stmt(l))
+        .filter(|s| !s.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_potential_change_names(
+    d: &FnDecl,
+    numeric_effects: &[NumericEffect],
+    vector_effects: &[VectorEffect],
+    coin_effects: &[CoinEffect],
+    treasury_cap_effects: &[TreasuryCapEffect],
+    option_effects: &[OptionEffect],
+    string_effects: &[StringEffect],
+    container_effects: &[ContainerEffect],
+) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for p in &d.params {
+        if p.ty.trim().starts_with("&mut") {
+            out.insert(p.name.clone());
+        }
+    }
+    for eff in numeric_effects {
+        out.insert(format!("{}.{}", eff.base_var, eff.field));
+    }
+    for eff in vector_effects {
+        out.insert(format!("{}.{}", eff.base_var, eff.field));
+    }
+    for eff in option_effects {
+        out.insert(format!("{}.{}", eff.base_var, eff.field));
+    }
+    for eff in string_effects {
+        out.insert(format!("{}.{}", eff.base_var, eff.field));
+    }
+    for eff in container_effects {
+        out.insert(format!("{}.{}", eff.base_var, eff.field));
+    }
+    for eff in coin_effects {
+        out.insert(eff.base_var.clone());
+    }
+    for eff in treasury_cap_effects {
+        out.insert(eff.base_var.clone());
+    }
+    out.into_iter().collect()
+}
+
+fn is_read_only_decl_with_effects(
+    d: &FnDecl,
+    numeric_effects: &[NumericEffect],
+    vector_effects: &[VectorEffect],
+    coin_effects: &[CoinEffect],
+    treasury_cap_effects: &[TreasuryCapEffect],
+    option_effects: &[OptionEffect],
+    string_effects: &[StringEffect],
+    container_effects: &[ContainerEffect],
+) -> bool {
+    if d.params.iter().any(|p| p.ty.trim().starts_with("&mut")) {
+        return false;
+    }
+    numeric_effects.is_empty()
+        && vector_effects.is_empty()
+        && coin_effects.is_empty()
+        && treasury_cap_effects.is_empty()
+        && option_effects.is_empty()
+        && string_effects.is_empty()
+        && container_effects.is_empty()
+}
+
+fn find_cross_module_callees(
+    d: &FnDecl,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+) -> Vec<(String, String)> {
+    let mut out: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let resolve_module = |raw_mod: &str| -> Option<String> {
+        if raw_mod.is_empty() {
+            return None;
+        }
+        if let Some(full) = d.module_use_aliases.get(raw_mod) {
+            return Some(full.clone());
+        }
+        if raw_mod.contains("::") {
+            return Some(raw_mod.to_string());
+        }
+        let mut matches: Vec<String> = fn_lookup
+            .keys()
+            .filter(|m| m.ends_with(&format!("::{}", raw_mod)))
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.dedup();
+        if matches.len() == 1 {
+            return matches.into_iter().next();
+        }
+        None
+    };
+    for line in &d.body_lines {
+        let src = line.split("//").next().unwrap_or("").trim();
+        if src.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = src.chars().collect();
+        let mut i = 0usize;
+        while i + 1 < chars.len() {
+            if chars[i] != ':' || chars[i + 1] != ':' {
+                i += 1;
+                continue;
+            }
+            let mut left = i;
+            while left > 0
+                && (chars[left - 1].is_ascii_alphanumeric()
+                    || chars[left - 1] == '_'
+                    || chars[left - 1] == ':')
+            {
+                left -= 1;
+            }
+            let module_part: String = chars[left..i].iter().collect();
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let fn_start = j;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j == fn_start {
+                i += 2;
+                continue;
+            }
+            let fn_name: String = chars[fn_start..j].iter().collect();
+            while j < chars.len() && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '<' {
+                let mut depth = 1i32;
+                j += 1;
+                while j < chars.len() && depth > 0 {
+                    if chars[j] == '<' {
+                        depth += 1;
+                    } else if chars[j] == '>' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                while j < chars.len() && chars[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j >= chars.len() || chars[j] != '(' {
+                i += 2;
+                continue;
+            }
+            let Some(resolved_module) = resolve_module(module_part.trim()) else {
+                i += 2;
+                continue;
+            };
+            if resolved_module == d.module_name {
+                i += 2;
+                continue;
+            }
+            if fn_lookup
+                .get(&resolved_module)
+                .and_then(|m| m.get(&fn_name))
+                .is_some()
+            {
+                out.insert((resolved_module, fn_name));
+            }
+            i += 2;
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use serde::Deserialize;
 
@@ -311,7 +554,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
-    let mut skipped: Vec<(String, String, String)> = Vec::new(); // (module, fn, reason)
+    let mut skipped: Vec<SkippedFunctionDiagnostic> = Vec::new();
     let mut unverified_abort_paths: Vec<String> = Vec::new();
     let mut out: Vec<String> = Vec::new();
     let test_module_address = derive_test_module_address(&decls, &pkg_name);
@@ -439,18 +682,234 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             }
             unverified_abort_paths.extend(guard_unverified);
         } else {
-            skipped.push((
-                d.module_name,
-                d.fn_name,
-                "unsupported signature for first-pass generation".to_string(),
-            ));
+            if is_read_only_decl_with_effects(
+                &d,
+                &resolved_effects,
+                &resolved_vector_effects,
+                &resolved_coin_effects,
+                &resolved_treasury_cap_effects,
+                &resolved_option_effects,
+                &resolved_string_effects,
+                &resolved_container_effects,
+            ) {
+                continue;
+            }
+            let local_potential_changes = collect_potential_change_names(
+                &d,
+                &resolved_effects,
+                &resolved_vector_effects,
+                &resolved_coin_effects,
+                &resolved_treasury_cap_effects,
+                &resolved_option_effects,
+                &resolved_string_effects,
+                &resolved_container_effects,
+            );
+            let local_asserts = collect_assert_conditions(&d.body_lines);
+            let mut callee_diagnostics: Vec<CalleeDiagnostic> = Vec::new();
+            for cs in &d.calls {
+                if let Some(callee) = fn_lookup
+                    .get(&d.module_name)
+                    .and_then(|m| m.get(&cs.callee_fn))
+                {
+                    let ckey = fn_key(&callee.module_name, &callee.fn_name);
+                    let c_numeric = effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.numeric_effects.clone());
+                    let c_vector = vector_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.vector_effects.clone());
+                    let c_coin = coin_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.coin_effects.clone());
+                    let c_treasury = treasury_cap_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.treasury_cap_effects.clone());
+                    let c_option = option_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.option_effects.clone());
+                    let c_string = string_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.string_effects.clone());
+                    let c_container = container_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.container_effects.clone());
+                    let pot = collect_potential_change_names(
+                        callee,
+                        &c_numeric,
+                        &c_vector,
+                        &c_coin,
+                        &c_treasury,
+                        &c_option,
+                        &c_string,
+                        &c_container,
+                    );
+                    let asserts = collect_assert_conditions(&callee.body_lines);
+                    if is_read_only_decl_with_effects(
+                        callee,
+                        &c_numeric,
+                        &c_vector,
+                        &c_coin,
+                        &c_treasury,
+                        &c_option,
+                        &c_string,
+                        &c_container,
+                    ) {
+                        continue;
+                    }
+                    if !pot.is_empty() || !asserts.is_empty() {
+                        callee_diagnostics.push(CalleeDiagnostic {
+                            callee_label: format!("{}::{}", callee.module_name, callee.fn_name),
+                            potential_changes: pot,
+                            asserts,
+                        });
+                    }
+                }
+            }
+            for (cmodule, cfn) in find_cross_module_callees(&d, &fn_lookup) {
+                if let Some(callee) = fn_lookup.get(&cmodule).and_then(|m| m.get(&cfn)) {
+                    let ckey = fn_key(&callee.module_name, &callee.fn_name);
+                    let c_numeric = effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.numeric_effects.clone());
+                    let c_vector = vector_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.vector_effects.clone());
+                    let c_coin = coin_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.coin_effects.clone());
+                    let c_treasury = treasury_cap_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.treasury_cap_effects.clone());
+                    let c_option = option_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.option_effects.clone());
+                    let c_string = string_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.string_effects.clone());
+                    let c_container = container_effects_map
+                        .get(&ckey)
+                        .cloned()
+                        .unwrap_or_else(|| callee.container_effects.clone());
+                    let pot = collect_potential_change_names(
+                        callee,
+                        &c_numeric,
+                        &c_vector,
+                        &c_coin,
+                        &c_treasury,
+                        &c_option,
+                        &c_string,
+                        &c_container,
+                    );
+                    let asserts = collect_assert_conditions(&callee.body_lines);
+                    if is_read_only_decl_with_effects(
+                        callee,
+                        &c_numeric,
+                        &c_vector,
+                        &c_coin,
+                        &c_treasury,
+                        &c_option,
+                        &c_string,
+                        &c_container,
+                    ) {
+                        continue;
+                    }
+                    if !pot.is_empty() || !asserts.is_empty() {
+                        let label = format!("{}::{}", callee.module_name, callee.fn_name);
+                        if !callee_diagnostics.iter().any(|c| c.callee_label == label) {
+                            callee_diagnostics.push(CalleeDiagnostic {
+                                callee_label: label,
+                                potential_changes: pot,
+                                asserts,
+                            });
+                        }
+                    }
+                }
+            }
+            skipped.push(SkippedFunctionDiagnostic {
+                module_name: d.module_name,
+                fn_name: d.fn_name,
+                reason: "unsupported signature for first-pass generation".to_string(),
+                local_potential_changes,
+                local_asserts,
+                callee_diagnostics,
+            });
         }
     }
 
     if !skipped.is_empty() {
         out.push("    // ---- Skipped functions (best-effort generator couldn’t synthesize calls yet) ----".to_string());
-        for (m, f, r) in &skipped {
-            out.push(format!("    // {}::{} — {}", m, f, r));
+        for s in &skipped {
+            out.push(format!(
+                "    // {}::{} — {}",
+                s.module_name, s.fn_name, s.reason
+            ));
+            let local_changes = if s.local_potential_changes.is_empty() {
+                "(none)".to_string()
+            } else {
+                s.local_potential_changes.join(", ")
+            };
+            out.push(format!("    //   potential_change (local): {}", local_changes));
+            if s.callee_diagnostics.is_empty() {
+                out.push("    //   potential_change (from calls): (none)".to_string());
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                for c in &s.callee_diagnostics {
+                    if c.potential_changes.is_empty() {
+                        continue;
+                    }
+                    parts.push(format!(
+                        "{} -> {}",
+                        c.callee_label,
+                        c.potential_changes.join(", ")
+                    ));
+                }
+                if parts.is_empty() {
+                    out.push("    //   potential_change (from calls): (none)".to_string());
+                } else {
+                    out.push(format!(
+                        "    //   potential_change (from calls): {}",
+                        parts.join(" | ")
+                    ));
+                }
+            }
+            let local_asserts = if s.local_asserts.is_empty() {
+                "(none)".to_string()
+            } else {
+                s.local_asserts.join(" | ")
+            };
+            out.push(format!("    //   manual_asserts (local): {}", local_asserts));
+            if s.callee_diagnostics.is_empty() {
+                out.push("    //   manual_asserts (from calls): (none)".to_string());
+            } else {
+                let mut parts: Vec<String> = Vec::new();
+                for c in &s.callee_diagnostics {
+                    if c.asserts.is_empty() {
+                        continue;
+                    }
+                    parts.push(format!("{} -> {}", c.callee_label, c.asserts.join(" | ")));
+                }
+                if parts.is_empty() {
+                    out.push("    //   manual_asserts (from calls): (none)".to_string());
+                } else {
+                    out.push(format!(
+                        "    //   manual_asserts (from calls): {}",
+                        parts.join(" | ")
+                    ));
+                }
+            }
         }
         out.push("".to_string());
     }
@@ -1217,6 +1676,9 @@ fn is_type_return_match(target_ty: &str, ret_ty: &str, current_module: &str) -> 
         return false;
     }
     if !target.contains("::") {
+        if target_base == ret_base {
+            return true;
+        }
         return ret == format!("{}::{}", current_module, target) || ret_base == target;
     }
     let Some((target_mod, _)) = target.rsplit_once("::") else {
@@ -1298,7 +1760,20 @@ fn synthesize_value_expr_for_type(
         return Some("std::string::utf8(b\"tidewalker\")".to_string());
     }
     if is_vector_type(&t) {
-        return vector_literal_expr_for_type(&t);
+        if let Some(vec_lit) = vector_literal_expr_for_type(&t) {
+            return Some(vec_lit);
+        }
+        if let Some(inner) = extract_vector_inner_type(&t) {
+            let inner_expr = synthesize_value_expr_for_type(
+                &inner,
+                current_module,
+                fn_lookup,
+                skip_fq,
+                depth + 1,
+            )?;
+            return Some(format!("vector[{}]", inner_expr));
+        }
+        return None;
     }
     if is_coin_type(&t) {
         let coin_ty = coin_type_tag_from_coin_type_in_module(&t, current_module, fn_lookup);
