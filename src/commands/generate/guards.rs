@@ -132,6 +132,8 @@ struct GuardEnv<'a> {
     bootstrap_catalog: &'a std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &'a std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module:
+        &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 fn module_fn_label(d: &FnDecl) -> String {
@@ -144,7 +146,8 @@ fn cleanup_stmt_for_type(
     var: &str,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-) -> String {
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<String> {
     if is_known_key_struct(ty, default_module, key_structs_by_module) {
         let (decl_module, _) = split_type_module_and_base(ty, default_module);
         let destroy_name = format!("destroy_{}_for_testing", type_key_from_type_name(ty));
@@ -154,10 +157,13 @@ fn cleanup_stmt_for_type(
             .map(|f| f.is_test_only)
             .unwrap_or(false)
         {
-            return format!("{}::{}({});", decl_module, destroy_name, var);
+            return Some(format!("{}::{}({});", decl_module, destroy_name, var));
+        }
+        if !is_known_store_struct(ty, default_module, store_structs_by_module) {
+            return None;
         }
     }
-    format!("transfer::public_transfer({}, SUPER_USER);", var)
+    Some(format!("transfer::public_transfer({}, SUPER_USER);", var))
 }
 
 fn reverse_comparison_op(op: &str) -> String {
@@ -1354,6 +1360,7 @@ fn synthesize_guard_factory_args_with_refs(
     factory: &FnDecl,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> Option<GuardFactoryArgPlan> {
     let mut args = Vec::new();
     let mut prep_lines = Vec::new();
@@ -1454,7 +1461,8 @@ fn synthesize_guard_factory_args_with_refs(
                         &var,
                         fn_lookup,
                         key_structs_by_module,
-                    ));
+                        store_structs_by_module,
+                    )?);
                 }
             }
             continue;
@@ -1499,6 +1507,7 @@ fn pick_guard_factory_call_for_type(
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> Option<GuardFactoryCallPlan> {
     let mut best: Option<(usize, GuardFactoryCallPlan)> = None;
     for f in module_fns.values() {
@@ -1518,8 +1527,12 @@ fn pick_guard_factory_call_for_type(
         if type_key_from_type_name(ret) != type_key {
             continue;
         }
-        let Some(arg_plan) =
-            synthesize_guard_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        let Some(arg_plan) = synthesize_guard_factory_args_with_refs(
+            f,
+            fn_lookup,
+            key_structs_by_module,
+            store_structs_by_module,
+        )
         else {
             continue;
         };
@@ -1549,6 +1562,7 @@ fn pick_guard_shared_creator_plan(
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     required_cap_type_keys: &std::collections::BTreeSet<String>,
     required_shared_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<GuardSharedCreatorPlan> {
@@ -1592,8 +1606,12 @@ fn pick_guard_shared_creator_plan(
         } else if shared_type_keys.is_empty() {
             continue;
         }
-        let Some(arg_plan) =
-            synthesize_guard_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        let Some(arg_plan) = synthesize_guard_factory_args_with_refs(
+            f,
+            fn_lookup,
+            key_structs_by_module,
+            store_structs_by_module,
+        )
         else {
             continue;
         };
@@ -1915,6 +1933,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         fns,
                         env.fn_lookup,
                         env.key_structs_by_module,
+                        env.store_structs_by_module,
                         &required_creator_cap_type_keys,
                         &required_creator_shared_type_keys,
                     )
@@ -1936,6 +1955,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                 fns,
                 env.fn_lookup,
                 env.key_structs_by_module,
+                env.store_structs_by_module,
             )
         })
         {
@@ -1953,6 +1973,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         fns,
                         env.fn_lookup,
                         env.key_structs_by_module,
+                        env.store_structs_by_module,
                         &required_creator_cap_type_keys,
                         &required_creator_shared_type_keys,
                     )
@@ -2059,7 +2080,8 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         "seed_ret_obj",
                         env.fn_lookup,
                         env.key_structs_by_module,
-                    );
+                        env.store_structs_by_module,
+                    )?;
                     lines_before_tx.push(format!("    {}", seed_cleanup));
                 } else {
                     lines_before_tx.push(format!("    {};", call_expr));
@@ -2196,7 +2218,8 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             &obj.var_name,
             env.fn_lookup,
             env.key_structs_by_module,
-        );
+            env.store_structs_by_module,
+        )?;
         cleanup.push(cleanup_stmt);
     }
     for coin in &coin_needs {
@@ -2230,6 +2253,7 @@ fn render_cap_role_guard_test(
     bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     case_idx: usize,
     cap_param: &str,
     cap_type: &str,
@@ -2259,6 +2283,7 @@ fn render_cap_role_guard_test(
                 fns,
                 fn_lookup,
                 key_structs_by_module,
+                store_structs_by_module,
                 &required_cap_type_keys,
                 &required_shared_type_keys,
             )
@@ -2324,7 +2349,8 @@ fn render_cap_role_guard_test(
                     "seed_ret_obj",
                     fn_lookup,
                     key_structs_by_module,
-                );
+                    store_structs_by_module,
+                )?;
                 lines.push(format!("        {}", seed_cleanup));
             } else {
                 lines.push(format!("        {};", call_expr));
@@ -2487,7 +2513,8 @@ fn render_guard_call_test(
                 "tw_ret_obj",
                 env.fn_lookup,
                 env.key_structs_by_module,
-            );
+                env.store_structs_by_module,
+            )?;
             lines.push(format!("        {}", ret_cleanup));
         } else {
             lines.push(format!("        {};", call_expr));
@@ -2657,9 +2684,13 @@ fn render_object_field_sender_guard_test(
             continue;
         }
         if is_coin_type(t) {
+            let coin_tag = coin_type_tag_from_coin_type_with_aliases(t, &d.module_use_aliases);
+            if !is_qualified_type_tag(&coin_tag) {
+                return None;
+            }
             move_vars.push((
                 format!("coin_{}", sanitize_ident(&p.name)),
-                normalize_param_object_type(t),
+                format!("sui::coin::Coin<{}>", coin_tag),
                 t.starts_with("&mut"),
             ));
             continue;
@@ -2878,6 +2909,7 @@ pub(super) fn render_guard_tests_for_function(
     bootstrap_catalog: &std::collections::HashMap<String, ModuleBootstrapCatalog>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) -> (Vec<Vec<String>>, Vec<String>) {
     let mut tests = Vec::new();
     let mut notes = Vec::new();
@@ -2886,6 +2918,7 @@ pub(super) fn render_guard_tests_for_function(
         bootstrap_catalog,
         fn_lookup,
         key_structs_by_module,
+        store_structs_by_module,
     };
 
     let (cases, parse_notes) = parse_assert_guard_cases(d, accessor_map);
@@ -2903,6 +2936,7 @@ pub(super) fn render_guard_tests_for_function(
                     bootstrap_catalog,
                     fn_lookup,
                     key_structs_by_module,
+                    store_structs_by_module,
                     idx,
                     cap_param,
                     cap_type,

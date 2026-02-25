@@ -152,7 +152,10 @@ fn dedup_type_pairs(v: &mut Vec<(String, String)>) {
     v.retain(|item| seen.insert(item.clone()));
 }
 
-pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_generate_setup_internal(
+    package_path: &Path,
+    emit_alerts: bool,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -337,7 +340,7 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         }
     }
 
-    if !alerts.is_empty() {
+    if emit_alerts && !alerts.is_empty() {
         eprintln!("\n--- Tidewalker: setup generation alerts ---");
         for (target, reason) in &alerts {
             eprintln!("  ALERT [{}]: {}", target, reason);
@@ -345,7 +348,18 @@ pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error:
         eprintln!("--------------------------------------------");
     }
 
+    Ok(alerts)
+}
+
+pub fn run_generate_setup(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_generate_setup_internal(package_path, true)?;
     Ok(())
+}
+
+pub fn run_generate_setup_quiet(
+    package_path: &Path,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    run_generate_setup_internal(package_path, false)
 }
 
 fn extract_setup_info(path: &Path) -> Result<ModuleSetupInfo, Box<dyn std::error::Error>> {

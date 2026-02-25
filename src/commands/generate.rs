@@ -1,5 +1,5 @@
 //! Test generation logic.
-use crate::commands::setup::run_generate_setup;
+use crate::commands::setup::run_generate_setup_quiet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,9 +14,21 @@ mod render;
 use parser::*;
 
 pub fn run_generate(package_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Always do setup first (same behavior as `generate-setup`).
-    run_generate_setup(package_path)?;
-    generate_tests(package_path)
+    // Always do setup first, but defer setup alerts unless generation fails.
+    let setup_alerts = run_generate_setup_quiet(package_path)?;
+    match generate_tests(package_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if !setup_alerts.is_empty() {
+                eprintln!("\n--- Tidewalker: setup generation alerts ---");
+                for (target, reason) in &setup_alerts {
+                    eprintln!("  ALERT [{}]: {}", target, reason);
+                }
+                eprintln!("--------------------------------------------");
+            }
+            Err(e)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +287,10 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
         String,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
+    let mut store_structs_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     for file in &move_files {
         let content = fs::read_to_string(file)?;
         decls.extend(extract_public_fns(&content));
@@ -289,6 +305,8 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             }
         }) {
             key_structs_by_module.insert(module_name.clone(), extract_key_struct_types(&content));
+            store_structs_by_module
+                .insert(module_name.clone(), extract_store_struct_types(&content));
             module_sources.insert(module_name, content);
         }
     }
@@ -388,6 +406,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
             bootstrap_catalog: &bootstrap_catalog,
             fn_lookup: &fn_lookup,
             key_structs_by_module: &key_structs_by_module,
+            store_structs_by_module: &store_structs_by_module,
             numeric_effects: &resolved_effects,
             vector_effects: &resolved_vector_effects,
             coin_effects: &resolved_coin_effects,
@@ -410,6 +429,7 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
                 &bootstrap_catalog,
                 &fn_lookup,
                 &key_structs_by_module,
+                &store_structs_by_module,
             );
             for test in guard_tests {
                 for l in test {
@@ -921,6 +941,18 @@ fn is_known_key_struct(
         .unwrap_or(false)
 }
 
+fn is_known_store_struct(
+    ty: &str,
+    default_module: &str,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let (module, base) = split_type_module_and_base(ty, default_module);
+    store_structs_by_module
+        .get(module)
+        .map(|types| types.contains(base))
+        .unwrap_or(false)
+}
+
 fn derive_test_module_address(decls: &[FnDecl], fallback_pkg_name: &str) -> String {
     decls
         .iter()
@@ -956,6 +988,10 @@ fn pick_init_bootstrap_helper_name(
 fn should_transfer_call_return_basic(ret_ty: &str, _module_name: &str) -> bool {
     let t = ret_ty.trim();
     if t.is_empty() || t == "()" || t.starts_with('&') {
+        return false;
+    }
+    // Tuple/list returns need per-element destructuring; do not treat as one transferable value.
+    if t.starts_with('(') && t.ends_with(')') && t.contains(',') {
         return false;
     }
     if is_numeric_type(t)
@@ -1391,6 +1427,46 @@ fn extract_key_struct_types(content: &str) -> std::collections::HashSet<String> 
             .map(|a| a.trim())
             .any(|a| a == "key");
         if has_key {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+fn extract_store_struct_types(content: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in content.lines() {
+        let t = line.trim();
+        let after = if let Some(rest) = t.strip_prefix("public struct ") {
+            rest
+        } else if let Some(rest) = t.strip_prefix("struct ") {
+            rest
+        } else {
+            continue;
+        };
+        let Some((name_part, ability_part_raw)) = after.split_once(" has ") else {
+            continue;
+        };
+        let name = name_part
+            .trim()
+            .split('<')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let ability_part = ability_part_raw
+            .split('{')
+            .next()
+            .unwrap_or(ability_part_raw)
+            .trim();
+        let has_store = ability_part
+            .split(',')
+            .map(|a| a.trim())
+            .any(|a| a == "store");
+        if has_store {
             out.insert(name);
         }
     }

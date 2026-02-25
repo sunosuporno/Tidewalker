@@ -268,6 +268,8 @@ pub(super) struct RenderInputs<'a> {
         &'a std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     pub(super) key_structs_by_module:
         &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub(super) store_structs_by_module:
+        &'a std::collections::HashMap<String, std::collections::HashSet<String>>,
     pub(super) numeric_effects: &'a [NumericEffect],
     pub(super) vector_effects: &'a [VectorEffect],
     pub(super) coin_effects: &'a [CoinEffect],

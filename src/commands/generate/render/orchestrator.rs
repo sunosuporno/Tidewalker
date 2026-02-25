@@ -25,6 +25,7 @@ struct SharedCreatorPlan {
 
 #[derive(Debug, Clone)]
 struct HelperCallPlan {
+    module_name: String,
     fn_name: String,
     args: Vec<String>,
     type_args: Vec<String>,
@@ -39,6 +40,7 @@ struct FactoryArgPlan {
 
 #[derive(Debug, Clone)]
 struct FactoryCallPlan {
+    module_name: String,
     fn_name: String,
     type_args: Vec<String>,
     args: Vec<String>,
@@ -51,13 +53,80 @@ fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
 }
 
+fn parse_top_level_tuple_types(ret_ty: &str) -> Option<Vec<String>> {
+    let t = ret_ty.trim();
+    if !(t.starts_with('(') && t.ends_with(')')) {
+        return None;
+    }
+    let inner = &t[1..t.len() - 1];
+    let parts = split_args(inner)
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(parts)
+}
+
+fn has_overflow_prone_mul(body_lines: &[String]) -> bool {
+    body_lines.iter().any(|line| {
+        let raw = line.split("//").next().unwrap_or("").trim();
+        if raw.is_empty() || !raw.contains('*') {
+            return false;
+        }
+        let norm = remove_whitespace(raw);
+        let has_billion_scale_mul = norm.contains("*1_000_000_000") || norm.contains("*1000000000");
+        let has_u128_cast = norm.contains("asu128");
+        has_billion_scale_mul || !has_u128_cast
+    })
+}
+
+fn per_call_coin_mint_amount(
+    d: &FnDecl,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+) -> &'static str {
+    // Keep defaults high for broad protocol compatibility, but avoid
+    // overflow-prone reserve math patterns in the function under test and
+    // direct same-module callees (entry wrapper patterns).
+    let mut overflow_prone = has_overflow_prone_mul(&d.body_lines);
+    if !overflow_prone {
+        if let Some(module_fns) = fn_lookup.get(&d.module_name) {
+            'outer: for line in &d.body_lines {
+                let stmt = line.split("//").next().unwrap_or("").trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                for (name, callee) in module_fns {
+                    if name == &d.fn_name {
+                        continue;
+                    }
+                    if stmt.contains(&format!("{}(", name))
+                        && has_overflow_prone_mul(&callee.body_lines)
+                    {
+                        overflow_prone = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    if overflow_prone {
+        "1_000_000_000"
+    } else {
+        "1_000_000_000_000"
+    }
+}
+
 fn cleanup_stmt_for_type(
     default_module: &str,
     ty: &str,
     var: &str,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-) -> String {
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> Option<String> {
     if is_known_key_struct(ty, default_module, key_structs_by_module) {
         let (decl_module, _) = split_type_module_and_base(ty, default_module);
         let destroy_name = format!("destroy_{}_for_testing", type_key_from_type_name(ty));
@@ -67,10 +136,13 @@ fn cleanup_stmt_for_type(
             .map(|f| f.is_test_only)
             .unwrap_or(false)
         {
-            return format!("{}::{}({});", decl_module, destroy_name, var);
+            return Some(format!("{}::{}({});", decl_module, destroy_name, var));
+        }
+        if !is_known_store_struct(ty, default_module, store_structs_by_module) {
+            return None;
         }
     }
-    format!("transfer::public_transfer({}, SUPER_USER);", var)
+    Some(format!("transfer::public_transfer({}, SUPER_USER);", var))
 }
 
 fn requires_chain_uses_coin_slot_later(
@@ -488,6 +560,7 @@ fn synthesize_requires_call_args(
     requires_cleanup_coin_vars: &mut Vec<String>,
     requires_cleanup_clock_vars: &mut Vec<String>,
     requires_consumed_coin_vars: &mut std::collections::HashSet<String>,
+    coin_mint_amount: &str,
 ) -> Option<(Vec<String>, Vec<String>)> {
     let mut args = Vec::new();
     let mut prep = Vec::new();
@@ -586,8 +659,8 @@ fn synthesize_requires_call_args(
                         return None;
                     }
                     prep.push(format!(
-                        "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
-                        maybe_mut, var, coin_ty
+                        "let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+                        maybe_mut, var, coin_ty, coin_mint_amount
                     ));
                     if t.starts_with("&mut") {
                         args.push(format!("&mut {}", var));
@@ -615,8 +688,8 @@ fn synthesize_requires_call_args(
                         return None;
                     }
                     prep.push(format!(
-                        "let {} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
-                        var, coin_ty
+                        "let {} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+                        var, coin_ty, coin_mint_amount
                     ));
                     args.push(var);
                 } else if let Some(var) = main_coin_vars.get(coin_slot_idx) {
@@ -636,8 +709,8 @@ fn synthesize_requires_call_args(
                         return None;
                     }
                     prep.push(format!(
-                        "let {} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
-                        var, coin_ty
+                        "let {} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+                        var, coin_ty, coin_mint_amount
                     ));
                     args.push(var);
                 }
@@ -674,6 +747,7 @@ fn synthesize_requires_call_args(
 fn synthesize_factory_args(
     factory: &FnDecl,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    coin_mint_amount: &str,
 ) -> Option<Vec<String>> {
     let mut args = Vec::new();
     for p in &factory.params {
@@ -686,8 +760,8 @@ fn synthesize_factory_args(
                 return None;
             }
             args.push(format!(
-                "coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario))",
-                coin_ty
+                "coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario))",
+                coin_ty, coin_mint_amount
             ));
         } else if is_vector_type(t) && !t.starts_with('&') {
             args.push(vector_literal_expr_for_type(t)?);
@@ -725,6 +799,8 @@ fn synthesize_factory_args_with_refs(
     factory: &FnDecl,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    coin_mint_amount: &str,
 ) -> Option<FactoryArgPlan> {
     let mut args = Vec::new();
     let mut prep_lines = Vec::new();
@@ -767,8 +843,8 @@ fn synthesize_factory_args_with_refs(
                 return None;
             }
             prep_lines.push(format!(
-                "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
-                maybe_mut, var, coin_ty
+                "let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var, coin_ty, coin_mint_amount
             ));
             if t.starts_with("&mut") {
                 args.push(format!("&mut {}", var));
@@ -810,7 +886,8 @@ fn synthesize_factory_args_with_refs(
                     &var,
                     fn_lookup,
                     key_structs_by_module,
-                ));
+                    store_structs_by_module,
+                )?);
             }
             continue;
         }
@@ -851,10 +928,9 @@ fn synthesize_factory_args_with_refs(
 fn synthesize_owned_factory_call_plan(
     d: &FnDecl,
     factory: &FnDecl,
-    module_fns: &std::collections::HashMap<String, FnDecl>,
-    module_bootstrap: &ModuleBootstrapCatalog,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    coin_mint_amount: &str,
 ) -> Option<FactoryCallPlan> {
     let mut args = Vec::new();
     let mut prep_lines = Vec::new();
@@ -898,8 +974,8 @@ fn synthesize_owned_factory_call_plan(
                 return None;
             }
             prep_lines.push(format!(
-                "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
-                maybe_mut, var, coin_ty
+                "let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var, coin_ty, coin_mint_amount
             ));
             if t.starts_with("&mut") {
                 args.push(format!("&mut {}", var));
@@ -917,14 +993,6 @@ fn synthesize_owned_factory_call_plan(
             let inner_ty = normalize_param_object_type(t);
             if is_known_key_struct(&inner_ty, &d.module_name, key_structs_by_module) {
                 let type_key = type_key_from_type_name(&inner_ty);
-                let has_shared_helper = module_fns
-                    .contains_key(&format!("create_and_share_{}_for_testing", type_key));
-                let from_witness_init =
-                    module_bootstrap.one_time_witness_init
-                        && module_bootstrap.init_shared_types.contains(&type_key);
-                if !has_shared_helper && !from_witness_init {
-                    return None;
-                }
                 let token = format!("__TW_OBJ_BY_TYPE_{}__", sanitize_ident(&type_key));
                 if t.starts_with("&mut") {
                     args.push(format!("&mut {}", token));
@@ -984,6 +1052,7 @@ fn synthesize_owned_factory_call_plan(
         Vec::new()
     };
     Some(FactoryCallPlan {
+        module_name: factory.module_name.clone(),
         fn_name: factory.fn_name.clone(),
         type_args,
         args,
@@ -997,9 +1066,9 @@ fn pick_factory_call_for_type(
     d: &FnDecl,
     type_key: &str,
     module_fns: &std::collections::HashMap<String, FnDecl>,
-    module_bootstrap: &ModuleBootstrapCatalog,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    coin_mint_amount: &str,
 ) -> Option<FactoryCallPlan> {
     let mut best: Option<(usize, FactoryCallPlan)> = None;
     for f in module_fns.values() {
@@ -1022,10 +1091,9 @@ fn pick_factory_call_for_type(
         let Some(plan) = synthesize_owned_factory_call_plan(
             d,
             f,
-            module_fns,
-            module_bootstrap,
             fn_lookup,
             key_structs_by_module,
+            coin_mint_amount,
         ) else {
             continue;
         };
@@ -1043,6 +1111,8 @@ fn pick_owned_test_helper_for_type(
     type_key: &str,
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    helper_module_name: &str,
+    coin_mint_amount: &str,
 ) -> Option<HelperCallPlan> {
     let wanted = normalize_helper_key(type_key);
     let mut best: Option<(usize, HelperCallPlan)> = None;
@@ -1070,7 +1140,7 @@ fn pick_owned_test_helper_for_type(
         if !helper_name_match && !ret_type_match {
             continue;
         }
-        let Some(args) = synthesize_factory_args(f, fn_lookup) else {
+        let Some(args) = synthesize_factory_args(f, fn_lookup, coin_mint_amount) else {
             continue;
         };
         let type_args = if has_unbound_type_params(f) {
@@ -1079,6 +1149,7 @@ fn pick_owned_test_helper_for_type(
             Vec::new()
         };
         let plan = HelperCallPlan {
+            module_name: helper_module_name.to_string(),
             fn_name: f.fn_name.clone(),
             args,
             type_args,
@@ -1096,6 +1167,8 @@ fn pick_shared_test_helper_for_type(
     type_key: &str,
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+    helper_module_name: &str,
+    coin_mint_amount: &str,
 ) -> Option<HelperCallPlan> {
     let wanted = normalize_helper_key(type_key);
     let mut best: Option<(usize, HelperCallPlan)> = None;
@@ -1120,7 +1193,7 @@ fn pick_shared_test_helper_for_type(
         if !helper_name_match && !ret_type_match {
             continue;
         }
-        let Some(args) = synthesize_factory_args(f, fn_lookup) else {
+        let Some(args) = synthesize_factory_args(f, fn_lookup, coin_mint_amount) else {
             continue;
         };
         let type_args = if has_unbound_type_params(f) {
@@ -1129,6 +1202,7 @@ fn pick_shared_test_helper_for_type(
             Vec::new()
         };
         let plan = HelperCallPlan {
+            module_name: helper_module_name.to_string(),
             fn_name: f.fn_name.clone(),
             args,
             type_args,
@@ -1146,8 +1220,10 @@ fn pick_shared_creator_plan(
     module_fns: &std::collections::HashMap<String, FnDecl>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     required_cap_type_keys: &std::collections::BTreeSet<String>,
     required_shared_type_keys: &std::collections::BTreeSet<String>,
+    coin_mint_amount: &str,
 ) -> Option<SharedCreatorPlan> {
     let mut candidates = module_fns
         .values()
@@ -1189,7 +1265,14 @@ fn pick_shared_creator_plan(
         } else if shared_type_keys.is_empty() {
             continue;
         }
-        let Some(arg_plan) = synthesize_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
+        let Some(arg_plan) =
+            synthesize_factory_args_with_refs(
+                f,
+                fn_lookup,
+                key_structs_by_module,
+                store_structs_by_module,
+                coin_mint_amount,
+            )
         else {
             continue;
         };
@@ -1247,6 +1330,7 @@ pub(super) fn render_best_effort_test(
     let bootstrap_catalog = inputs.bootstrap_catalog;
     let fn_lookup = inputs.fn_lookup;
     let key_structs_by_module = inputs.key_structs_by_module;
+    let store_structs_by_module = inputs.store_structs_by_module;
     let numeric_effects = inputs.numeric_effects;
     let vector_effects = inputs.vector_effects;
     let coin_effects = inputs.coin_effects;
@@ -1269,6 +1353,7 @@ pub(super) fn render_best_effort_test(
         return None;
     }
     let fq = format!("{}::{}", d.module_name, d.fn_name);
+    let coin_mint_amount = per_call_coin_mint_amount(d, fn_lookup);
     let mut lines = Vec::new();
     lines.push("#[test]".to_string());
     lines.push(format!(
@@ -1472,14 +1557,17 @@ pub(super) fn render_best_effort_test(
     let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     if !object_needs.is_empty() {
-        let empty_bootstrap = ModuleBootstrapCatalog::default();
-        let module_bootstrap = bootstrap_catalog
-            .get(&d.module_name)
-            .unwrap_or(&empty_bootstrap);
+            let empty_bootstrap = ModuleBootstrapCatalog::default();
         let module_fns = fn_lookup.get(&d.module_name);
         let mut idx = 0usize;
         while idx < object_needs.len() {
             let obj = object_needs[idx].clone();
+            let (provider_module, _) =
+                split_type_module_and_base(&obj.type_name, &d.module_name);
+            let provider_fns = fn_lookup.get(provider_module);
+            let provider_bootstrap = bootstrap_catalog
+                .get(provider_module)
+                .unwrap_or(&empty_bootstrap);
             let needs_shared_non_cap_object = object_needs
                 .iter()
                 .any(|o| o.is_ref && !is_cap_type(&o.type_name));
@@ -1493,15 +1581,30 @@ pub(super) fn render_best_effort_test(
                 .filter(|o| o.is_ref && !is_cap_type(&o.type_name))
                 .map(|o| o.type_key.clone())
                 .collect();
-            let shared_helper_plan = module_fns.and_then(|fns| {
+            let shared_helper_plan = provider_fns.and_then(|fns| {
                 if obj.is_ref {
-                    pick_shared_test_helper_for_type(d, &obj.type_key, fns, fn_lookup)
+                    pick_shared_test_helper_for_type(
+                        d,
+                        &obj.type_key,
+                        fns,
+                        fn_lookup,
+                        provider_module,
+                        coin_mint_amount,
+                    )
                 } else {
                     None
                 }
             });
-            let owned_helper_plan = module_fns
-                .and_then(|fns| pick_owned_test_helper_for_type(d, &obj.type_key, fns, fn_lookup));
+            let owned_helper_plan = provider_fns.and_then(|fns| {
+                pick_owned_test_helper_for_type(
+                    d,
+                    &obj.type_key,
+                    fns,
+                    fn_lookup,
+                    provider_module,
+                    coin_mint_amount,
+                )
+            });
 
             if let Some(plan) = shared_helper_plan {
                 shared_objects.push(obj.clone());
@@ -1511,24 +1614,21 @@ pub(super) fn render_best_effort_test(
                 owned_objects.push(obj.clone());
                 object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedHelper);
                 owned_helper_calls.insert(obj.var_name.clone(), plan);
-            } else if obj.is_ref
-                && module_bootstrap.one_time_witness_init
-                && module_bootstrap.init_shared_types.contains(&obj.type_key)
+            } else if obj.is_ref && provider_bootstrap.init_shared_types.contains(&obj.type_key)
             {
                 shared_objects.push(obj.clone());
                 object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::SharedInit);
-            } else if module_bootstrap.one_time_witness_init
-                && module_bootstrap.init_owned_types.contains(&obj.type_key)
+            } else if provider_bootstrap.init_owned_types.contains(&obj.type_key)
             {
                 owned_objects.push(obj.clone());
                 object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedInit);
             } else {
                 let shared_helper = format!("create_and_share_{}_for_testing", obj.type_key);
                 let owned_helper = format!("create_{}_for_testing", obj.type_key);
-                let has_shared_helper = module_fns
+                let has_shared_helper = provider_fns
                     .map(|fns| fns.contains_key(&shared_helper))
                     .unwrap_or(false);
-                let has_owned_helper = module_fns
+                let has_owned_helper = provider_fns
                     .map(|fns| fns.contains_key(&owned_helper))
                     .unwrap_or(false);
                 if obj.is_ref && has_shared_helper {
@@ -1546,8 +1646,10 @@ pub(super) fn render_best_effort_test(
                                 fns,
                                 fn_lookup,
                                 key_structs_by_module,
+                                store_structs_by_module,
                                 &required_creator_cap_type_keys,
                                 &required_creator_shared_type_keys,
+                                coin_mint_amount,
                             )
                         });
                     }
@@ -1560,14 +1662,14 @@ pub(super) fn render_best_effort_test(
                     } else {
                         return None;
                     }
-                } else if let Some(plan) = module_fns.and_then(|fns| {
+                } else if let Some(plan) = provider_fns.and_then(|fns| {
                     pick_factory_call_for_type(
                         d,
                         &obj.type_key,
                         fns,
-                        module_bootstrap,
                         fn_lookup,
                         key_structs_by_module,
+                        coin_mint_amount,
                     )
                 }) {
                     for (dep_ty, dep_mut) in &plan.shared_ref_deps {
@@ -1585,8 +1687,10 @@ pub(super) fn render_best_effort_test(
                                 fns,
                                 fn_lookup,
                                 key_structs_by_module,
+                                store_structs_by_module,
                                 &required_creator_cap_type_keys,
                                 &required_creator_shared_type_keys,
+                                coin_mint_amount,
                             )
                         });
                     }
@@ -1623,17 +1727,25 @@ pub(super) fn render_best_effort_test(
             idx += 1;
         }
     }
-    let needs_init_bootstrap = object_sources.values().any(|src| {
-        matches!(
-            src,
-            ObjectProvisionSource::SharedInit | ObjectProvisionSource::OwnedInit
-        )
-    });
-    let init_bootstrap_helper_name = fn_lookup
-        .get(&d.module_name)
-        .and_then(pick_init_bootstrap_helper_name);
-    if needs_init_bootstrap && init_bootstrap_helper_name.is_none() {
-        return None;
+    let mut init_bootstrap_modules: Vec<String> = Vec::new();
+    for obj in &object_needs {
+        let is_init_sourced = matches!(
+            object_sources.get(&obj.var_name),
+            Some(ObjectProvisionSource::SharedInit | ObjectProvisionSource::OwnedInit)
+        );
+        if !is_init_sourced {
+            continue;
+        }
+        let (provider_module, _) = split_type_module_and_base(&obj.type_name, &d.module_name);
+        if !init_bootstrap_modules.iter().any(|m| m == provider_module) {
+            init_bootstrap_modules.push(provider_module.to_string());
+        }
+    }
+    let mut init_bootstrap_helper_by_module: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    for module in &init_bootstrap_modules {
+        let helper_name = fn_lookup.get(module).and_then(pick_init_bootstrap_helper_name)?;
+        init_bootstrap_helper_by_module.insert(module.clone(), helper_name);
     }
 
     let has_shared_objects = !shared_objects.is_empty();
@@ -1694,7 +1806,35 @@ pub(super) fn render_best_effort_test(
             };
             let call_expr = format!("{}({})", call_path, plan.args.join(", "));
             if let Some(ret_ty) = plan.return_ty.as_ref() {
-                if should_transfer_call_return_with_keys(
+                if let Some(tuple_types) = parse_top_level_tuple_types(ret_ty) {
+                    let vars = tuple_types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("seed_ret_obj_{}", i))
+                        .collect::<Vec<_>>();
+                    lines.push(format!(
+                        "        let ({}) = {};",
+                        vars.join(", "),
+                        call_expr
+                    ));
+                    for (i, member_ty) in tuple_types.iter().enumerate() {
+                        if should_transfer_call_return_with_keys(
+                            member_ty,
+                            &d.module_name,
+                            key_structs_by_module,
+                        ) {
+                            let seed_cleanup = cleanup_stmt_for_type(
+                                &d.module_name,
+                                member_ty,
+                                &format!("seed_ret_obj_{}", i),
+                                fn_lookup,
+                                key_structs_by_module,
+                                store_structs_by_module,
+                            )?;
+                            lines.push(format!("        {}", seed_cleanup));
+                        }
+                    }
+                } else if should_transfer_call_return_with_keys(
                     ret_ty,
                     &d.module_name,
                     key_structs_by_module,
@@ -1706,7 +1846,8 @@ pub(super) fn render_best_effort_test(
                         "seed_ret_obj",
                         fn_lookup,
                         key_structs_by_module,
-                    );
+                        store_structs_by_module,
+                    )?;
                     lines.push(format!("        {}", seed_cleanup));
                 } else {
                     lines.push(format!("        {};", call_expr));
@@ -1721,13 +1862,15 @@ pub(super) fn render_best_effort_test(
             needs_next_tx_before_use = true;
         }
     }
-    if needs_init_bootstrap {
+    if !init_bootstrap_modules.is_empty() {
         lines.push("    {".to_string());
-        let bootstrap_name = init_bootstrap_helper_name?;
-        lines.push(format!(
-            "        {}::{}(test_scenario::ctx(&mut scenario));",
-            d.module_name, bootstrap_name
-        ));
+        for module in &init_bootstrap_modules {
+            let bootstrap_name = init_bootstrap_helper_by_module.get(module)?;
+            lines.push(format!(
+                "        {}::{}(test_scenario::ctx(&mut scenario));",
+                module, bootstrap_name
+            ));
+        }
         lines.push("    };".to_string());
         needs_next_tx_before_use = true;
     }
@@ -1871,10 +2014,11 @@ pub(super) fn render_best_effort_test(
     for coin in &coin_needs {
         let maybe_mut = if coin.needs_mut_binding { "mut " } else { "" };
         lines.push(format!(
-            "        let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+            "        let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
             maybe_mut,
             coin.var_name,
-            coin.coin_type
+            coin.coin_type,
+            coin_mint_amount
         ));
     }
     for obj in &shared_objects {
@@ -1891,11 +2035,11 @@ pub(super) fn render_best_effort_test(
             Some(ObjectProvisionSource::OwnedHelper) => {
                 let plan = owned_helper_calls.get(&obj.var_name)?;
                 let call_path = if plan.type_args.is_empty() {
-                    format!("{}::{}", d.module_name, plan.fn_name)
+                    format!("{}::{}", plan.module_name, plan.fn_name)
                 } else {
                     format!(
                         "{}::{}<{}>",
-                        d.module_name,
+                        plan.module_name,
                         plan.fn_name,
                         plan.type_args.join(", ")
                     )
@@ -1936,11 +2080,11 @@ pub(super) fn render_best_effort_test(
                     resolved_args.push(resolved);
                 }
                 let call_path = if plan.type_args.is_empty() {
-                    format!("{}::{}", d.module_name, plan.fn_name)
+                    format!("{}::{}", plan.module_name, plan.fn_name)
                 } else {
                     format!(
                         "{}::{}<{}>",
-                        d.module_name,
+                        plan.module_name,
                         plan.fn_name,
                         plan.type_args.join(", ")
                     )
@@ -1989,6 +2133,7 @@ pub(super) fn render_best_effort_test(
             &mut requires_cleanup_coin_vars,
             &mut requires_cleanup_clock_vars,
             &mut requires_consumed_coin_vars,
+            coin_mint_amount,
         ) {
             for l in pre_lines {
                 lines.push(format!("        {}", l));
@@ -2045,7 +2190,31 @@ pub(super) fn render_best_effort_test(
     };
     let call_expr = format!("{}({})", call_target, args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
-        if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module) {
+        if let Some(tuple_types) = parse_top_level_tuple_types(ret_ty) {
+            let vars = tuple_types
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("tw_ret_obj_{}", i))
+                .collect::<Vec<_>>();
+            lines.push(format!("        let ({}) = {};", vars.join(", "), call_expr));
+            for (i, member_ty) in tuple_types.iter().enumerate() {
+                if should_transfer_call_return_with_keys(
+                    member_ty,
+                    &d.module_name,
+                    key_structs_by_module,
+                ) {
+                    let ret_cleanup = cleanup_stmt_for_type(
+                        &d.module_name,
+                        member_ty,
+                        &format!("tw_ret_obj_{}", i),
+                        fn_lookup,
+                        key_structs_by_module,
+                        store_structs_by_module,
+                    )?;
+                    lines.push(format!("        {}", ret_cleanup));
+                }
+            }
+        } else if should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module) {
             lines.push(format!("        let tw_ret_obj = {};", call_expr));
             let ret_cleanup = cleanup_stmt_for_type(
                 &d.module_name,
@@ -2053,7 +2222,8 @@ pub(super) fn render_best_effort_test(
                 "tw_ret_obj",
                 fn_lookup,
                 key_structs_by_module,
-            );
+                store_structs_by_module,
+            )?;
             lines.push(format!("        {}", ret_cleanup));
         } else {
             lines.push(format!("        {};", call_expr));
@@ -2122,7 +2292,8 @@ pub(super) fn render_best_effort_test(
                 &obj.var_name,
                 fn_lookup,
                 key_structs_by_module,
-            );
+                store_structs_by_module,
+            )?;
             lines.push(format!("        {}", cleanup_stmt));
         }
     }
