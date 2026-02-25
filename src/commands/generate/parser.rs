@@ -13,6 +13,7 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             break;
         }
     }
+    let module_use_aliases = extract_module_use_aliases(&lines);
     let option_fields_by_type = extract_option_fields_by_type(&lines);
     let string_fields_by_type = extract_string_fields_by_type(&lines);
 
@@ -160,6 +161,7 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
 
         out.push(FnDecl {
             module_name: module_name.clone(),
+            module_use_aliases: module_use_aliases.clone(),
             fn_name: name,
             type_params,
             params,
@@ -180,6 +182,83 @@ pub(super) fn extract_public_fns(content: &str) -> Vec<FnDecl> {
             calls,
         });
         i = body_end.map(|e| e + 1).unwrap_or(j);
+    }
+    out
+}
+
+fn parse_use_alias_binding(raw: &str) -> Option<(String, String)> {
+    let stmt = raw.trim().trim_end_matches(';').trim();
+    let rest = stmt.strip_prefix("use ")?;
+    let (path_part, alias_opt) = if let Some((lhs, rhs)) = rest.rsplit_once(" as ") {
+        (lhs.trim(), Some(rhs.trim()))
+    } else {
+        (rest, None)
+    };
+    if path_part.contains('{') {
+        return None;
+    }
+    let alias = alias_opt.unwrap_or_else(|| path_part.rsplit("::").next().unwrap_or(path_part));
+    if !is_ident(alias) || alias == "Self" {
+        return None;
+    }
+    Some((alias.to_string(), path_part.to_string()))
+}
+
+fn extract_module_use_aliases(lines: &[&str]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for line in lines {
+        let stmt = line
+            .split("//")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if !stmt.starts_with("use ") {
+            continue;
+        }
+        if let Some((alias, target)) = parse_use_alias_binding(&stmt) {
+            out.insert(alias, target);
+            continue;
+        }
+        let Some(rest) = stmt.strip_prefix("use ") else {
+            continue;
+        };
+        let Some((base, members)) = rest.split_once("::{") else {
+            continue;
+        };
+        let Some((inside, _)) = members.split_once('}') else {
+            continue;
+        };
+        let base = base.trim();
+        if base.is_empty() {
+            continue;
+        }
+        for member_raw in split_params(inside) {
+            let member = member_raw.trim();
+            if member.is_empty() {
+                continue;
+            }
+            if member == "Self" {
+                if let Some(alias) = base.rsplit("::").next().filter(|a| is_ident(a)) {
+                    out.insert(alias.to_string(), base.to_string());
+                }
+                continue;
+            }
+            let (member_name, alias_name) = if let Some((lhs, rhs)) = member.rsplit_once(" as ") {
+                (lhs.trim(), rhs.trim())
+            } else {
+                (member, member)
+            };
+            if !is_ident(member_name) || !is_ident(alias_name) {
+                continue;
+            }
+            out.insert(
+                alias_name.to_string(),
+                format!("{}::{}", base, member_name),
+            );
+        }
     }
     out
 }

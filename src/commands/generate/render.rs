@@ -12,6 +12,7 @@ mod vector;
 #[derive(Debug, Clone)]
 struct CoinNeed {
     var_name: String,
+    coin_type: String,
     moved_on_main_call: bool,
     needs_mut_binding: bool,
 }

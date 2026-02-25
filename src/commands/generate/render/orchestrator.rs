@@ -18,6 +18,7 @@ struct SharedCreatorPlan {
     args: Vec<String>,
     type_args: Vec<String>,
     return_ty: Option<String>,
+    shared_type_keys: std::collections::HashSet<String>,
     prep_lines: Vec<String>,
     cleanup_lines: Vec<String>,
 }
@@ -491,6 +492,10 @@ fn synthesize_requires_call_args(
     let mut args = Vec::new();
     let mut prep = Vec::new();
     let mut coin_slot_idx = 0usize;
+    let req_aliases = req_chain
+        .get(req_step_idx)
+        .map(|r| &r.module_use_aliases)
+        .unwrap_or(&d.module_use_aliases);
     for p in &d.params {
         let t = p.ty.trim();
         if is_vector_type(t) {
@@ -576,9 +581,13 @@ fn synthesize_requires_call_args(
                     let var = format!("pre_req_coin_{}", *pre_coin_counter);
                     *pre_coin_counter += 1;
                     let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, req_aliases);
+                    if !is_qualified_type_tag(&coin_ty) {
+                        return None;
+                    }
                     prep.push(format!(
-                        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                        maybe_mut, var
+                        "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                        maybe_mut, var, coin_ty
                     ));
                     if t.starts_with("&mut") {
                         args.push(format!("&mut {}", var));
@@ -601,9 +610,13 @@ fn synthesize_requires_call_args(
                     // Mint a dedicated object only for this call.
                     let var = format!("pre_req_coin_{}", *pre_coin_counter);
                     *pre_coin_counter += 1;
+                    let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, req_aliases);
+                    if !is_qualified_type_tag(&coin_ty) {
+                        return None;
+                    }
                     prep.push(format!(
-                        "let {} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                        var
+                        "let {} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                        var, coin_ty
                     ));
                     args.push(var);
                 } else if let Some(var) = main_coin_vars.get(coin_slot_idx) {
@@ -618,9 +631,13 @@ fn synthesize_requires_call_args(
                     // One-off by-value precondition coin (consumed in this call).
                     let var = format!("pre_req_coin_{}", *pre_coin_counter);
                     *pre_coin_counter += 1;
+                    let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, req_aliases);
+                    if !is_qualified_type_tag(&coin_ty) {
+                        return None;
+                    }
                     prep.push(format!(
-                        "let {} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                        var
+                        "let {} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                        var, coin_ty
                     ));
                     args.push(var);
                 }
@@ -664,10 +681,14 @@ fn synthesize_factory_args(
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if is_coin_type(t) && !t.starts_with('&') {
-            args.push(
-                "coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario))"
-                    .to_string(),
-            );
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &factory.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
+            args.push(format!(
+                "coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario))",
+                coin_ty
+            ));
         } else if is_vector_type(t) && !t.starts_with('&') {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
@@ -741,9 +762,13 @@ fn synthesize_factory_args_with_refs(
         if is_coin_type(t) {
             let var = format!("factory_coin_{}_{}", idx, sanitize_ident(&p.name));
             let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &factory.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
             prep_lines.push(format!(
-                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                maybe_mut, var
+                "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var, coin_ty
             ));
             if t.starts_with("&mut") {
                 args.push(format!("&mut {}", var));
@@ -868,9 +893,13 @@ fn synthesize_owned_factory_call_plan(
         if is_coin_type(t) {
             let var = format!("factory_coin_{}_{}", idx, sanitize_ident(&p.name));
             let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &factory.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
             prep_lines.push(format!(
-                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                maybe_mut, var
+                "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var, coin_ty
             ));
             if t.starts_with("&mut") {
                 args.push(format!("&mut {}", var));
@@ -1118,6 +1147,7 @@ fn pick_shared_creator_plan(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     required_cap_type_keys: &std::collections::BTreeSet<String>,
+    required_shared_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<SharedCreatorPlan> {
     let mut candidates = module_fns
         .values()
@@ -1132,6 +1162,15 @@ fn pick_shared_creator_plan(
     candidates.sort_by_key(|f| f.params.len());
     let mut best: Option<(usize, SharedCreatorPlan)> = None;
     for f in candidates {
+        let shared_type_keys =
+            infer_shared_type_keys_from_fn_body(&f.body_lines, &d.module_name, key_structs_by_module);
+        if !required_shared_type_keys.is_empty()
+            && !required_shared_type_keys
+                .iter()
+                .all(|k| shared_type_keys.contains(k))
+        {
+            continue;
+        }
         if !required_cap_type_keys.is_empty() {
             let Some(ret_ty) = f.return_ty.as_ref() else {
                 continue;
@@ -1143,9 +1182,12 @@ fn pick_shared_creator_plan(
         }
         if let Some(ret_ty) = f.return_ty.as_ref() {
             if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
+                && shared_type_keys.is_empty()
             {
                 continue;
             }
+        } else if shared_type_keys.is_empty() {
+            continue;
         }
         let Some(arg_plan) = synthesize_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
         else {
@@ -1161,6 +1203,7 @@ fn pick_shared_creator_plan(
             args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
+            shared_type_keys,
             prep_lines: arg_plan.prep_lines,
             cleanup_lines: arg_plan.cleanup_lines,
         };
@@ -1356,11 +1399,16 @@ pub(super) fn render_best_effort_test(
             } else {
                 var_name.clone()
             };
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &d.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
             args.push(arg);
             param_coin_runtime.insert(param.name.clone(), var_name.clone());
             param_coin_is_ref.insert(param.name.clone(), is_ref);
             coin_needs.push(CoinNeed {
                 var_name,
+                coin_type: coin_ty,
                 moved_on_main_call: !is_ref,
                 needs_mut_binding: t.starts_with("&mut"),
             });
@@ -1440,6 +1488,11 @@ pub(super) fn render_best_effort_test(
                 .filter(|o| o.is_ref && is_cap_type(&o.type_name))
                 .map(|o| o.type_key.clone())
                 .collect();
+            let required_creator_shared_type_keys: std::collections::BTreeSet<String> = object_needs
+                .iter()
+                .filter(|o| o.is_ref && !is_cap_type(&o.type_name))
+                .map(|o| o.type_key.clone())
+                .collect();
             let shared_helper_plan = module_fns.and_then(|fns| {
                 if obj.is_ref {
                     pick_shared_test_helper_for_type(d, &obj.type_key, fns, fn_lookup)
@@ -1494,6 +1547,7 @@ pub(super) fn render_best_effort_test(
                                 fn_lookup,
                                 key_structs_by_module,
                                 &required_creator_cap_type_keys,
+                                &required_creator_shared_type_keys,
                             )
                         });
                     }
@@ -1532,6 +1586,7 @@ pub(super) fn render_best_effort_test(
                                 fn_lookup,
                                 key_structs_by_module,
                                 &required_creator_cap_type_keys,
+                                &required_creator_shared_type_keys,
                             )
                         });
                     }
@@ -1543,6 +1598,13 @@ pub(super) fn render_best_effort_test(
                                 ObjectProvisionSource::OwnedCreatorSender,
                             );
                         } else {
+                            let creator_supports_type = shared_creator_plan
+                                .as_ref()
+                                .map(|p| p.shared_type_keys.contains(&obj.type_key))
+                                .unwrap_or(false);
+                            if !creator_supports_type {
+                                return None;
+                            }
                             creator_non_cap_type_keys.insert(obj.type_key.clone());
                             if creator_non_cap_type_keys.len() > 1 {
                                 // A single create_shared_* bootstrap can safely seed only one
@@ -1809,9 +1871,10 @@ pub(super) fn render_best_effort_test(
     for coin in &coin_needs {
         let maybe_mut = if coin.needs_mut_binding { "mut " } else { "" };
         lines.push(format!(
-            "        let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
+            "        let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
             maybe_mut,
-            coin.var_name
+            coin.var_name,
+            coin.coin_type
         ));
     }
     for obj in &shared_objects {

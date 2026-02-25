@@ -22,6 +22,7 @@ pub fn run_generate(package_path: &Path) -> Result<(), Box<dyn std::error::Error
 #[derive(Debug, Clone)]
 struct FnDecl {
     module_name: String,
+    module_use_aliases: std::collections::HashMap<String, String>,
     fn_name: String,
     type_params: Vec<String>,
     params: Vec<ParamDecl>,
@@ -539,6 +540,100 @@ fn is_coin_type(ty: &str) -> bool {
     norm.contains("Coin<")
 }
 
+fn coin_type_tag_from_coin_type(ty: &str) -> String {
+    let norm = normalize_param_object_type(ty).replace(' ', "");
+    let Some(start) = norm.find("Coin<") else {
+        return "0x2::sui::SUI".to_string();
+    };
+    let mut depth = 0i32;
+    let mut inner_start: Option<usize> = None;
+    let mut inner_end: Option<usize> = None;
+    for (i, ch) in norm.char_indices().skip(start) {
+        if ch == '<' {
+            depth += 1;
+            if depth == 1 {
+                inner_start = Some(i + 1);
+            }
+        } else if ch == '>' {
+            if depth == 1 {
+                inner_end = Some(i);
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    match (inner_start, inner_end) {
+        (Some(s), Some(e)) if s < e => norm[s..e].trim().to_string(),
+        _ => "0x2::sui::SUI".to_string(),
+    }
+}
+
+fn resolve_type_aliases_with_map(
+    ty: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    if aliases.is_empty() {
+        return ty.to_string();
+    }
+    let mut out = String::new();
+    let mut token = String::new();
+    let flush = |out: &mut String,
+                 token: &mut String,
+                 aliases: &std::collections::HashMap<String, String>| {
+        if token.is_empty() {
+            return;
+        }
+        if is_ident(token) {
+            out.push_str(&resolve_token_alias(token, aliases));
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for ch in ty.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            flush(&mut out, &mut token, aliases);
+            out.push(ch);
+        }
+    }
+    flush(&mut out, &mut token, aliases);
+    out
+}
+
+fn coin_type_tag_from_coin_type_with_aliases(
+    ty: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    coin_type_tag_from_coin_type(&resolve_type_aliases_with_map(ty, aliases))
+}
+
+fn module_use_aliases_for<'a>(
+    module_name: &str,
+    fn_lookup: &'a std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+) -> Option<&'a std::collections::HashMap<String, String>> {
+    fn_lookup
+        .get(module_name)
+        .and_then(|fns| fns.values().next().map(|f| &f.module_use_aliases))
+}
+
+fn coin_type_tag_from_coin_type_in_module(
+    ty: &str,
+    module_name: &str,
+    fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
+) -> String {
+    if let Some(aliases) = module_use_aliases_for(module_name, fn_lookup) {
+        return coin_type_tag_from_coin_type_with_aliases(ty, aliases);
+    }
+    coin_type_tag_from_coin_type(ty)
+}
+
+fn is_qualified_type_tag(ty: &str) -> bool {
+    let t = ty.trim();
+    t.starts_with("0x") || t.contains("::")
+}
+
 fn is_treasury_cap_type(ty: &str) -> bool {
     let norm = ty.trim().replace(' ', "");
     norm.contains("TreasuryCap<")
@@ -575,14 +670,42 @@ fn vector_literal_expr_for_type(ty: &str) -> Option<String> {
     let norm = normalize_param_object_type(ty).replace(' ', "");
     let inner = extract_vector_inner_type(&norm)?;
     let inner_norm = inner.replace(' ', "");
-    if inner_norm != "u8" {
-        return None;
+    if inner_norm == "u8" {
+        let elems = std::iter::repeat("0u8")
+            .take(32)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("vector[{}]", elems));
     }
-    let elems = std::iter::repeat("0u8")
-        .take(32)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("vector[{}]", elems))
+    if inner_norm == "u16" {
+        return Some("vector[1u16, 2u16]".to_string());
+    }
+    if inner_norm == "u32" {
+        return Some("vector[1u32, 2u32]".to_string());
+    }
+    if inner_norm == "u64" {
+        return Some("vector[1u64, 2u64]".to_string());
+    }
+    if inner_norm == "u128" {
+        return Some("vector[1u128, 2u128]".to_string());
+    }
+    if inner_norm == "u256" {
+        return Some("vector[1u256, 2u256]".to_string());
+    }
+    if inner_norm == "bool" {
+        return Some("vector[false, true]".to_string());
+    }
+    if inner_norm == "address" {
+        return Some("vector[SUPER_USER, OTHER]".to_string());
+    }
+    if inner_norm == "ID" || inner_norm.ends_with("::ID") {
+        return Some(format!(
+            "vector[{}, {}]",
+            default_id_arg_expr(),
+            default_id_arg_expr()
+        ));
+    }
+    None
 }
 
 fn extract_vector_inner_type(ty: &str) -> Option<String> {
@@ -683,6 +806,107 @@ fn fn_body_shares_object(body_lines: &[String]) -> bool {
         let stmt = line.split("//").next().unwrap_or("").trim();
         stmt.contains("::share_object(") || stmt.contains("::public_share_object(")
     })
+}
+
+fn normalize_body_token(mut token: &str) -> String {
+    token = token.trim().trim_end_matches(';').trim();
+    while token.starts_with('(') && token.ends_with(')') && token.len() > 2 {
+        token = token[1..token.len() - 1].trim();
+    }
+    if let Some(rest) = token.strip_prefix("&mut ") {
+        token = rest.trim();
+    } else if let Some(rest) = token.strip_prefix("&mut") {
+        token = rest.trim();
+    } else if let Some(rest) = token.strip_prefix('&') {
+        token = rest.trim();
+    }
+    token.trim().to_string()
+}
+
+fn is_path_like_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '<' | '>' | ',' | ' '))
+}
+
+fn resolve_token_alias(
+    token: &str,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut cur = token.to_string();
+    for _ in 0..8 {
+        let next = aliases.get(&cur).cloned();
+        let Some(n) = next else {
+            break;
+        };
+        if n == cur {
+            break;
+        }
+        cur = n;
+    }
+    cur
+}
+
+fn infer_shared_type_keys_from_fn_body(
+    body_lines: &[String],
+    default_module: &str,
+    key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut local_object_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut aliases: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let share_prefixes = [
+        "transfer::share_object",
+        "transfer::public_share_object",
+        "sui::transfer::share_object",
+        "sui::transfer::public_share_object",
+        "share_object",
+        "public_share_object",
+    ];
+
+    for line in body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some((_, rhs_raw)) = stmt.split_once('=') {
+            if let Some(lhs) = parse_let_binding_name(stmt) {
+                let rhs = normalize_body_token(rhs_raw);
+                if is_path_like_token(&rhs) {
+                    aliases.insert(lhs.clone(), rhs.clone());
+                }
+                if let Some(before_brace) = rhs.split('{').next() {
+                    let ty = before_brace.trim();
+                    if rhs.contains('{') && is_known_key_struct(ty, default_module, key_structs_by_module)
+                    {
+                        local_object_types.insert(lhs, type_key_from_type_name(ty));
+                    }
+                }
+            }
+        }
+
+        for prefix in &share_prefixes {
+            let Some(args) = extract_namespace_args_flexible(stmt, prefix) else {
+                continue;
+            };
+            let Some(first_arg_raw) = args.first() else {
+                continue;
+            };
+            let token = normalize_body_token(first_arg_raw);
+            let resolved = resolve_token_alias(&token, &aliases);
+            if let Some(type_key) = local_object_types.get(&resolved) {
+                out.insert(type_key.clone());
+                continue;
+            }
+            if is_known_key_struct(&resolved, default_module, key_structs_by_module) {
+                out.insert(type_key_from_type_name(&resolved));
+            }
+        }
+    }
+    out
 }
 
 fn is_known_key_struct(
@@ -1041,9 +1265,15 @@ fn synthesize_value_expr_for_type(
         return vector_literal_expr_for_type(&t);
     }
     if is_coin_type(&t) {
+        let coin_ty = coin_type_tag_from_coin_type_in_module(&t, current_module, fn_lookup);
+        if !is_qualified_type_tag(&coin_ty) {
+            return None;
+        }
         return Some(
-            "coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario))"
-                .to_string(),
+            format!(
+                "coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario))",
+                coin_ty
+            ),
         );
     }
 

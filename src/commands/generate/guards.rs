@@ -69,6 +69,7 @@ struct GuardCase {
 #[derive(Debug, Clone)]
 struct GuardCoinNeed {
     var_name: String,
+    coin_type: String,
     moved_on_call: bool,
     needs_mut_binding: bool,
 }
@@ -90,6 +91,7 @@ struct GuardSharedCreatorPlan {
     args: Vec<String>,
     type_args: Vec<String>,
     return_ty: Option<String>,
+    shared_type_keys: std::collections::HashSet<String>,
     prep_lines: Vec<String>,
     cleanup_lines: Vec<String>,
 }
@@ -1309,10 +1311,14 @@ fn synthesize_guard_factory_args(
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if is_coin_type(t) && !t.starts_with('&') {
-            args.push(
-                "coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario))"
-                    .to_string(),
-            );
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &factory.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
+            args.push(format!(
+                "coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario))",
+                coin_ty
+            ));
         } else if is_vector_type(t) && !t.starts_with('&') {
             args.push(vector_literal_expr_for_type(t)?);
         } else if t == "u64" {
@@ -1385,9 +1391,13 @@ fn synthesize_guard_factory_args_with_refs(
         if is_coin_type(t) {
             let var = format!("guard_factory_coin_{}_{}", idx, sanitize_ident(&p.name));
             let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &factory.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
             prep_lines.push(format!(
-                "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-                maybe_mut, var
+                "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+                maybe_mut, var, coin_ty
             ));
             if t.starts_with("&mut") {
                 args.push(format!("&mut {}", var));
@@ -1540,6 +1550,7 @@ fn pick_guard_shared_creator_plan(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     required_cap_type_keys: &std::collections::BTreeSet<String>,
+    required_shared_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<GuardSharedCreatorPlan> {
     let mut candidates = module_fns
         .values()
@@ -1554,6 +1565,15 @@ fn pick_guard_shared_creator_plan(
     candidates.sort_by_key(|f| f.params.len());
     let mut best: Option<(usize, GuardSharedCreatorPlan)> = None;
     for f in candidates {
+        let shared_type_keys =
+            infer_shared_type_keys_from_fn_body(&f.body_lines, &d.module_name, key_structs_by_module);
+        if !required_shared_type_keys.is_empty()
+            && !required_shared_type_keys
+                .iter()
+                .all(|k| shared_type_keys.contains(k))
+        {
+            continue;
+        }
         if !required_cap_type_keys.is_empty() {
             let Some(ret_ty) = f.return_ty.as_ref() else {
                 continue;
@@ -1565,9 +1585,12 @@ fn pick_guard_shared_creator_plan(
         }
         if let Some(ret_ty) = f.return_ty.as_ref() {
             if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
+                && shared_type_keys.is_empty()
             {
                 continue;
             }
+        } else if shared_type_keys.is_empty() {
+            continue;
         }
         let Some(arg_plan) =
             synthesize_guard_factory_args_with_refs(f, fn_lookup, key_structs_by_module)
@@ -1584,6 +1607,7 @@ fn pick_guard_shared_creator_plan(
             args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
+            shared_type_keys,
             prep_lines: arg_plan.prep_lines,
             cleanup_lines: arg_plan.cleanup_lines,
         };
@@ -1748,9 +1772,14 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
             } else {
                 var_name.clone()
             };
+            let coin_ty = coin_type_tag_from_coin_type_with_aliases(t, &d.module_use_aliases);
+            if !is_qualified_type_tag(&coin_ty) {
+                return None;
+            }
             call_args.push(arg);
             coin_needs.push(GuardCoinNeed {
                 var_name,
+                coin_type: coin_ty,
                 moved_on_call: !is_ref,
                 needs_mut_binding: t.starts_with("&mut"),
             });
@@ -1839,6 +1868,11 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
         .filter(|o| o.is_ref && is_cap_type(&o.type_name))
         .map(|o| o.type_key.clone())
         .collect();
+    let required_creator_shared_type_keys: std::collections::BTreeSet<String> = object_needs
+        .iter()
+        .filter(|o| o.is_ref && !is_cap_type(&o.type_name))
+        .map(|o| o.type_key.clone())
+        .collect();
     for obj in &object_needs {
         let owned_helper_plan = module_fns.and_then(|fns| {
             pick_guard_owned_test_helper_for_type(d, &obj.type_key, fns, env.fn_lookup)
@@ -1882,6 +1916,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         env.fn_lookup,
                         env.key_structs_by_module,
                         &required_creator_cap_type_keys,
+                        &required_creator_shared_type_keys,
                     )
                 });
             }
@@ -1919,6 +1954,7 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         env.fn_lookup,
                         env.key_structs_by_module,
                         &required_creator_cap_type_keys,
+                        &required_creator_shared_type_keys,
                     )
                 });
             }
@@ -1930,6 +1966,13 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         GuardObjectProvisionSource::OwnedCreatorSender,
                     );
                 } else {
+                    let creator_supports_type = shared_creator_plan
+                        .as_ref()
+                        .map(|p| p.shared_type_keys.contains(&obj.type_key))
+                        .unwrap_or(false);
+                    if !creator_supports_type {
+                        return None;
+                    }
                     creator_non_cap_type_keys.insert(obj.type_key.clone());
                     if creator_non_cap_type_keys.len() > 1 {
                         return None;
@@ -2048,8 +2091,8 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
     for coin in &coin_needs {
         let maybe_mut = if coin.needs_mut_binding { "mut " } else { "" };
         lines_before_tx.push(format!(
-            "let {}{} = coin::mint_for_testing<0x2::sui::SUI>(1000, test_scenario::ctx(&mut scenario));",
-            maybe_mut, coin.var_name
+            "let {}{} = coin::mint_for_testing<{}>(1_000_000_000_000, test_scenario::ctx(&mut scenario));",
+            maybe_mut, coin.var_name, coin.coin_type
         ));
     }
     for obj in &owned_objects {
@@ -2210,12 +2253,14 @@ fn render_cap_role_guard_test(
     let creator_plan = if !use_helper_path && !use_bootstrap_path {
         module_fns.and_then(|fns| {
             let required_cap_type_keys = std::collections::BTreeSet::from([cap_type_key.clone()]);
+            let required_shared_type_keys = std::collections::BTreeSet::new();
             pick_guard_shared_creator_plan(
                 d,
                 fns,
                 fn_lookup,
                 key_structs_by_module,
                 &required_cap_type_keys,
+                &required_shared_type_keys,
             )
         })
     } else {
@@ -2363,9 +2408,18 @@ fn render_coin_value_guard_test(
         ""
     };
     prep.push(format!(
-        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>({}, test_scenario::ctx(&mut scenario));",
-        maybe_mut, bad_coin_var, bad_amount
+        "let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+        maybe_mut,
+        bad_coin_var,
+        coin_type_tag_from_coin_type_with_aliases(param_ty, &d.module_use_aliases),
+        bad_amount
     ));
+    if !is_qualified_type_tag(&coin_type_tag_from_coin_type_with_aliases(
+        param_ty,
+        &d.module_use_aliases,
+    )) {
+        return None;
+    }
     call_args[param_idx] = if param_ty.starts_with("&mut") {
         format!("&mut {}", bad_coin_var)
     } else if param_ty.starts_with('&') {
@@ -2605,7 +2659,7 @@ fn render_object_field_sender_guard_test(
         if is_coin_type(t) {
             move_vars.push((
                 format!("coin_{}", sanitize_ident(&p.name)),
-                "sui::coin::Coin<0x2::sui::SUI>".to_string(),
+                normalize_param_object_type(t),
                 t.starts_with("&mut"),
             ));
             continue;
@@ -2789,9 +2843,18 @@ fn render_coin_value_object_field_guard_test(
         ""
     };
     prep.push(format!(
-        "let {}{} = coin::mint_for_testing<0x2::sui::SUI>({}, test_scenario::ctx(&mut scenario));",
-        maybe_mut, bad_coin_var, bad_amount
+        "let {}{} = coin::mint_for_testing<{}>({}, test_scenario::ctx(&mut scenario));",
+        maybe_mut,
+        bad_coin_var,
+        coin_type_tag_from_coin_type_with_aliases(param_ty, &d.module_use_aliases),
+        bad_amount
     ));
+    if !is_qualified_type_tag(&coin_type_tag_from_coin_type_with_aliases(
+        param_ty,
+        &d.module_use_aliases,
+    )) {
+        return None;
+    }
     call_args[param_idx] = if param_ty.starts_with("&mut") {
         format!("&mut {}", bad_coin_var)
     } else if param_ty.starts_with('&') {
