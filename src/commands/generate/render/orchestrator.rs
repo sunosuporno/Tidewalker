@@ -56,8 +56,113 @@ enum OwnedFactoryProvision {
     SenderTransfer,
 }
 
+#[derive(Debug, Clone)]
+struct SharedChainArgSpec {
+    expr: String,
+    binding_var: Option<String>,
+}
+
 fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
+}
+
+fn normalize_chain_reuse_type(ty: &str) -> String {
+    ty.trim()
+        .trim_start_matches("&mut")
+        .trim()
+        .trim_start_matches('&')
+        .trim()
+        .to_string()
+}
+
+fn is_copyish_chain_reuse_type(ty: &str) -> bool {
+    let base = normalize_chain_reuse_type(ty);
+    base == "address"
+        || base == "bool"
+        || is_numeric_type(&base)
+        || is_id_type(&base)
+        || base == "vector<u8>"
+        || base == "vector<u64>"
+        || base == "vector<address>"
+        || base == "vector<bool>"
+}
+
+fn chain_reuse_key(param_name: &str, resolved_ty: &str) -> Option<String> {
+    let base = normalize_chain_reuse_type(resolved_ty);
+    if base.is_empty()
+        || base.contains("TxContext")
+        || is_clock_type(&base)
+        || is_coin_type(&base)
+    {
+        return None;
+    }
+    let supported = base == "address"
+        || base == "bool"
+        || is_numeric_type(&base)
+        || is_id_type(&base)
+        || is_option_type(&base)
+        || is_string_type(&base)
+        || is_vector_type(&base);
+    if !supported {
+        return None;
+    }
+    Some(format!(
+        "{}::{}",
+        sanitize_ident(param_name),
+        sanitize_ident(&base)
+    ))
+}
+
+fn record_shared_chain_arg_expr(
+    shared_chain_args: &mut std::collections::HashMap<String, SharedChainArgSpec>,
+    reuse_key: Option<&String>,
+    expr: &str,
+) {
+    let Some(key) = reuse_key else {
+        return;
+    };
+    shared_chain_args.entry(key.clone()).or_insert_with(|| SharedChainArgSpec {
+        expr: expr.to_string(),
+        binding_var: None,
+    });
+}
+
+fn materialize_existing_shared_chain_arg(
+    shared_chain_args: &mut std::collections::HashMap<String, SharedChainArgSpec>,
+    reuse_key: &str,
+    resolved_ty: &str,
+    prep_lines: &mut Vec<String>,
+) -> Option<String> {
+    let spec = shared_chain_args.get_mut(reuse_key)?;
+    if resolved_ty.trim().starts_with('&') {
+        let var = if let Some(existing) = &spec.binding_var {
+            existing.clone()
+        } else {
+            let var = format!("tw_chain_arg_{}", sanitize_ident(reuse_key));
+            prep_lines.push(format!("let mut {} = {};", var, spec.expr));
+            spec.binding_var = Some(var.clone());
+            var
+        };
+        if resolved_ty.trim().starts_with("&mut") {
+            Some(format!("&mut {}", var))
+        } else {
+            Some(format!("&{}", var))
+        }
+    } else if is_copyish_chain_reuse_type(resolved_ty) {
+        let var = if let Some(existing) = &spec.binding_var {
+            existing.clone()
+        } else {
+            let var = format!("tw_chain_arg_{}", sanitize_ident(reuse_key));
+            prep_lines.push(format!("let {} = {};", var, spec.expr));
+            spec.binding_var = Some(var.clone());
+            var
+        };
+        Some(var)
+    } else if let Some(var) = &spec.binding_var {
+        Some(var.clone())
+    } else {
+        Some(spec.expr.clone())
+    }
 }
 
 fn parse_top_level_tuple_types(ret_ty: &str) -> Option<Vec<String>> {
@@ -721,6 +826,7 @@ fn synthesize_requires_call_args(
     req_step_idx: usize,
     req_chain: &[&FnDecl],
     object_vars_by_type: &std::collections::HashMap<String, String>,
+    shared_chain_args: &mut std::collections::HashMap<String, SharedChainArgSpec>,
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     main_coin_vars: &[String],
     requires_extra_coin_slots: &mut std::collections::HashMap<usize, String>,
@@ -741,19 +847,50 @@ fn synthesize_requires_call_args(
     for p in &d.params {
         let resolved_ty = concretize_type_params(&p.ty, &d.type_params, &req_default_type_args);
         let t = resolved_ty.trim();
+        let reuse_key = chain_reuse_key(&p.name, t);
+        if let Some(key) = reuse_key.as_ref() {
+            if let Some(arg) =
+                materialize_existing_shared_chain_arg(shared_chain_args, key, t, &mut prep)
+            {
+                args.push(arg);
+                continue;
+            }
+        }
         if is_vector_type(t) {
             let vec_expr = vector_literal_expr_for_type(t)?;
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &vec_expr);
             if t.starts_with('&') {
-                let var = format!("pre_req_vec_{}_{}", req_step_idx, sanitize_ident(&p.name));
-                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
-                prep.push(format!("let {}{} = {};", maybe_mut, var, vec_expr));
-                if t.starts_with("&mut") {
-                    args.push(format!("&mut {}", var));
+                if let Some(key) = reuse_key.as_ref() {
+                    args.push(materialize_existing_shared_chain_arg(
+                        shared_chain_args,
+                        key,
+                        t,
+                        &mut prep,
+                    )?);
                 } else {
-                    args.push(format!("&{}", var));
+                    let var = format!("pre_req_vec_{}_{}", req_step_idx, sanitize_ident(&p.name));
+                    let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    prep.push(format!("let {}{} = {};", maybe_mut, var, vec_expr));
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var));
+                    } else {
+                        args.push(format!("&{}", var));
+                    }
                 }
             } else {
-                args.push(vec_expr);
+                args.push(
+                    reuse_key
+                        .as_ref()
+                        .and_then(|key| {
+                            materialize_existing_shared_chain_arg(
+                                shared_chain_args,
+                                key,
+                                t,
+                                &mut prep,
+                            )
+                        })
+                        .unwrap_or(vec_expr),
+                );
             }
         } else if t.starts_with('&') && !t.contains("TxContext") && !is_coin_type(t) {
             let ty = normalize_param_object_type(t);
@@ -887,20 +1024,118 @@ fn synthesize_requires_call_args(
                 coin_slot_idx += 1;
             }
         } else if t == "u64" {
-            args.push(choose_u64_arg_for_param_in_fn(&p.name, &d.body_lines));
+            let expr = choose_u64_arg_for_param_in_fn(&p.name, &d.body_lines);
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if is_numeric_type(t) {
-            args.push("1".to_string());
+            let expr = "1".to_string();
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if t == "bool" {
-            args.push("false".to_string());
+            let expr = "false".to_string();
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if t == "address" {
             // Helper/factory objects are usually consumed in SUPER_USER tx by default.
-            args.push("SUPER_USER".to_string());
+            let expr = "SUPER_USER".to_string();
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if is_id_type(t) {
-            args.push(default_id_arg_expr());
+            let expr = default_id_arg_expr();
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if is_option_type(t) {
-            args.push(option_none_expr_for_type(t));
+            let expr = option_none_expr_for_type(t);
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else if is_string_type(t) {
-            args.push("std::string::utf8(b\"tidewalker\")".to_string());
+            let expr = "std::string::utf8(b\"tidewalker\")".to_string();
+            record_shared_chain_arg_expr(shared_chain_args, reuse_key.as_ref(), &expr);
+            args.push(
+                reuse_key
+                    .as_ref()
+                    .and_then(|key| {
+                        materialize_existing_shared_chain_arg(
+                            shared_chain_args,
+                            key,
+                            t,
+                            &mut prep,
+                        )
+                    })
+                    .unwrap_or(expr),
+            );
         } else {
             args.push(synthesize_value_expr_for_type(
                 t,
@@ -1555,12 +1790,15 @@ pub(super) fn render_best_effort_test(
     let mut arg_value_cleanup_lines: Vec<String> = Vec::new();
     let mut clock_cleanup_vars: Vec<String> = Vec::new();
     let mut deferred_id_params: Vec<(String, String)> = Vec::new();
+    let mut shared_chain_args: std::collections::HashMap<String, SharedChainArgSpec> =
+        std::collections::HashMap::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
     let prefer_advanced_clock = has_clock_ge_guard(&d.body_lines);
 
     for param in &d.params {
         let resolved_ty = concretize_type_params(&param.ty, &d.type_params, &default_type_args);
         let t = resolved_ty.trim();
+        let reuse_key = chain_reuse_key(&param.name, t);
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if is_clock_type(t) {
@@ -1617,42 +1855,72 @@ pub(super) fn render_best_effort_test(
         } else if t == "address" {
             let v = "OTHER".to_string();
             args.push(v.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &v);
             param_arg_values.insert(param.name.clone(), v);
         } else if t == "u64" {
             let v = choose_u64_arg_for_param_in_fn(&param.name, &d.body_lines);
             args.push(v.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &v);
             param_arg_values.insert(param.name.clone(), v);
         } else if is_numeric_type(t) {
             let v = "1".to_string();
             args.push(v.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &v);
             param_arg_values.insert(param.name.clone(), v);
         } else if t == "bool" {
             let v = "false".to_string();
             args.push(v.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &v);
             param_arg_values.insert(param.name.clone(), v);
         } else if is_id_type(t) {
             let placeholder = format!("__TW_ID_PARAM_{}__", sanitize_ident(&param.name));
             args.push(placeholder.clone());
             deferred_id_params.push((param.name.clone(), placeholder.clone()));
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &placeholder);
             param_arg_values.insert(param.name.clone(), placeholder);
         } else if is_option_type(t) {
-            args.push(option_none_expr_for_type(t));
+            let expr = option_none_expr_for_type(t);
+            args.push(expr.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &expr);
         } else if is_string_type(t) {
             let v = "std::string::utf8(b\"tidewalker\")".to_string();
-            args.push(v);
+            args.push(v.clone());
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &v);
         } else if is_vector_type(t) {
             let vec_expr = vector_literal_expr_for_type(t)?;
+            record_shared_chain_arg_expr(&mut shared_chain_args, reuse_key.as_ref(), &vec_expr);
             if t.starts_with('&') {
-                let var_name = format!("vec_{}", sanitize_ident(&param.name));
-                let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
-                arg_setup_lines.push(format!("let {}{} = {};", maybe_mut, var_name, vec_expr));
-                if t.starts_with("&mut") {
-                    args.push(format!("&mut {}", var_name));
+                if let Some(key) = reuse_key.as_ref() {
+                    args.push(materialize_existing_shared_chain_arg(
+                        &mut shared_chain_args,
+                        key,
+                        t,
+                        &mut arg_setup_lines,
+                    )?);
                 } else {
-                    args.push(format!("&{}", var_name));
+                    let var_name = format!("vec_{}", sanitize_ident(&param.name));
+                    let maybe_mut = if t.starts_with("&mut") { "mut " } else { "" };
+                    arg_setup_lines.push(format!("let {}{} = {};", maybe_mut, var_name, vec_expr));
+                    if t.starts_with("&mut") {
+                        args.push(format!("&mut {}", var_name));
+                    } else {
+                        args.push(format!("&{}", var_name));
+                    }
                 }
             } else {
-                args.push(vec_expr);
+                args.push(
+                    reuse_key
+                        .as_ref()
+                        .and_then(|key| {
+                            materialize_existing_shared_chain_arg(
+                                &mut shared_chain_args,
+                                key,
+                                t,
+                                &mut arg_setup_lines,
+                            )
+                        })
+                        .unwrap_or(vec_expr),
+                );
             }
         } else if is_coin_type(t) {
             let var_name = format!("coin_{}", sanitize_ident(&param.name));
@@ -2437,6 +2705,7 @@ pub(super) fn render_best_effort_test(
             req_idx,
             &requires_chain,
             &object_vars_by_type,
+            &mut shared_chain_args,
             fn_lookup,
             &coin_vars_for_calls,
             &mut requires_extra_coin_slots,
