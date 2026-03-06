@@ -58,6 +58,16 @@ enum GuardKind {
         clock_param: String,
         op: String,
     },
+    VectorLenConst {
+        param_name: String,
+        op: String,
+        rhs_literal: String,
+    },
+    VectorLenParam {
+        lhs_param: String,
+        rhs_param: String,
+        op: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -621,6 +631,59 @@ fn parse_clock_timestamp_side(expr: &str, d: &FnDecl) -> Option<String> {
         }
     }
 
+    None
+}
+
+fn vector_length_param_from_expr(expr: &Expr, d: &FnDecl, param_names: &[String]) -> Option<String> {
+    let (func, args) = expr_ast::as_call(expr)?;
+    let is_len = matches!(
+        func.as_str(),
+        "length" | "vector::length" | "std::vector::length"
+    );
+    if !is_len || args.len() != 1 {
+        return None;
+    }
+    let arg = expr_ast::as_ident(&args[0])?;
+    if !param_names.iter().any(|p| p == &arg) {
+        return None;
+    }
+    let p = d.params.iter().find(|p| p.name == arg)?;
+    if !is_vector_type(&p.ty) {
+        return None;
+    }
+    Some(arg)
+}
+
+fn parse_vector_len_comparison(
+    expr: &str,
+    d: &FnDecl,
+    param_names: &[String],
+) -> Option<(String, String, String, bool, bool)> {
+    let (lhs, op, rhs) = parse_ast_comparison(expr)?;
+    if let Some(param) = vector_length_param_from_expr(&lhs, d, param_names) {
+        if let Some(rhs_param) = vector_length_param_from_expr(&rhs, d, param_names) {
+            return Some((param, op.as_str().to_string(), rhs_param, false, true));
+        }
+        return Some((
+            param,
+            op.as_str().to_string(),
+            expr_ast::render_expr(&rhs),
+            false,
+            false,
+        ));
+    }
+    if let Some(param) = vector_length_param_from_expr(&rhs, d, param_names) {
+        if let Some(lhs_param) = vector_length_param_from_expr(&lhs, d, param_names) {
+            return Some((param, op.as_str().to_string(), lhs_param, true, true));
+        }
+        return Some((
+            param,
+            op.as_str().to_string(),
+            expr_ast::render_expr(&lhs),
+            true,
+            false,
+        ));
+    }
     None
 }
 
@@ -1389,6 +1452,42 @@ fn parse_assert_guard_cases(
                 },
                 source: format!("{}: {}", fq, cond),
             });
+            continue;
+        }
+        if let Some((vec_param, vec_op_raw, vec_other, vec_flipped, rhs_is_vec_len)) =
+            parse_vector_len_comparison(&expanded_cond, d, &param_names)
+        {
+            let op = if vec_flipped {
+                reverse_comparison_op(&vec_op_raw)
+            } else {
+                vec_op_raw
+            };
+            if rhs_is_vec_len {
+                out.push(GuardCase {
+                    kind: GuardKind::VectorLenParam {
+                        lhs_param: vec_param,
+                        rhs_param: vec_other,
+                        op,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+            if let Some(lit) = parse_numeric_literal(&vec_other) {
+                out.push(GuardCase {
+                    kind: GuardKind::VectorLenConst {
+                        param_name: vec_param,
+                        op,
+                        rhs_literal: lit,
+                    },
+                    source: format!("{}: {}", fq, cond),
+                });
+                continue;
+            }
+            notes.push(format!(
+                "{}: unresolved non-literal vector-length assert side '{}'",
+                fq, vec_other
+            ));
             continue;
         }
         let (param_side, op, other_side, flipped) =
@@ -2780,6 +2879,118 @@ fn render_guard_call_test(
     Some(lines)
 }
 
+fn vector_inner_elem_literal(inner: &str) -> Option<String> {
+    let t = inner.trim().replace(' ', "");
+    match t.as_str() {
+        "u8" => Some("0u8".to_string()),
+        "u16" => Some("1u16".to_string()),
+        "u32" => Some("1u32".to_string()),
+        "u64" => Some("1u64".to_string()),
+        "u128" => Some("1u128".to_string()),
+        "u256" => Some("1u256".to_string()),
+        "bool" => Some("false".to_string()),
+        "address" => Some("SUPER_USER".to_string()),
+        _ if t == "ID" || t.ends_with("::ID") => Some(default_id_arg_expr()),
+        _ => None,
+    }
+}
+
+fn build_vector_with_len_prep(var: &str, ty: &str, len: usize) -> Option<Vec<String>> {
+    let norm = normalize_param_object_type(ty).replace(' ', "");
+    let inner = extract_vector_inner_type(&norm)?;
+    let elem = vector_inner_elem_literal(&inner)?;
+    let mut out = Vec::new();
+    out.push(format!("let mut {}: {} = vector[];", var, norm));
+    for _ in 0..len {
+        out.push(format!("std::vector::push_back(&mut {}, {});", var, elem));
+    }
+    Some(out)
+}
+
+fn apply_param_arg(call_args: &mut [String], idx: usize, param_ty: &str, var_name: &str) {
+    call_args[idx] = if param_ty.starts_with("&mut") {
+        format!("&mut {}", var_name)
+    } else if param_ty.starts_with('&') {
+        format!("&{}", var_name)
+    } else {
+        var_name.to_string()
+    };
+}
+
+fn violating_vector_len(op: &str, rhs_literal: &str) -> Option<usize> {
+    let rhs = parse_numeric_literal(rhs_literal)?
+        .replace('_', "")
+        .parse::<usize>()
+        .ok()?;
+    match op {
+        ">" | "<" | "!=" => Some(rhs),
+        "==" | "<=" => rhs.checked_add(1),
+        ">=" => rhs.checked_sub(1),
+        _ => None,
+    }
+}
+
+fn violating_vector_len_pair(op: &str) -> Option<(usize, usize)> {
+    match op {
+        "==" => Some((0, 1)),
+        "!=" => Some((1, 1)),
+        ">" => Some((0, 1)),
+        ">=" => Some((0, 1)),
+        "<" => Some((1, 0)),
+        "<=" => Some((1, 0)),
+        _ => None,
+    }
+}
+
+fn render_vector_len_const_guard_test(
+    d: &FnDecl,
+    env: &GuardEnv<'_>,
+    case_idx: usize,
+    param_name: &str,
+    op: &str,
+    rhs_literal: &str,
+) -> Option<Vec<String>> {
+    let bad_len = violating_vector_len(op, rhs_literal)?;
+    let (setup_lines, mut call_args, cleanup, _param_runtime, _param_arg_values) =
+        build_common_call_plan(d, env)?;
+    let param_idx = d.params.iter().position(|p| p.name == param_name)?;
+    let param_ty = d.params.get(param_idx)?.ty.trim().to_string();
+    if !is_vector_type(&param_ty) {
+        return None;
+    }
+    let vec_var = format!("guard_bad_vec_{}", case_idx);
+    let prep = build_vector_with_len_prep(&vec_var, &param_ty, bad_len)?;
+    apply_param_arg(&mut call_args, param_idx, &param_ty, &vec_var);
+    render_guard_call_test(d, env, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+}
+
+fn render_vector_len_param_guard_test(
+    d: &FnDecl,
+    env: &GuardEnv<'_>,
+    case_idx: usize,
+    lhs_param: &str,
+    rhs_param: &str,
+    op: &str,
+) -> Option<Vec<String>> {
+    let (lhs_len, rhs_len) = violating_vector_len_pair(op)?;
+    let (setup_lines, mut call_args, cleanup, _param_runtime, _param_arg_values) =
+        build_common_call_plan(d, env)?;
+    let lhs_idx = d.params.iter().position(|p| p.name == lhs_param)?;
+    let rhs_idx = d.params.iter().position(|p| p.name == rhs_param)?;
+    let lhs_ty = d.params.get(lhs_idx)?.ty.trim().to_string();
+    let rhs_ty = d.params.get(rhs_idx)?.ty.trim().to_string();
+    if !is_vector_type(&lhs_ty) || !is_vector_type(&rhs_ty) {
+        return None;
+    }
+    let lhs_var = format!("guard_bad_vec_lhs_{}", case_idx);
+    let rhs_var = format!("guard_bad_vec_rhs_{}", case_idx);
+    let mut prep = build_vector_with_len_prep(&lhs_var, &lhs_ty, lhs_len)?;
+    prep.extend(build_vector_with_len_prep(&rhs_var, &rhs_ty, rhs_len)?);
+    apply_param_arg(&mut call_args, lhs_idx, &lhs_ty, &lhs_var);
+    apply_param_arg(&mut call_args, rhs_idx, &rhs_ty, &rhs_var);
+    render_guard_call_test(d, env, case_idx, &setup_lines, &prep, &call_args, &cleanup)
+}
+
 fn extract_helper_field_literal(helper: &FnDecl, field_name: &str) -> Option<String> {
     for line in &helper.body_lines {
         let stmt = line.split("//").next().unwrap_or("").trim();
@@ -3427,6 +3638,45 @@ pub(super) fn render_guard_tests_for_function(
                 } else {
                     notes.push(format!(
                         "{}: could not synthesize object-field/clock failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::VectorLenConst {
+                param_name,
+                op,
+                rhs_literal,
+            } => {
+                if let Some(lines) = render_vector_len_const_guard_test(
+                    d,
+                    &env,
+                    idx,
+                    param_name,
+                    op,
+                    rhs_literal,
+                ) {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize vector-length/const failure test ({})",
+                        module_fn_label(d),
+                        case.source
+                    ));
+                }
+            }
+            GuardKind::VectorLenParam {
+                lhs_param,
+                rhs_param,
+                op,
+            } => {
+                if let Some(lines) = render_vector_len_param_guard_test(
+                    d, &env, idx, lhs_param, rhs_param, op,
+                ) {
+                    tests.push(lines);
+                } else {
+                    notes.push(format!(
+                        "{}: could not synthesize vector-length/vector-length failure test ({})",
                         module_fn_label(d),
                         case.source
                     ));

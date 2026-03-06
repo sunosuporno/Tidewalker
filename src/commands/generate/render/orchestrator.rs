@@ -66,6 +66,62 @@ fn coin_var_names(needs: &[CoinNeed]) -> Vec<String> {
     needs.iter().map(|n| n.var_name.clone()).collect::<Vec<_>>()
 }
 
+fn parse_inline_object_id_arg(expr: &str) -> Option<String> {
+    let trimmed = remove_whitespace(expr);
+    let prefixes = ["sui::object::id(&", "object::id(&", "id(&"];
+    for prefix in prefixes {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if let Some(inner) = rest.strip_suffix(')') {
+                let name = inner.trim();
+                if is_ident(name) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn rewrite_inline_object_id_args_for_call(
+    d: &FnDecl,
+    args: &mut [String],
+) -> Vec<String> {
+    let mut pre_call = Vec::new();
+    let mut mut_borrowed = std::collections::HashSet::new();
+    for a in args.iter() {
+        if let Some(rest) = a.trim().strip_prefix("&mut ") {
+            let name = strip_ref_and_parens_text(rest).trim().to_string();
+            if is_ident(&name) {
+                mut_borrowed.insert(name);
+            }
+        }
+    }
+
+    for (idx, arg) in args.iter_mut().enumerate() {
+        let Some(obj_var) = parse_inline_object_id_arg(arg) else {
+            continue;
+        };
+        let param_ty = d.params.get(idx).map(|p| p.ty.trim()).unwrap_or("");
+        let needs_ref_id = param_ty.starts_with('&') && is_id_type(param_ty);
+        let conflicts_with_mut = mut_borrowed.contains(&obj_var);
+        if !needs_ref_id && !conflicts_with_mut {
+            continue;
+        }
+        let tmp = format!("tw_arg_id_{}", idx);
+        pre_call.push(format!(
+            "let {} = sui::object::id(&{});",
+            tmp, obj_var
+        ));
+        *arg = if needs_ref_id {
+            format!("&{}", tmp)
+        } else {
+            tmp
+        };
+    }
+
+    pre_call
+}
+
 fn normalize_chain_reuse_type(ty: &str) -> String {
     ty.trim()
         .trim_start_matches("&mut")
@@ -299,6 +355,81 @@ fn infer_expr_type_key_from_module_calls(
     let callee = module_fns.get(&fn_name)?;
     let ret = callee.return_ty.as_ref()?;
     Some(type_key_from_type_name(ret))
+}
+
+fn infer_expr_type_name_from_module_calls(
+    expr: &str,
+    default_module: &str,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Option<String> {
+    let trimmed = strip_ref_and_parens_text(expr).trim();
+    if let Some((left, _)) = trimmed.split_once('{') {
+        let ty = left.trim();
+        if ty.is_empty() {
+            return None;
+        }
+        if ty.contains("::") {
+            return Some(ty.to_string());
+        }
+        return Some(format!("{}::{}", default_module, ty));
+    }
+    let (module_opt, fn_name) = parse_function_call_name(trimmed)?;
+    if let Some(module) = module_opt {
+        if module != default_module {
+            return None;
+        }
+    }
+    let callee = module_fns.get(&fn_name)?;
+    let ret = callee.return_ty.as_ref()?.trim();
+    if ret.is_empty() || ret == "()" {
+        return None;
+    }
+    if ret.contains("::") {
+        Some(ret.to_string())
+    } else {
+        Some(format!("{}::{}", default_module, ret))
+    }
+}
+
+fn infer_transferred_object_types_for_fn(
+    f: &FnDecl,
+    module_fns: &std::collections::HashMap<String, FnDecl>,
+) -> Vec<String> {
+    let mut local_var_type_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in &f.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some((lhs, rhs)) = parse_simple_let_binding(stmt) {
+            if let Some(inferred) =
+                infer_expr_type_name_from_module_calls(&rhs, &f.module_name, module_fns)
+            {
+                local_var_type_names.insert(lhs, inferred);
+            }
+        }
+    }
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for line in &f.body_lines {
+        let stmt = line.split("//").next().unwrap_or("").trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let Some((obj_expr, _recipient_expr)) = parse_transfer_call(stmt) else {
+            continue;
+        };
+        let obj_norm = strip_ref_and_parens_text(&obj_expr).trim().to_string();
+        if let Some(ty) = local_var_type_names.get(&obj_norm) {
+            out.insert(ty.clone());
+            continue;
+        }
+        if let Some(ty) = infer_expr_type_name_from_module_calls(&obj_expr, &f.module_name, module_fns)
+        {
+            out.insert(ty);
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn fn_transfers_type_to_sender(
@@ -1660,11 +1791,15 @@ fn pick_shared_creator_plan(
             continue;
         }
         if !required_cap_type_keys.is_empty() {
-            let Some(ret_ty) = f.return_ty.as_ref() else {
-                continue;
-            };
-            let ret_key = type_key_from_type_name(ret_ty);
-            if !required_cap_type_keys.contains(&ret_key) {
+            let returns_required_cap = f
+                .return_ty
+                .as_ref()
+                .map(|ret_ty| required_cap_type_keys.contains(&type_key_from_type_name(ret_ty)))
+                .unwrap_or(false);
+            let transfers_required_caps = required_cap_type_keys
+                .iter()
+                .all(|cap_key| fn_transfers_type_to_sender(f, cap_key, module_fns));
+            if !returns_required_cap && !transfers_required_caps {
                 continue;
             }
         }
@@ -1790,6 +1925,7 @@ pub(super) fn render_best_effort_test(
     let mut arg_value_cleanup_lines: Vec<String> = Vec::new();
     let mut clock_cleanup_vars: Vec<String> = Vec::new();
     let mut deferred_id_params: Vec<(String, String)> = Vec::new();
+    let mut unresolved_deferred_id_params: Vec<(String, String)> = Vec::new();
     let mut shared_chain_args: std::collections::HashMap<String, SharedChainArgSpec> =
         std::collections::HashMap::new();
     let default_type_args = default_type_args_for_params(&d.type_params);
@@ -2405,28 +2541,35 @@ pub(super) fn render_best_effort_test(
             .or_insert_with(|| obj.var_name.clone());
     }
     if !deferred_id_params.is_empty() {
-        let resolve_id_arg = |param_name: &str| -> String {
+        let defer_id_resolution_to_requires = !d.requires.is_empty();
+        let resolve_id_arg = |param_name: &str| -> Option<String> {
+            if defer_id_resolution_to_requires && param_name.ends_with("_id") {
+                return None;
+            }
             let preferred = param_name.strip_suffix("_id").unwrap_or(param_name);
             if let Some(obj) = object_needs
                 .iter()
                 .find(|o| o.var_name.contains(preferred) || preferred.contains(&o.var_name))
             {
-                return format!("sui::object::id(&{})", obj.var_name);
+                return Some(format!("sui::object::id(&{})", obj.var_name));
             }
             if let Some(obj) = object_needs.first() {
-                return format!("sui::object::id(&{})", obj.var_name);
+                return Some(format!("sui::object::id(&{})", obj.var_name));
             }
-            default_id_arg_expr()
+            None
         };
-        for (param_name, placeholder) in deferred_id_params {
-            let resolved = resolve_id_arg(&param_name);
-            for arg in &mut args {
-                if arg == &placeholder {
-                    *arg = resolved.clone();
+        for (param_name, placeholder) in deferred_id_params.into_iter() {
+            if let Some(resolved) = resolve_id_arg(&param_name) {
+                for arg in &mut args {
+                    if arg == &placeholder {
+                        *arg = resolved.clone();
+                    }
                 }
-            }
-            if let Some(v) = param_arg_values.get_mut(&param_name) {
-                *v = resolved;
+                if let Some(v) = param_arg_values.get_mut(&param_name) {
+                    *v = resolved;
+                }
+            } else {
+                unresolved_deferred_id_params.push((param_name, placeholder));
             }
         }
     }
@@ -2438,6 +2581,12 @@ pub(super) fn render_best_effort_test(
         std::collections::HashSet::new();
     let mut requires_extra_coin_slots: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
+    let mut requires_sender_obj_var_by_type_key: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut requires_sender_obj_ordered: Vec<(String, String)> = Vec::new();
+    let mut requires_sender_obj_pending: Vec<(String, String)> = Vec::new();
+    let mut requires_sender_obj_cleanup: Vec<String> = Vec::new();
+    let mut requires_sender_obj_counter: usize = 0;
     let mut requires_chain: Vec<&FnDecl> = Vec::new();
     if let Some(module_fns) = fn_lookup.get(&d.module_name) {
         for req in &d.requires {
@@ -2738,6 +2887,112 @@ pub(super) fn render_best_effort_test(
                 req_call_target,
                 req_args.join(", ")
             ));
+            if let Some(module_fns) = fn_lookup.get(&req_decl.module_name) {
+                let transferred_types = infer_transferred_object_types_for_fn(req_decl, module_fns);
+                for ty in transferred_types {
+                    let type_key = type_key_from_type_name(&ty);
+                    let wants_type_for_unresolved_id = unresolved_deferred_id_params.iter().any(
+                        |(param_name, _)| {
+                            let preferred =
+                                sanitize_ident(param_name.strip_suffix("_id").unwrap_or(param_name));
+                            !preferred.is_empty()
+                                && (type_key.contains(&preferred) || preferred.contains(&type_key))
+                        },
+                    );
+                    if !wants_type_for_unresolved_id
+                        || requires_sender_obj_var_by_type_key.contains_key(&type_key)
+                    {
+                        continue;
+                    }
+                    let var = format!("req_sender_obj_{}", requires_sender_obj_counter);
+                    requires_sender_obj_counter += 1;
+                    requires_sender_obj_var_by_type_key.insert(type_key.clone(), var.clone());
+                    requires_sender_obj_ordered.push((type_key.clone(), var.clone()));
+                    requires_sender_obj_pending.push((var.clone(), ty));
+                    requires_sender_obj_cleanup.push(var);
+                }
+            }
+        }
+    }
+    if !requires_sender_obj_pending.is_empty() {
+        for obj in &shared_objects {
+            lines.push(format!(
+                "        test_scenario::return_shared({});",
+                obj.var_name
+            ));
+        }
+        for obj in &owned_objects {
+            if moved_object_vars_on_main_call.contains(&obj.var_name) {
+                continue;
+            }
+            let norm = normalize_param_object_type(&obj.type_name);
+            if is_known_store_struct(&norm, &d.module_name, store_structs_by_module) {
+                lines.push(format!(
+                    "        transfer::public_transfer({}, SUPER_USER);",
+                    obj.var_name
+                ));
+            } else {
+                lines.push(format!(
+                    "        transfer::transfer({}, SUPER_USER);",
+                    obj.var_name
+                ));
+            }
+        }
+        lines.push("    };".to_string());
+        lines.push("    test_scenario::next_tx(&mut scenario, SUPER_USER);".to_string());
+        lines.push("    {".to_string());
+        for obj in &shared_objects {
+            let maybe_mut = if obj.is_mut { "mut " } else { "" };
+            let obj_ty = qualify_type_for_module(&d.module_name, &obj.type_name);
+            lines.push(format!(
+                "        let {}{} = scenario.take_shared<{}>();",
+                maybe_mut, obj.var_name, obj_ty
+            ));
+        }
+        for obj in &owned_objects {
+            if moved_object_vars_on_main_call.contains(&obj.var_name) {
+                continue;
+            }
+            let maybe_mut = if obj.is_mut { "mut " } else { "" };
+            lines.push(format!(
+                "        let {}{} = test_scenario::take_from_sender<{}>(&scenario);",
+                maybe_mut,
+                obj.var_name,
+                qualify_type_for_module(&d.module_name, &obj.type_name)
+            ));
+        }
+        for (var, ty) in &requires_sender_obj_pending {
+            lines.push(format!(
+                "        let {} = test_scenario::take_from_sender<{}>(&scenario);",
+                var,
+                qualify_type_for_module(&d.module_name, ty)
+            ));
+        }
+    }
+    if !unresolved_deferred_id_params.is_empty() {
+        for (param_name, placeholder) in unresolved_deferred_id_params {
+            let preferred = sanitize_ident(param_name.strip_suffix("_id").unwrap_or(&param_name));
+            let resolved = requires_sender_obj_ordered
+                .iter()
+                .rev()
+                .find_map(|(type_key, var)| {
+                    if !preferred.is_empty()
+                        && (type_key.contains(&preferred) || preferred.contains(type_key))
+                    {
+                        Some(format!("sui::object::id(&{})", var))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(default_id_arg_expr);
+            for arg in &mut args {
+                if arg == &placeholder {
+                    *arg = resolved.clone();
+                }
+            }
+            if let Some(v) = param_arg_values.get_mut(&param_name) {
+                *v = resolved;
+            }
         }
     }
     let auto_prestate_lines = synthesize_auto_prestate_calls(
@@ -2782,6 +3037,9 @@ pub(super) fn render_best_effort_test(
     } else {
         fq.clone()
     };
+    for l in rewrite_inline_object_id_args_for_call(d, &mut args) {
+        lines.push(format!("        {}", l));
+    }
     let call_expr = format!("{}({})", call_target, args.join(", "));
     if let Some(ret_ty) = d.return_ty.as_ref() {
         if let Some(tuple_types) = parse_top_level_tuple_types(ret_ty) {
@@ -2854,6 +3112,9 @@ pub(super) fn render_best_effort_test(
             "        test_scenario::return_shared({});",
             obj.var_name
         ));
+    }
+    for var in &requires_sender_obj_cleanup {
+        lines.push(format!("        test_scenario::return_to_sender(&scenario, {});", var));
     }
     let mut seen_req_coin_cleanup: std::collections::HashSet<String> =
         std::collections::HashSet::new();

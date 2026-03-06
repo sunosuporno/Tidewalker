@@ -508,10 +508,10 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
         return Err("sui move build failed".into());
     }
 
-    let src_root = path.join("build").join(&pkg_name).join("sources");
-    if !src_root.is_dir() {
-        return Err(format!("No build sources at {}", src_root.display()).into());
-    }
+    let src_root = resolve_build_sources_root(&path, &pkg_name).ok_or_else(|| {
+        let expected = path.join("build").join(&pkg_name).join("sources");
+        format!("No build sources at {} (or any build/*/sources)", expected.display())
+    })?;
 
     let mut move_files: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(&src_root)? {
@@ -935,6 +935,28 @@ fn generate_tests(package_path: &Path) -> Result<(), Box<dyn std::error::Error>>
     println!("Wrote {}", out_path.display());
 
     Ok(())
+}
+
+fn resolve_build_sources_root(path: &Path, pkg_name: &str) -> Option<PathBuf> {
+    let preferred = path.join("build").join(pkg_name).join("sources");
+    if preferred.is_dir() {
+        return Some(preferred);
+    }
+    let build_dir = path.join("build");
+    if !build_dir.is_dir() {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    if let Ok(entries) = fs::read_dir(build_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("sources");
+            if candidate.is_dir() {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 #[derive(Debug, Clone)]
