@@ -102,6 +102,7 @@ struct GuardSharedCreatorPlan {
     type_args: Vec<String>,
     return_ty: Option<String>,
     shared_type_keys: std::collections::HashSet<String>,
+    provided_cap_type_keys: std::collections::HashSet<String>,
     prep_lines: Vec<String>,
     cleanup_lines: Vec<String>,
 }
@@ -1028,10 +1029,12 @@ fn parse_assert_guard_cases(
     let mut out = Vec::new();
     let mut notes = Vec::new();
     let fq = module_fn_label(d);
+    let default_type_args = default_type_args_for_params(&d.type_params);
 
     for p in &d.params {
-        let ty = normalize_param_object_type(&p.ty);
-        if p.ty.trim().starts_with('&') && is_cap_type(&ty) && !is_treasury_cap_type(&ty) {
+        let resolved_ty = concretize_type_params(&p.ty, &d.type_params, &default_type_args);
+        let ty = normalize_param_object_type(&resolved_ty);
+        if resolved_ty.trim().starts_with('&') && is_cap_type(&ty) && !is_treasury_cap_type(&ty) {
             out.push(GuardCase {
                 kind: GuardKind::CapRole {
                     cap_param: p.name.clone(),
@@ -1660,8 +1663,11 @@ fn synthesize_guard_factory_args(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
 ) -> Option<Vec<String>> {
     let mut args = Vec::new();
+    let factory_type_args = default_type_args_for_params(&factory.type_params);
     for p in &factory.params {
-        let t = p.ty.trim();
+        let resolved_ty =
+            concretize_type_params(&p.ty, &factory.type_params, &factory_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if is_coin_type(t) && !t.starts_with('&') {
@@ -1713,8 +1719,11 @@ fn synthesize_guard_factory_args_with_refs(
     let mut args = Vec::new();
     let mut prep_lines = Vec::new();
     let mut cleanup_lines = Vec::new();
+    let factory_type_args = default_type_args_for_params(&factory.type_params);
     for (idx, p) in factory.params.iter().enumerate() {
-        let t = p.ty.trim();
+        let resolved_ty =
+            concretize_type_params(&p.ty, &factory.type_params, &factory_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
             continue;
@@ -1911,7 +1920,7 @@ fn pick_guard_shared_creator_plan(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    required_cap_type_keys: &std::collections::BTreeSet<String>,
+    _required_cap_type_keys: &std::collections::BTreeSet<String>,
     required_shared_type_keys: &std::collections::BTreeSet<String>,
 ) -> Option<GuardSharedCreatorPlan> {
     let mut candidates = module_fns
@@ -1936,15 +1945,6 @@ fn pick_guard_shared_creator_plan(
         {
             continue;
         }
-        if !required_cap_type_keys.is_empty() {
-            let Some(ret_ty) = f.return_ty.as_ref() else {
-                continue;
-            };
-            let ret_key = type_key_from_type_name(ret_ty);
-            if !required_cap_type_keys.contains(&ret_key) {
-                continue;
-            }
-        }
         if let Some(ret_ty) = f.return_ty.as_ref() {
             if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
                 && shared_type_keys.is_empty()
@@ -1968,12 +1968,26 @@ fn pick_guard_shared_creator_plan(
         } else {
             Vec::new()
         };
+        let mut provided_cap_type_keys = std::collections::HashSet::new();
+        if let Some(ret_ty) = f.return_ty.as_ref() {
+            if is_cap_type(ret_ty) {
+                provided_cap_type_keys.insert(type_key_from_type_name(ret_ty));
+            }
+        }
+        for param in &f.params {
+            let resolved_ty = concretize_type_params(&param.ty, &f.type_params, &type_args);
+            let cap_ty = normalize_param_object_type(&resolved_ty);
+            if resolved_ty.trim().starts_with('&') && is_cap_type(&cap_ty) {
+                provided_cap_type_keys.insert(type_key_from_type_name(&cap_ty));
+            }
+        }
         let plan = GuardSharedCreatorPlan {
             fn_name: f.fn_name.clone(),
             args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
             shared_type_keys,
+            provided_cap_type_keys,
             prep_lines: arg_plan.prep_lines,
             cleanup_lines: arg_plan.cleanup_lines,
         };
@@ -2226,19 +2240,14 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
     let mut shared_creator_plan: Option<GuardSharedCreatorPlan> = None;
     let mut creator_non_cap_type_keys: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    let needs_shared_non_cap_object = object_needs
-        .iter()
-        .any(|o| o.is_ref && !is_cap_type(&o.type_name));
-    let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
-        .iter()
-        .filter(|o| o.is_ref && is_cap_type(&o.type_name))
-        .map(|o| o.type_key.clone())
-        .collect();
     let required_creator_shared_type_keys: std::collections::BTreeSet<String> = object_needs
         .iter()
         .filter(|o| o.is_ref && !is_cap_type(&o.type_name))
         .map(|o| o.type_key.clone())
         .collect();
+    let needs_shared_non_cap_object = object_needs
+        .iter()
+        .any(|o| o.is_ref && !is_cap_type(&o.type_name));
     for obj in &object_needs {
         let owned_helper_plan = module_fns.and_then(|fns| {
             pick_guard_owned_test_helper_for_type(d, &obj.type_key, fns, env.fn_lookup)
@@ -2282,17 +2291,37 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         env.fn_lookup,
                         env.key_structs_by_module,
                         env.store_structs_by_module,
-                        &required_creator_cap_type_keys,
+                        &std::collections::BTreeSet::new(),
                         &required_creator_shared_type_keys,
                     )
                 });
             }
-            if shared_creator_plan.is_some() {
+            let creator_supports_cap = shared_creator_plan
+                .as_ref()
+                .map(|p| p.provided_cap_type_keys.contains(&obj.type_key))
+                .unwrap_or(false);
+            if creator_supports_cap {
                 owned_objects.push(obj.clone());
                 object_sources.insert(
                     obj.var_name.clone(),
                     GuardObjectProvisionSource::OwnedCreatorSender,
                 );
+            } else if let Some(factory_plan) = module_fns.and_then(|fns| {
+                pick_guard_factory_call_for_type(
+                    d,
+                    &obj.type_key,
+                    fns,
+                    env.fn_lookup,
+                    env.key_structs_by_module,
+                    env.store_structs_by_module,
+                )
+            }) {
+                owned_objects.push(obj.clone());
+                object_sources.insert(
+                    obj.var_name.clone(),
+                    GuardObjectProvisionSource::OwnedFactory,
+                );
+                factory_calls.insert(obj.var_name.clone(), factory_plan);
             } else {
                 return None;
             }
@@ -2322,18 +2351,26 @@ fn build_common_call_plan(d: &FnDecl, env: &GuardEnv<'_>) -> Option<GuardCallPla
                         env.fn_lookup,
                         env.key_structs_by_module,
                         env.store_structs_by_module,
-                        &required_creator_cap_type_keys,
+                        &std::collections::BTreeSet::new(),
                         &required_creator_shared_type_keys,
                     )
                 });
             }
             if obj.is_ref && shared_creator_plan.is_some() {
                 if is_cap_type(&obj.type_name) {
-                    owned_objects.push(obj.clone());
-                    object_sources.insert(
-                        obj.var_name.clone(),
-                        GuardObjectProvisionSource::OwnedCreatorSender,
-                    );
+                    let creator_supports_cap = shared_creator_plan
+                        .as_ref()
+                        .map(|p| p.provided_cap_type_keys.contains(&obj.type_key))
+                        .unwrap_or(false);
+                    if creator_supports_cap {
+                        owned_objects.push(obj.clone());
+                        object_sources.insert(
+                            obj.var_name.clone(),
+                            GuardObjectProvisionSource::OwnedCreatorSender,
+                        );
+                    } else {
+                        return None;
+                    }
                 } else {
                     let creator_supports_type = shared_creator_plan
                         .as_ref()

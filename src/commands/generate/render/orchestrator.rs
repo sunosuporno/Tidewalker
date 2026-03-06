@@ -19,6 +19,7 @@ struct SharedCreatorPlan {
     type_args: Vec<String>,
     return_ty: Option<String>,
     shared_type_keys: std::collections::HashSet<String>,
+    provided_cap_type_keys: std::collections::HashSet<String>,
     prep_lines: Vec<String>,
     cleanup_lines: Vec<String>,
 }
@@ -1286,8 +1287,11 @@ fn synthesize_factory_args(
     coin_mint_amount: &str,
 ) -> Option<Vec<String>> {
     let mut args = Vec::new();
+    let factory_type_args = default_type_args_for_params(&factory.type_params);
     for p in &factory.params {
-        let t = p.ty.trim();
+        let resolved_ty =
+            concretize_type_params(&p.ty, &factory.type_params, &factory_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
         } else if is_coin_type(t) && !t.starts_with('&') {
@@ -1341,8 +1345,11 @@ fn synthesize_factory_args_with_refs(
     let mut args = Vec::new();
     let mut prep_lines = Vec::new();
     let mut cleanup_lines = Vec::new();
+    let factory_type_args = default_type_args_for_params(&factory.type_params);
     for (idx, p) in factory.params.iter().enumerate() {
-        let t = p.ty.trim();
+        let resolved_ty =
+            concretize_type_params(&p.ty, &factory.type_params, &factory_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
             continue;
@@ -1472,8 +1479,11 @@ fn synthesize_owned_factory_call_plan(
     let mut prep_lines = Vec::new();
     let mut cleanup_lines = Vec::new();
     let mut shared_ref_deps: Vec<(String, bool)> = Vec::new();
+    let factory_type_args = default_type_args_for_params(&factory.type_params);
     for (idx, p) in factory.params.iter().enumerate() {
-        let t = p.ty.trim();
+        let resolved_ty =
+            concretize_type_params(&p.ty, &factory.type_params, &factory_type_args);
+        let t = resolved_ty.trim();
         if t.contains("TxContext") {
             args.push("test_scenario::ctx(&mut scenario)".to_string());
             continue;
@@ -1582,11 +1592,7 @@ fn synthesize_owned_factory_call_plan(
             )?);
         }
     }
-    let type_args = if has_unbound_type_params(factory) {
-        default_type_args_for_params(&factory.type_params)
-    } else {
-        Vec::new()
-    };
+    let type_args = factory_type_args;
     Some(FactoryCallPlan {
         module_name: factory.module_name.clone(),
         fn_name: factory.fn_name.clone(),
@@ -1764,7 +1770,7 @@ fn pick_shared_creator_plan(
     fn_lookup: &std::collections::HashMap<String, std::collections::HashMap<String, FnDecl>>,
     key_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
     store_structs_by_module: &std::collections::HashMap<String, std::collections::HashSet<String>>,
-    required_cap_type_keys: &std::collections::BTreeSet<String>,
+    _required_cap_type_keys: &std::collections::BTreeSet<String>,
     required_shared_type_keys: &std::collections::BTreeSet<String>,
     coin_mint_amount: &str,
 ) -> Option<SharedCreatorPlan> {
@@ -1789,19 +1795,6 @@ fn pick_shared_creator_plan(
                 .all(|k| shared_type_keys.contains(k))
         {
             continue;
-        }
-        if !required_cap_type_keys.is_empty() {
-            let returns_required_cap = f
-                .return_ty
-                .as_ref()
-                .map(|ret_ty| required_cap_type_keys.contains(&type_key_from_type_name(ret_ty)))
-                .unwrap_or(false);
-            let transfers_required_caps = required_cap_type_keys
-                .iter()
-                .all(|cap_key| fn_transfers_type_to_sender(f, cap_key, module_fns));
-            if !returns_required_cap && !transfers_required_caps {
-                continue;
-            }
         }
         if let Some(ret_ty) = f.return_ty.as_ref() {
             if !should_transfer_call_return_with_keys(ret_ty, &d.module_name, key_structs_by_module)
@@ -1828,12 +1821,43 @@ fn pick_shared_creator_plan(
         } else {
             Vec::new()
         };
+        let mut provided_cap_type_keys = std::collections::HashSet::new();
+        if let Some(ret_ty) = f.return_ty.as_ref() {
+            let ret_key = type_key_from_type_name(ret_ty);
+            if is_cap_type(ret_ty) {
+                provided_cap_type_keys.insert(ret_key);
+            }
+        }
+        for (cand_name, cand) in module_fns {
+            if cand_name != &f.fn_name {
+                continue;
+            }
+            for p in &d.params {
+                let ty = normalize_param_object_type(&p.ty);
+                if !is_cap_type(&ty) {
+                    continue;
+                }
+                let key = type_key_from_type_name(&ty);
+                if fn_transfers_type_to_sender(cand, &key, module_fns) {
+                    provided_cap_type_keys.insert(key);
+                }
+            }
+            break;
+        }
+        for param in &f.params {
+            let resolved_ty = concretize_type_params(&param.ty, &f.type_params, &type_args);
+            let cap_ty = normalize_param_object_type(&resolved_ty);
+            if resolved_ty.trim().starts_with('&') && is_cap_type(&cap_ty) {
+                provided_cap_type_keys.insert(type_key_from_type_name(&cap_ty));
+            }
+        }
         let plan = SharedCreatorPlan {
             fn_name: f.fn_name.clone(),
             args: arg_plan.args,
             type_args,
             return_ty: f.return_ty.clone(),
             shared_type_keys,
+            provided_cap_type_keys,
             prep_lines: arg_plan.prep_lines,
             cleanup_lines: arg_plan.cleanup_lines,
         };
@@ -2177,11 +2201,6 @@ pub(super) fn render_best_effort_test(
             let needs_shared_non_cap_object = object_needs
                 .iter()
                 .any(|o| o.is_ref && !is_cap_type(&o.type_name));
-            let required_creator_cap_type_keys: std::collections::BTreeSet<String> = object_needs
-                .iter()
-                .filter(|o| o.is_ref && is_cap_type(&o.type_name))
-                .map(|o| o.type_key.clone())
-                .collect();
             let required_creator_shared_type_keys: std::collections::BTreeSet<String> = object_needs
                 .iter()
                 .filter(|o| o.is_ref && !is_cap_type(&o.type_name))
@@ -2244,31 +2263,59 @@ pub(super) fn render_best_effort_test(
                 } else if has_owned_helper {
                     owned_objects.push(obj.clone());
                     object_sources.insert(obj.var_name.clone(), ObjectProvisionSource::OwnedHelper);
-                } else if obj.is_ref && is_cap_type(&obj.type_name) && needs_shared_non_cap_object {
-                    if shared_creator_plan.is_none() {
-                        shared_creator_plan = module_fns.and_then(|fns| {
-                            pick_shared_creator_plan(
-                                d,
-                                fns,
-                                fn_lookup,
-                                key_structs_by_module,
-                                store_structs_by_module,
-                                &required_creator_cap_type_keys,
-                                &required_creator_shared_type_keys,
-                                coin_mint_amount,
-                            )
-                        });
-                    }
-                    if shared_creator_plan.is_some() {
-                        owned_objects.push(obj.clone());
-                        object_sources.insert(
-                            obj.var_name.clone(),
-                            ObjectProvisionSource::OwnedCreatorSender,
-                        );
-                    } else {
-                        return None;
-                    }
+            } else if obj.is_ref && is_cap_type(&obj.type_name) && needs_shared_non_cap_object {
+                if shared_creator_plan.is_none() {
+                    shared_creator_plan = module_fns.and_then(|fns| {
+                        pick_shared_creator_plan(
+                            d,
+                            fns,
+                            fn_lookup,
+                            key_structs_by_module,
+                            store_structs_by_module,
+                            &std::collections::BTreeSet::new(),
+                            &required_creator_shared_type_keys,
+                            coin_mint_amount,
+                        )
+                    });
+                }
+                let creator_supports_cap = shared_creator_plan
+                    .as_ref()
+                    .map(|p| p.provided_cap_type_keys.contains(&obj.type_key))
+                    .unwrap_or(false);
+                if creator_supports_cap {
+                    owned_objects.push(obj.clone());
+                    object_sources.insert(
+                        obj.var_name.clone(),
+                        ObjectProvisionSource::OwnedCreatorSender,
+                    );
                 } else if let Some(plan) = provider_fns.and_then(|fns| {
+                    pick_factory_call_for_type(
+                        d,
+                        &obj.type_key,
+                        fns,
+                        fn_lookup,
+                        key_structs_by_module,
+                        coin_mint_amount,
+                    )
+                }) {
+                    for (dep_ty, dep_mut) in &plan.shared_ref_deps {
+                        upsert_object_need(&mut object_needs, dep_ty.clone(), *dep_mut, true);
+                    }
+                    owned_objects.push(obj.clone());
+                    object_sources.insert(
+                        obj.var_name.clone(),
+                        match plan.provision_mode {
+                            OwnedFactoryProvision::ReturnValue => ObjectProvisionSource::OwnedFactory,
+                            OwnedFactoryProvision::SenderTransfer => {
+                                ObjectProvisionSource::OwnedCreatorSender
+                            }
+                        },
+                    );
+                    factory_calls.insert(obj.var_name.clone(), plan);
+                } else {
+                    return None;
+                }
+            } else if let Some(plan) = provider_fns.and_then(|fns| {
                     pick_factory_call_for_type(
                         d,
                         &obj.type_key,
@@ -2301,7 +2348,7 @@ pub(super) fn render_best_effort_test(
                                 fn_lookup,
                                 key_structs_by_module,
                                 store_structs_by_module,
-                                &required_creator_cap_type_keys,
+                                &std::collections::BTreeSet::new(),
                                 &required_creator_shared_type_keys,
                                 coin_mint_amount,
                             )
@@ -2309,11 +2356,19 @@ pub(super) fn render_best_effort_test(
                     }
                     if obj.is_ref && shared_creator_plan.is_some() {
                         if is_cap_type(&obj.type_name) {
-                            owned_objects.push(obj.clone());
-                            object_sources.insert(
-                                obj.var_name.clone(),
-                                ObjectProvisionSource::OwnedCreatorSender,
-                            );
+                            let creator_supports_cap = shared_creator_plan
+                                .as_ref()
+                                .map(|p| p.provided_cap_type_keys.contains(&obj.type_key))
+                                .unwrap_or(false);
+                            if creator_supports_cap {
+                                owned_objects.push(obj.clone());
+                                object_sources.insert(
+                                    obj.var_name.clone(),
+                                    ObjectProvisionSource::OwnedCreatorSender,
+                                );
+                            } else {
+                                return None;
+                            }
                         } else {
                             let creator_supports_type = shared_creator_plan
                                 .as_ref()

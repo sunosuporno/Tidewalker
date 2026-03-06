@@ -1605,7 +1605,7 @@ fn default_type_args_for_params(type_params: &[String]) -> Vec<String> {
     }
     type_params
         .iter()
-        .map(|_| "0x2::sui::SUI".to_string())
+        .map(|_| "u64".to_string())
         .collect::<Vec<_>>()
 }
 
@@ -1842,8 +1842,11 @@ fn synthesize_value_expr_for_type(
 
             let mut args = Vec::new();
             let mut ok = true;
+            let candidate_type_args = default_type_args_for_params(&f.type_params);
             for p in &f.params {
-                let pty = p.ty.trim();
+                let pty_resolved =
+                    concretize_type_params(&p.ty, &f.type_params, &candidate_type_args);
+                let pty = pty_resolved.trim();
                 if pty.contains("TxContext") {
                     args.push("test_scenario::ctx(&mut scenario)".to_string());
                     continue;
@@ -1870,11 +1873,7 @@ fn synthesize_value_expr_for_type(
             if !ok {
                 continue;
             }
-            let type_args = if has_unbound_type_params(f) {
-                default_type_args_for_params(&f.type_params)
-            } else {
-                Vec::new()
-            };
+            let type_args = candidate_type_args;
             let call_path = if type_args.is_empty() {
                 format!("{}::{}", f.module_name, f.fn_name)
             } else {
