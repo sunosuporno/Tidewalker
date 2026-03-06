@@ -9,6 +9,7 @@ mod chain;
 mod expr_ast;
 mod guards;
 mod parser;
+mod provision;
 mod render;
 
 use parser::*;
